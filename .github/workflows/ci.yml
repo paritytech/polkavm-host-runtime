@@ -43,12 +43,12 @@ jobs:
           browser=false
           while IFS= read -r file; do
             case "$file" in
-              Cargo.toml|Cargo.lock|rust/*|.github/workflows/*)
+              Cargo.toml|Cargo.lock|rust/*|.github/*)
                 rust=true
                 ;;
             esac
             case "$file" in
-              Cargo.toml|Cargo.lock|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-runtime-assets/*|js/*|scripts/*|.github/workflows/*)
+              Cargo.toml|Cargo.lock|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-runtime-assets/*|js/*|scripts/*|.github/*)
                 browser=true
                 ;;
             esac
