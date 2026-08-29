@@ -38,7 +38,8 @@ jobs:
           mkdir -p artifacts
           npm pack --workspace @parity/pvm-browser-runtime --pack-destination artifacts
           version="$(node -p "require('./package.json').version")"
-          tar -czf "artifacts/pvm-runtime-assets-$version.tar.gz" \
+          tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
+            -czf "artifacts/pvm-runtime-assets-$version.tar.gz" \
             -C rust/crates/pvm-runtime-assets assets
           npm run manifest
       - name: Publish immutable GitHub release
