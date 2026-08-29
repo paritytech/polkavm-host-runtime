@@ -47,6 +47,29 @@ async function waitForMessage(messages, type, timeoutMs = 10_000) {
   }
   throw new Error(`timed out waiting for browser runtime message ${type}`);
 }
+async function waitForStartupStage(
+  messages,
+  stage,
+  timeoutMs = 10_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (
+      messages.some(
+        (candidate) =>
+          candidate.type === "startup" && candidate.stage === stage,
+      )
+    ) {
+      return;
+    }
+    const error = messages.find((candidate) => candidate.type === "error");
+    if (error) {
+      throw new Error(error.message);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for browser runtime startup stage ${stage}`);
+}
 
 function invalidStart(overrides = {}) {
   return {
@@ -124,6 +147,70 @@ test("compiler backend enforces the declared graphics profile", async () => {
     false,
     "a framebuffer submission must not escape a tri2d declaration",
   );
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+});
+
+test("browser runtime can select the interpreter without attempting translation", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "forced-interpreter",
+      forceInterpreter: true,
+    },
+  });
+
+  const ready = await waitForMessage(messages, "ready");
+  assert.equal(ready.backend, "interpreter");
+  assert.equal(ready.cacheHit, false);
+  assert.equal(ready.translationMs, 0);
+  assert.equal(ready.compilationMs, 0);
+  assert.equal(ready.translatedWasmBytes, 0);
+  assert.equal(
+    messages.some(
+      (message) => message.type === "translated" || message.type === "compiled",
+    ),
+    false,
+  );
+
+  await waitForStartupStage(messages, "first-update-completed");
+  assert.deepEqual(
+    messages
+      .filter((message) => message.type === "startup")
+      .map((message) => message.stage),
+    [
+      "runtime-instantiating",
+      "runtime-instantiated",
+      "interpreter-staging-program",
+      "interpreter-program-staged",
+      "interpreter-launch-begin",
+      "interpreter-launch-begun",
+      "interpreter-mounting-assets",
+      "interpreter-assets-mounted",
+      "interpreter-launch-starting",
+      "interpreter-launch-started",
+      "interpreter-initializing",
+      "interpreter-initialized",
+      "first-update-started",
+      "first-update-completed",
+    ],
+  );
+
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
 });
