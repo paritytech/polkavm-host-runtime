@@ -12,6 +12,7 @@ use polkavm::{
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 struct File {
@@ -64,7 +65,10 @@ pub struct Vm {
     input_events: VecDeque<InputEvent>,
     audio_channels: u32,
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
+    #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
+    #[cfg(target_arch = "wasm32")]
+    now_ms: u64,
 
     import_syscall: Option<u32>,
     import_set_palette: Option<u32>,
@@ -253,7 +257,10 @@ impl Vm {
             input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             audio_channels: 0,
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
+            #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            now_ms: 0,
             import_syscall,
             import_set_palette,
             import_display,
@@ -267,6 +274,22 @@ impl Vm {
             import_log,
             import_yield,
         })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_time_ms(&mut self, time_ms: u64) {
+        self.now_ms = self.now_ms.max(time_ms);
+    }
+
+    fn time_ms(&self) -> u64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.now_ms
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.started.elapsed().as_millis() as u64
+        }
     }
 
     pub fn backend(&self) -> polkavm::BackendKind {
@@ -602,8 +625,7 @@ impl Vm {
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_time_ms => {
-                    self.instance
-                        .set_reg(Reg::A0, self.started.elapsed().as_millis() as u64);
+                    self.instance.set_reg(Reg::A0, self.time_ms());
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_log => {

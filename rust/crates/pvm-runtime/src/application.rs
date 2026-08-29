@@ -167,8 +167,9 @@ impl ApplicationRuntime {
 
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
-        if let Self::Cooperative(runtime) = self {
-            runtime.set_time_ms(time_ms);
+        match self {
+            Self::Cooperative(runtime) => runtime.set_time_ms(time_ms),
+            Self::CoreVm(runtime) => runtime.vm.set_time_ms(time_ms),
         }
     }
 
