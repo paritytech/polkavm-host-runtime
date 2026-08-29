@@ -17,10 +17,12 @@ if (JSON.stringify(distFiles) !== JSON.stringify(embeddedFiles)) {
 for (const file of distFiles) {
   const generated = await readFile(resolve(dist, file));
   const packaged = await readFile(resolve(embedded, file));
+  const generatedHash = createHash("sha256").update(generated).digest("hex");
+  const packagedHash = createHash("sha256").update(packaged).digest("hex");
   if (!generated.equals(packaged)) {
-    throw new Error(`browser asset differs from source build: ${file}`);
+    throw new Error(
+      `browser asset differs from source build: ${file}\ngenerated: ${generatedHash}\npackaged: ${packagedHash}`,
+    );
   }
-  console.log(
-    `${createHash("sha256").update(generated).digest("hex")}  ${file}`,
-  );
+  console.log(`${generatedHash}  ${file}`);
 }

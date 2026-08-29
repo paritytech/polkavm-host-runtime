@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
+import { homedir } from "node:os";
 
 const packageRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(packageRoot, "../../..");
@@ -36,7 +37,21 @@ if (process.env.PVM_RUNTIME_WASM === undefined) {
       "-p",
       "pvm-runtime",
     ],
-    { cwd: repositoryRoot, stdio: "inherit" },
+    {
+      cwd: repositoryRoot,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        RUSTFLAGS: [
+          process.env.RUSTFLAGS,
+          `--remap-path-prefix=${repositoryRoot}=/workspace`,
+          `--remap-path-prefix=${process.env.CARGO_HOME ?? resolve(homedir(), ".cargo")}=/cargo`,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        SOURCE_DATE_EPOCH: "1",
+      },
+    },
   );
   if (build.status !== 0) process.exit(build.status ?? 1);
 }
