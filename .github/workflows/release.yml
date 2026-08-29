@@ -17,8 +17,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install Rust browser target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Install pinned Rust browser target
+        run: rustup toolchain install 1.97.1 --profile minimal --target wasm32-unknown-unknown
       - name: Verify tag and package version
         env:
           TAG: ${{ github.ref_name }}
