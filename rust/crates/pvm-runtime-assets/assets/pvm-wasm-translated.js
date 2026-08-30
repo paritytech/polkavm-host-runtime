@@ -353,6 +353,13 @@
         bytes.byteLength
       );
       const type = bytes[0];
+      if (
+        type === 6 &&
+        (Math.abs(view.getInt16(2, true)) > 127 ||
+          Math.abs(view.getInt16(4, true)) > 127)
+      ) {
+        return;
+      }
       if (this.imports.includes("pvm_fetch_epoca_inputs")) {
         this.#queueEpocaInput(bytes);
         return;
@@ -950,12 +957,14 @@
 
     #queueEpocaInput(bytes) {
       const event = bytes.slice();
-      if (
-        event[0] === 5 &&
-        this.epocaInput[this.epocaInput.length - 1]?.[0] === 5
-      ) {
-        this.epocaInput[this.epocaInput.length - 1] = event;
-        return;
+      if (event[0] === 5 || event[0] === 6) {
+        const existing = this.epocaInput.findIndex(
+          queued => queued[0] === event[0]
+        );
+        if (existing !== -1) {
+          this.epocaInput[existing] = event;
+          return;
+        }
       }
       if (this.epocaInput.length === 256) {
         this.epocaInput.shift();
@@ -970,11 +979,7 @@
       if (key === 0xa3 || key === 0xa4) {
         const existing = this.coreInput.find(event => event[0] === key);
         if (existing) {
-          existing[1] =
-            Math.max(
-              -128,
-              Math.min(127, signedByte(existing[1]) + signedByte(value))
-            ) & 0xff;
+          existing[1] = value;
           return;
         }
       }
