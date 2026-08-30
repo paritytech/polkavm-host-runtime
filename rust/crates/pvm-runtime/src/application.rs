@@ -4,8 +4,8 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile, Runtime,
-    Tri2dFrame, MAX_FRAME_BYTES,
+    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample, PresentationProfile,
+    Runtime, Tri2dFrame, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -134,6 +134,13 @@ impl ApplicationRuntime {
         match self {
             Self::Cooperative(runtime) => runtime.send_input(event),
             Self::CoreVm(runtime) => runtime.send_input(event),
+        }
+    }
+
+    pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_motion_tilt(sample),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support motion-tilt input")),
         }
     }
 

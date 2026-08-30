@@ -42,6 +42,79 @@ pub use tri2d::{
 
 pub const ABI_VERSION: u32 = 1;
 
+pub const MOTION_TILT_MAGIC: [u8; 4] = *b"PMT1";
+pub const MOTION_TILT_VERSION: u16 = 1;
+pub const MOTION_TILT_BYTES: usize = 40;
+pub const MOTION_TILT_FLAG_CALIBRATED: u16 = 1 << 0;
+pub const MOTION_TILT_FLAG_AZIMUTH_VALID: u16 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionTiltSample {
+    pub sequence: u32,
+    pub timestamp_us: u64,
+    pub tilt_x: f32,
+    pub tilt_y: f32,
+    pub azimuth: Option<f32>,
+}
+
+impl MotionTiltSample {
+    pub fn encode(self) -> Result<[u8; MOTION_TILT_BYTES]> {
+        if self.sequence == 0
+            || !self.tilt_x.is_finite()
+            || !self.tilt_y.is_finite()
+            || !(-1.0..=1.0).contains(&self.tilt_x)
+            || !(-1.0..=1.0).contains(&self.tilt_y)
+            || self.azimuth.is_some_and(|value| !value.is_finite())
+        {
+            return Err(anyhow!("invalid motion-tilt sample"));
+        }
+        let mut bytes = [0; MOTION_TILT_BYTES];
+        bytes[..4].copy_from_slice(&MOTION_TILT_MAGIC);
+        bytes[4..6].copy_from_slice(&MOTION_TILT_VERSION.to_le_bytes());
+        let flags = MOTION_TILT_FLAG_CALIBRATED
+            | if self.azimuth.is_some() {
+                MOTION_TILT_FLAG_AZIMUTH_VALID
+            } else {
+                0
+            };
+        bytes[6..8].copy_from_slice(&flags.to_le_bytes());
+        bytes[8..12].copy_from_slice(&(MOTION_TILT_BYTES as u32).to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.tilt_x.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.tilt_y.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.azimuth.unwrap_or(0.0).to_le_bytes());
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MOTION_TILT_BYTES
+            || bytes[..4] != MOTION_TILT_MAGIC
+            || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != MOTION_TILT_VERSION
+            || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != MOTION_TILT_BYTES
+            || bytes[36..40] != [0; 4]
+        {
+            return Err(anyhow!("invalid motion-tilt encoding"));
+        }
+        let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        if flags & !(MOTION_TILT_FLAG_CALIBRATED | MOTION_TILT_FLAG_AZIMUTH_VALID) != 0
+            || flags & MOTION_TILT_FLAG_CALIBRATED == 0
+        {
+            return Err(anyhow!("invalid motion-tilt flags"));
+        }
+        let sample = Self {
+            sequence: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            timestamp_us: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            tilt_x: f32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            tilt_y: f32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            azimuth: (flags & MOTION_TILT_FLAG_AZIMUTH_VALID != 0)
+                .then(|| f32::from_le_bytes(bytes[32..36].try_into().unwrap())),
+        };
+        sample.encode()?;
+        Ok(sample)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
     Framebuffer,
@@ -291,6 +364,7 @@ struct HostState {
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
     input: VecDeque<InputEvent>,
+    motion_tilt: Option<[u8; MOTION_TILT_BYTES]>,
     assets: HashMap<String, Vec<u8>>,
     clock: HostClock,
     logs: VecDeque<String>,
@@ -326,6 +400,7 @@ impl HostState {
             audio: VecDeque::new(),
             audio_samples: 0,
             input: VecDeque::new(),
+            motion_tilt: None,
             assets,
             clock: HostClock::new(),
             logs: VecDeque::new(),
@@ -753,6 +828,30 @@ impl Runtime {
 
         linker
             .define_typed(
+                "host_motion_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let Some(sample) = caller.user_data.motion_tilt else {
+                        return Ok(0);
+                    };
+                    if (capacity as usize) < MOTION_TILT_BYTES {
+                        return Ok(-(MOTION_TILT_BYTES as i32));
+                    }
+                    caller.user_data.charge_hostcall_bytes(MOTION_TILT_BYTES)?;
+                    caller
+                        .instance
+                        .write_memory(pointer, &sample)
+                        .map_err(|error| anyhow!("write motion-tilt sample: {error:?}"))?;
+                    Ok(MOTION_TILT_BYTES as i32)
+                },
+            )
+            .context("define host_motion_read")?;
+
+        linker
+            .define_typed(
                 "host_poll_input",
                 |caller: polkavm::Caller<'_, HostState>,
                  pointer: u32,
@@ -1002,6 +1101,11 @@ impl Runtime {
 
     pub fn send_input(&mut self, event: InputEvent) {
         self.state.queue_input(event);
+    }
+
+    pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
+        self.state.motion_tilt = sample.map(MotionTiltSample::encode).transpose()?;
+        Ok(())
     }
 
     pub fn gpu_ready(&self) -> bool {
@@ -1264,6 +1368,32 @@ mod tests {
             PresentationProfile::parse("ui-mesh").is_err(),
             "the provisional profile name must not remain an alias"
         );
+    }
+
+    #[test]
+    fn motion_tilt_encoding_roundtrips_and_rejects_invalid_samples() {
+        let sample = MotionTiltSample {
+            sequence: 7,
+            timestamp_us: 123_456,
+            tilt_x: -0.25,
+            tilt_y: 0.75,
+            azimuth: Some(1.5),
+        };
+        let bytes = sample.encode().expect("valid sample should encode");
+        assert_eq!(bytes.len(), MOTION_TILT_BYTES);
+        assert_eq!(MotionTiltSample::decode(&bytes).unwrap(), sample);
+        assert!(MotionTiltSample {
+            sequence: 0,
+            ..sample
+        }
+        .encode()
+        .is_err());
+        assert!(MotionTiltSample {
+            tilt_x: f32::NAN,
+            ..sample
+        }
+        .encode()
+        .is_err());
     }
 
     #[test]
