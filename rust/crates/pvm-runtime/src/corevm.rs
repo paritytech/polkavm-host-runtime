@@ -125,6 +125,40 @@ const O_WRONLY: u64 = 1;
 const O_RDWR: u64 = 2;
 const AT_PAGESZ: u64 = 6;
 
+fn queue_input_event(events: &mut VecDeque<InputEvent>, key: u8, value: u8) {
+    if key == crate::quake_keys::MOUSE_X || key == crate::quake_keys::MOUSE_Y {
+        if let Some(event) = events.iter_mut().find(|event| event.key == key) {
+            event.value = value;
+            return;
+        }
+    }
+
+    if events.len() == MAX_QUEUED_INPUT_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(InputEvent { key, value });
+}
+
+fn queue_epoca_input_event(
+    events: &mut VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
+    event: crate::InputEvent,
+) {
+    if event.event_type == crate::InputEventType::PointerDelta {
+        if let Some(queued) = events
+            .iter_mut()
+            .find(|queued| queued[0] == crate::InputEventType::PointerDelta as u8)
+        {
+            *queued = event.encode();
+            return;
+        }
+    }
+
+    if events.len() == MAX_QUEUED_INPUT_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(event.encode());
+}
+
 fn errno(error: u64) -> u64 {
     (-(error as i64)) as u64
 }
@@ -341,17 +375,7 @@ impl Vm {
     }
 
     fn send_input_event(&mut self, key: u8, value: u8) {
-        if key == crate::quake_keys::MOUSE_X || key == crate::quake_keys::MOUSE_Y {
-            if let Some(event) = self.input_events.iter_mut().find(|event| event.key == key) {
-                event.value = (event.value as i8).saturating_add(value as i8) as u8;
-                return;
-            }
-        }
-
-        if self.input_events.len() == MAX_QUEUED_INPUT_EVENTS {
-            self.input_events.pop_front();
-        }
-        self.input_events.push_back(InputEvent { key, value });
+        queue_input_event(&mut self.input_events, key, value);
     }
 
     pub fn send_key(&mut self, key: u8, is_pressed: bool) {
@@ -372,10 +396,7 @@ impl Vm {
     }
 
     pub fn send_epoca_input(&mut self, event: crate::InputEvent) {
-        if self.epoca_input_events.len() == MAX_QUEUED_INPUT_EVENTS {
-            self.epoca_input_events.pop_front();
-        }
-        self.epoca_input_events.push_back(event.encode());
+        queue_epoca_input_event(&mut self.epoca_input_events, event);
     }
 
     fn read_cstr(&mut self, address: u64) -> Result<Option<Vec<u8>>, String> {

@@ -84,6 +84,15 @@ function invalidStart(overrides = {}) {
   };
 }
 
+function pointerDelta(x, y) {
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+  bytes[0] = 6;
+  view.setInt16(2, x, true);
+  view.setInt16(4, y, true);
+  return bytes;
+}
+
 test("browser runtime rejects unbounded launch inputs before compilation", async () => {
   for (const [message, expected] of [
     [invalidStart({ program: new Uint8Array() }), /program must contain/],
@@ -149,6 +158,54 @@ test("compiler backend enforces the declared graphics profile", async () => {
   );
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
+});
+
+test("compiler backend discards stale CoreVM mouse movement", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "mouse-backlog",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.coreVm = true;
+  translated.imports = ["pvm_fetch_epoca_inputs"];
+  translated.sendInput(pointerDelta(100, -60));
+  translated.sendInput(pointerDelta(12, -7));
+  translated.sendInput(pointerDelta(430, 314));
+  assert.equal(translated.epocaInput.length, 1);
+  assert.deepEqual(translated.epocaInput[0], pointerDelta(12, -7));
+
+  translated.imports = [];
+  translated.sendInput(pointerDelta(100, 0));
+  translated.sendInput(pointerDelta(80, 0));
+  assert.deepEqual(translated.coreInput, [[0xa3, 80]]);
 });
 
 test("browser runtime can select the interpreter without attempting translation", async () => {
