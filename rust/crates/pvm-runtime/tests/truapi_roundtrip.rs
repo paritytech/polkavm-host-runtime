@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use polkavm::ProgramBlob;
-use pvm_runtime::{PresentationProfile, Runtime};
+use pvm_runtime::{BackendKind, PresentationProfile, Runtime};
 use std::collections::HashMap;
 
 const PROGRAM: &[u8] = include_bytes!("fixtures/truapi-roundtrip.polkavm");
@@ -26,12 +26,13 @@ fn fixture_imports_the_v1_truapi_transport() {
 
 #[test]
 fn native_runtime_roundtrips_an_opaque_truapi_frame() {
-    let mut runtime = Runtime::new(
+    let mut runtime = Runtime::new_with_backend(
         PROGRAM,
         HashMap::new(),
         PresentationProfile::Framebuffer,
         false,
         10_000_000,
+        BackendKind::Interpreter,
     )
     .expect("create runtime");
 
