@@ -60,3 +60,44 @@ fn wrapped_input_chunks_preserve_order_and_destination() {
     }
     assert!(events.is_empty(), "every reported event should be consumed");
 }
+
+#[test]
+fn legacy_mouse_backlog_keeps_only_the_latest_delta() {
+    let mut events = VecDeque::new();
+    queue_input_event(&mut events, crate::quake_keys::MOUSE_X, 100);
+    queue_input_event(&mut events, crate::quake_keys::MOUSE_X, 80);
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events.front().unwrap().value, 80);
+}
+
+#[test]
+fn epoca_mouse_backlog_keeps_only_the_latest_frame_delta() {
+    let mut events = VecDeque::new();
+    let key = crate::InputEvent {
+        event_type: crate::InputEventType::KeyDown,
+        code: 4,
+        x: 0,
+        y: 0,
+    };
+    let stale = crate::InputEvent {
+        event_type: crate::InputEventType::PointerDelta,
+        code: 0,
+        x: 100,
+        y: (-60_i16) as u16,
+    };
+    let latest = crate::InputEvent {
+        event_type: crate::InputEventType::PointerDelta,
+        code: 0,
+        x: 12,
+        y: (-7_i16) as u16,
+    };
+
+    queue_epoca_input_event(&mut events, key);
+    queue_epoca_input_event(&mut events, stale);
+    queue_epoca_input_event(&mut events, latest);
+
+    assert_eq!(events.len(), 2);
+    assert_eq!(events.pop_front(), Some(key.encode()));
+    assert_eq!(events.pop_front(), Some(latest.encode()));
+}
