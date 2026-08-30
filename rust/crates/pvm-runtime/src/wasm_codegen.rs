@@ -54,10 +54,8 @@ struct Layout {
     stack_low: u32,
     stack_high: u32,
     stack_phys: u32,
-    ro_pages: u64,
     rw_pages: u64,
     rw_max_pages: u64,
-    stack_pages: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -150,20 +148,15 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     });
     module.section(&table);
 
+    let rw_prefix_pages = u64::from(layout.rw_phys / PAGE_SIZE);
     let mut memory = MemorySection::new();
-    for (minimum, maximum) in [
-        (layout.ro_pages, layout.ro_pages),
-        (layout.rw_pages, layout.rw_max_pages),
-        (layout.stack_pages, layout.stack_pages),
-    ] {
-        memory.memory(MemoryType {
-            minimum,
-            maximum: Some(maximum),
-            memory64: false,
-            shared: false,
-            page_size_log2: None,
-        });
-    }
+    memory.memory(MemoryType {
+        minimum: rw_prefix_pages + layout.rw_pages,
+        maximum: Some(rw_prefix_pages + layout.rw_max_pages),
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
     module.section(&memory);
 
     let mut globals = GlobalSection::new();
@@ -206,9 +199,7 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     module.section(&globals);
 
     let mut exports = ExportSection::new();
-    exports.export("memory_ro", ExportKind::Memory, 0);
-    exports.export("memory_rw", ExportKind::Memory, 1);
-    exports.export("memory_stack", ExportKind::Memory, 2);
+    exports.export("memory", ExportKind::Memory, 0);
     exports.export("pvm_begin", ExportKind::Func, begin_index);
     exports.export("pvm_resume", ExportKind::Func, dispatcher_index);
     exports.export("pvm_set_gas", ExportKind::Func, set_gas_index);
@@ -279,7 +270,7 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     }
     if !blob.rw_data().is_empty() {
         data.active(
-            1,
+            0,
             &ConstExpr::i32_const(layout.rw_phys as i32),
             blob.rw_data().iter().copied(),
         );
@@ -315,22 +306,37 @@ fn build_layout(blob: &ProgramBlob) -> Result<Layout> {
         .checked_add(heap_limit)
         .ok_or_else(|| anyhow!("translated heap layout overflow"))?;
     let pages = |bytes: u32| align(bytes, PAGE_SIZE).map(|bytes| u64::from(bytes / PAGE_SIZE));
+    let ro_pages = pages(map.ro_data_size())?;
+    let rw_pages = pages(map.rw_data_size())?;
+    let rw_max_pages = pages(rw_max_bytes)?;
+    let stack_pages = pages(map.stack_size())?;
+    let stack_phys = u32::try_from(
+        ro_pages
+            .checked_mul(u64::from(PAGE_SIZE))
+            .ok_or_else(|| anyhow!("translated stack layout overflow"))?,
+    )
+    .map_err(|_| anyhow!("translated stack layout exceeds wasm32"))?;
+    let rw_phys = u32::try_from(
+        ro_pages
+            .checked_add(stack_pages)
+            .and_then(|pages| pages.checked_mul(u64::from(PAGE_SIZE)))
+            .ok_or_else(|| anyhow!("translated read-write layout overflow"))?,
+    )
+    .map_err(|_| anyhow!("translated read-write layout exceeds wasm32"))?;
     Ok(Layout {
         ro_address: map.ro_data_address(),
         ro_size: map.ro_data_size(),
         ro_phys: 0,
         rw_address: map.rw_data_address(),
         rw_size: map.rw_data_size(),
-        rw_phys: 0,
+        rw_phys,
         heap_base: map.heap_base(),
         heap_limit,
         stack_low: map.stack_address_low(),
         stack_high: map.stack_address_high(),
-        stack_phys: 0,
-        ro_pages: pages(map.ro_data_size())?,
-        rw_pages: pages(map.rw_data_size())?,
-        rw_max_pages: pages(rw_max_bytes)?,
-        stack_pages: pages(map.stack_size())?,
+        stack_phys,
+        rw_pages,
+        rw_max_pages,
     })
 }
 
@@ -746,21 +752,33 @@ fn emit_address(f: &mut Function, base: Option<RawReg>, offset: i32) {
 
 fn static_target(layout: Layout, address: u32, bytes: u32, write: bool) -> Option<(u32, u32)> {
     let end = u64::from(address).checked_add(u64::from(bytes))?;
-    let (memory, base) = if !write
+    let (virtual_base, physical_base) = if !write
         && address >= layout.ro_address
         && end <= u64::from(layout.ro_address) + u64::from(layout.ro_size)
     {
-        (0, layout.ro_address)
+        (layout.ro_address, layout.ro_phys)
     } else if address >= layout.rw_address
         && end <= u64::from(layout.rw_address) + u64::from(layout.rw_size)
     {
-        (1, layout.rw_address)
+        (layout.rw_address, layout.rw_phys)
     } else if address >= layout.stack_low && end <= u64::from(layout.stack_high) {
-        (2, layout.stack_low)
+        (layout.stack_low, layout.stack_phys)
     } else {
         return None;
     };
-    Some((memory, address.checked_sub(base)?))
+    Some((
+        0,
+        physical_base.checked_add(address.checked_sub(virtual_base)?)?,
+    ))
+}
+
+fn emit_physical_address(f: &mut Function, virtual_base: u32, physical_base: u32) {
+    f.instruction(&W::I32Const(virtual_base as i32));
+    f.instruction(&W::I32Sub);
+    if physical_base != 0 {
+        f.instruction(&W::I32Const(physical_base as i32));
+        f.instruction(&W::I32Add);
+    }
 }
 
 fn emit_load_at(f: &mut Function, kind: LoadKind, memory: u32) {
@@ -809,9 +827,8 @@ fn emit_load(
     }
     if base == Some(Reg::SP.raw()) {
         emit_address(f, base, offset);
-        f.instruction(&W::I32Const(context.layout.stack_low as i32));
-        f.instruction(&W::I32Sub);
-        emit_load_at(f, kind, 2);
+        emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
+        emit_load_at(f, kind, 0);
         emit_set_reg(f, dst);
         return;
     }
@@ -821,22 +838,19 @@ fn emit_load(
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I64)));
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.stack_low as i32));
-    f.instruction(&W::I32Sub);
-    emit_load_at(f, kind, 2);
+    emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
+    emit_load_at(f, kind, 0);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(context.layout.rw_address as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I64)));
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.rw_address as i32));
-    f.instruction(&W::I32Sub);
-    emit_load_at(f, kind, 1);
+    emit_physical_address(f, context.layout.rw_address, context.layout.rw_phys);
+    emit_load_at(f, kind, 0);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.ro_address as i32));
-    f.instruction(&W::I32Sub);
+    emit_physical_address(f, context.layout.ro_address, context.layout.ro_phys);
     emit_load_at(f, kind, 0);
     f.instruction(&W::End);
     f.instruction(&W::End);
@@ -894,9 +908,8 @@ fn emit_store(
     }
     if base == Some(Reg::SP.raw()) {
         emit_address(f, base, offset);
-        f.instruction(&W::I32Const(context.layout.stack_low as i32));
-        f.instruction(&W::I32Sub);
-        emit_store_value(f, kind, source, immediate, 2);
+        emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
+        emit_store_value(f, kind, source, immediate, 0);
         return;
     }
     emit_address(f, base, offset);
@@ -905,18 +918,16 @@ fn emit_store(
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Empty));
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.stack_low as i32));
-    f.instruction(&W::I32Sub);
-    emit_store_value(f, kind, source, immediate, 2);
+    emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
+    emit_store_value(f, kind, source, immediate, 0);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(context.layout.rw_address as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Empty));
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.rw_address as i32));
-    f.instruction(&W::I32Sub);
-    emit_store_value(f, kind, source, immediate, 1);
+    emit_physical_address(f, context.layout.rw_address, context.layout.rw_phys);
+    emit_store_value(f, kind, source, immediate, 0);
     f.instruction(&W::Else);
     emit_trap(f, pc);
     f.instruction(&W::End);
@@ -2033,9 +2044,11 @@ fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: Raw
     f.instruction(&W::I64Const(PAGE_SIZE.trailing_zeros() as i64));
     f.instruction(&W::I64ShrU);
     f.instruction(&W::I32WrapI64);
-    f.instruction(&W::MemorySize(1));
+    f.instruction(&W::MemorySize(0));
+    f.instruction(&W::I32Const((context.layout.rw_phys / PAGE_SIZE) as i32));
     f.instruction(&W::I32Sub);
-    f.instruction(&W::MemoryGrow(1));
+    f.instruction(&W::I32Sub);
+    f.instruction(&W::MemoryGrow(0));
     f.instruction(&W::I32Const(-1));
     f.instruction(&W::I32Ne);
     f.instruction(&W::If(BlockType::Result(ValType::I64)));
@@ -2139,6 +2152,19 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(&wasm)
             .expect("validate translated framebuffer fixture");
+        let memory_count = wasmparser::Parser::new(0)
+            .parse_all(&wasm)
+            .filter_map(
+                |payload| match payload.expect("parse translated framebuffer fixture") {
+                    wasmparser::Payload::MemorySection(section) => Some(section.count()),
+                    _ => None,
+                },
+            )
+            .sum::<u32>();
+        assert_eq!(
+            memory_count, 1,
+            "translated guests must not require the WebAssembly multi-memory proposal"
+        );
     }
 
     #[test]
