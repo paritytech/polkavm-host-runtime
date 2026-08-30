@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample,
     PresentationProfile, Tri2dFrame,
 };
 use std::collections::HashMap;
@@ -55,6 +55,27 @@ impl From<NativePvmInputEventType> for InputEventType {
 pub struct NativePvmAsset {
     pub path: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct NativePvmMotionTiltSample {
+    pub sequence: u32,
+    pub timestamp_us: u64,
+    pub tilt_x: f32,
+    pub tilt_y: f32,
+    pub azimuth: Option<f32>,
+}
+
+impl From<NativePvmMotionTiltSample> for MotionTiltSample {
+    fn from(sample: NativePvmMotionTiltSample) -> Self {
+        Self {
+            sequence: sample.sequence,
+            timestamp_us: sample.timestamp_us,
+            tilt_x: sample.tilt_x,
+            tilt_y: sample.tilt_y,
+            azimuth: sample.azimuth,
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -217,6 +238,18 @@ impl NativePvmRuntime {
             y,
         });
         Ok(())
+    }
+
+    pub fn set_motion_tilt(&self, sample: NativePvmMotionTiltSample) -> Result<(), NativePvmError> {
+        self.lock()?
+            .set_motion_tilt(Some(sample.into()))
+            .map_err(NativePvmError::runtime)
+    }
+
+    pub fn clear_motion_tilt(&self) -> Result<(), NativePvmError> {
+        self.lock()?
+            .set_motion_tilt(None)
+            .map_err(NativePvmError::runtime)
     }
 
     pub fn gpu_ready(&self) -> Result<bool, NativePvmError> {

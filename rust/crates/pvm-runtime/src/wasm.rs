@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample,
     PresentationProfile, Tri2dFrame, MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES,
     MAX_PROGRAM_BYTES,
 };
@@ -315,6 +315,20 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
         });
         Ok(())
     })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_set_motion_tilt() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        let sample = MotionTiltSample::decode(&bytes)?;
+        host.running()?.set_motion_tilt(Some(sample))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_clear_motion_tilt() -> u32 {
+    status(|host| host.running()?.set_motion_tilt(None))
 }
 
 #[no_mangle]

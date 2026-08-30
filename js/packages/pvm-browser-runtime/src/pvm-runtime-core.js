@@ -525,6 +525,35 @@ globalThis.createPvmRuntime = endpoint => {
     );
   }
 
+  function sendMotionTilt(bytes) {
+    if (!running || bytes.byteLength !== 40) {
+      return;
+    }
+    if (translated) {
+      translated.sendMotionTilt(bytes);
+      return;
+    }
+    stage(bytes);
+    check(
+      pvm.pvm_browser_set_motion_tilt(),
+      "set PolkaVM browser motion-tilt sample"
+    );
+  }
+
+  function clearMotionTilt() {
+    if (!running) {
+      return;
+    }
+    if (translated) {
+      translated.clearMotionTilt();
+      return;
+    }
+    check(
+      pvm.pvm_browser_clear_motion_tilt(),
+      "clear PolkaVM browser motion-tilt sample"
+    );
+  }
+
   function sendGpuEvent(bytes) {
     if (!running || !pvm || !bytes.byteLength) {
       return;
@@ -563,6 +592,22 @@ globalThis.createPvmRuntime = endpoint => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "motion-tilt") {
+      try {
+        sendMotionTilt(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "motion-tilt-clear") {
+      try {
+        clearMotionTilt();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

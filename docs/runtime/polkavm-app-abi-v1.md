@@ -79,6 +79,14 @@ input and audio. A Host call made outside its declared capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
 silently reinterpret a submission as another graphics profile.
 
+Device-input ABI v1 may gain additive Host imports behind declared feature
+names. Adding a feature does not change the existing input-record layout or the
+semantics of existing imports. A Host that does not recognize a requested
+feature MUST reject the manifest before instantiating the guest. A Host that
+recognizes an optional feature MUST still define its import when the current
+device cannot provide data; the import reports unavailability as specified
+below.
+
 ## Host imports
 
 ### Framebuffer presentation
@@ -264,6 +272,55 @@ ABI v1 event types are:
 The device-input contract defines code values, coordinate interpretation, and
 surface-metric scaling. ABI v1 does not define touch, wheel, UTF-8 text, IME,
 or focus events.
+
+#### Optional motion tilt
+
+An App requests fused, display-relative tilt without making it a launch
+requirement by declaring:
+
+```json
+{
+  "deviceInput": {
+    "abiVersion": 1,
+    "requiredFeatures": ["pointer"],
+    "optionalFeatures": ["motion-tilt"]
+  }
+}
+```
+
+The feature adds:
+
+```text
+host_motion_read(pointer: u32, capacity: u32) -> i32
+```
+
+The Host retains only the newest calibrated sample. The call returns `40` after
+writing one complete sample, `0` when motion is unavailable, inactive, stale,
+or not authorized, and `-40` when `capacity` is too small. It never writes a
+partial sample.
+
+The 40-byte `PMT1` sample is:
+
+```text
+offset  type    field
+0       [u8;4] magic "PMT1"
+4       u16     version 1
+6       u16     flags
+8       u32     byte length 40
+12      u32     nonzero sequence
+16      u64     monotonic timestamp in microseconds
+24      f32     normalized horizontal tilt in [-1, 1]
+28      f32     normalized vertical tilt in [-1, 1]
+32      f32     azimuth in radians, or zero when unavailable
+36      u32     zero
+```
+
+Flag bit 0 means the sample is calibrated and MUST be set. Bit 1 means azimuth
+is valid. All other bits are zero. Float fields are finite. Motion tilt is
+lossy state, not an event stream: Hosts SHOULD sample near display cadence,
+coalesce updates, stop sampling when the App is not visible, and MUST NOT
+persist samples. Pointer input remains available as the fallback and MAY
+temporarily override tilt while a pointer gesture is active.
 
 ### Time
 

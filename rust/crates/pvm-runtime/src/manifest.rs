@@ -20,6 +20,8 @@ pub struct AppDescriptor {
     pub audio_enabled: bool,
     /// Required device-input features.
     pub input_features: Vec<String>,
+    /// Optional device-input features requested when the host can provide them.
+    pub optional_input_features: Vec<String>,
     /// Required WebGPU limits, empty for other profiles.
     pub gpu_limits: BTreeMap<String, u64>,
 }
@@ -73,6 +75,8 @@ struct DeviceInput {
     abi_version: u32,
     #[serde(rename = "requiredFeatures", default)]
     required_features: Vec<String>,
+    #[serde(rename = "optionalFeatures", default)]
+    optional_features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,18 +137,43 @@ impl AppDescriptor {
         } else if !gpu_limits.is_empty() {
             bail!("non-WebGPU graphics profile declares required limits");
         }
-        let input_features = if let Some(input) = manifest.capabilities.device_input {
+        let (input_features, optional_input_features) = if let Some(input) =
+            manifest.capabilities.device_input
+        {
             if input.abi_version != 1 {
                 bail!("device input capability must use ABI version 1");
             }
+            if input.required_features.len()
+                != input
+                    .required_features
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                || input.optional_features.len()
+                    != input
+                        .optional_features
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+            {
+                bail!("device input features must be unique");
+            }
             for feature in &input.required_features {
                 if feature != "pointer" && feature != "keyboard" {
-                    bail!("unsupported device input feature {feature}");
+                    bail!("unsupported required device input feature {feature}");
                 }
             }
-            input.required_features
+            for feature in &input.optional_features {
+                if feature != "motion-tilt" {
+                    bail!("unsupported optional device input feature {feature}");
+                }
+                if input.required_features.contains(feature) {
+                    bail!("device input feature {feature} cannot be both required and optional");
+                }
+            }
+            (input.required_features, input.optional_features)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let audio_enabled = if let Some(audio) = manifest.capabilities.audio {
             if audio.abi_version != 1 || !audio.required_features.is_empty() {
@@ -160,6 +189,7 @@ impl AppDescriptor {
             presentation,
             audio_enabled,
             input_features,
+            optional_input_features,
             gpu_limits,
         })
     }
@@ -195,12 +225,21 @@ mod tests {
         assert!(descriptor.audio_enabled);
     }
 
+    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"webgpu-raster","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer"],"optionalFeatures":["motion-tilt"]}}}"#;
+
     #[test]
     fn parses_exact_strict_manifest() {
         let descriptor = AppDescriptor::parse_exact(FRAMEBUFFER, FRAMEBUFFER).unwrap();
         assert_eq!(descriptor.presentation, PresentationProfile::Framebuffer);
         assert_eq!(descriptor.program_path, "app.polkavm");
         assert!(descriptor.audio_enabled);
+    }
+
+    #[test]
+    fn parses_optional_motion_tilt_without_changing_abi_version() {
+        let descriptor = AppDescriptor::parse_exact(MOTION, MOTION).unwrap();
+        assert_eq!(descriptor.input_features, ["pointer"]);
+        assert_eq!(descriptor.optional_input_features, ["motion-tilt"]);
     }
 
     #[test]
