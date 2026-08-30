@@ -11,6 +11,8 @@ pub use pvm_gpu_wire as gpu_wire;
 mod manifest;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
+mod native_gpu;
 mod quake_keys;
 mod tri2d;
 #[cfg(target_arch = "wasm32")]
@@ -20,6 +22,8 @@ mod wasm_codegen;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 pub use native_ffi::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
+pub use native_gpu::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 uniffi::setup_scaffolding!();
