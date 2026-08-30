@@ -165,10 +165,28 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_truapi_request(),
+            Self::CoreVm(runtime) => runtime.vm.take_truapi_request(),
+        }
+    }
+
+    pub fn send_truapi_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_truapi_response(bytes),
+            Self::CoreVm(runtime) => runtime
+                .vm
+                .send_truapi_response(bytes)
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
-        if let Self::Cooperative(runtime) = self {
-            runtime.set_time_ms(time_ms);
+        match self {
+            Self::Cooperative(runtime) => runtime.set_time_ms(time_ms),
+            Self::CoreVm(runtime) => runtime.vm.set_time_ms(time_ms),
         }
     }
 
@@ -300,6 +318,14 @@ impl CoreVmRuntime {
     }
 
     fn send_input(&mut self, event: InputEvent) {
+        let pointer_delta = if event.event_type == InputEventType::PointerDelta {
+            match (corevm_pointer_delta(event.x), corevm_pointer_delta(event.y)) {
+                (Some(delta_x), Some(delta_y)) => Some((delta_x, delta_y)),
+                _ => return,
+            }
+        } else {
+            None
+        };
         if self.vm.uses_epoca_inputs() {
             self.vm.send_epoca_input(event);
             return;
@@ -326,10 +352,11 @@ impl CoreVmRuntime {
                 }
                 self.pointer = Some((event.x, event.y));
             }
-            InputEventType::PointerDelta => self.vm.send_mouse_move(
-                (event.x as i16).clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                (event.y as i16).clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-            ),
+            InputEventType::PointerDelta => {
+                if let Some((delta_x, delta_y)) = pointer_delta {
+                    self.vm.send_mouse_move(delta_x, delta_y);
+                }
+            }
             InputEventType::SurfaceMetrics => {}
         }
     }
@@ -337,4 +364,26 @@ impl CoreVmRuntime {
 
 fn signed_delta(current: u16, previous: u16) -> i8 {
     (i32::from(current) - i32::from(previous)).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+}
+
+fn corevm_pointer_delta(value: u16) -> Option<i8> {
+    i8::try_from(value as i16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::corevm_pointer_delta;
+
+    #[test]
+    fn corevm_pointer_delta_preserves_representable_signed_values() {
+        assert_eq!(corevm_pointer_delta(127), Some(127));
+        assert_eq!(corevm_pointer_delta((-128_i16) as u16), Some(-128));
+    }
+
+    #[test]
+    fn corevm_pointer_delta_drops_safari_pointer_lock_discontinuities() {
+        assert_eq!(corevm_pointer_delta(128), None);
+        assert_eq!(corevm_pointer_delta((-129_i16) as u16), None);
+        assert_eq!(corevm_pointer_delta(430), None);
+    }
 }

@@ -97,6 +97,9 @@ const MAX_QUEUED_GPU_BATCHES: usize = 4;
 const MAX_QUEUED_GPU_EVENTS: usize = 256;
 const MAX_GPU_SUBMITS_PER_TICK: u32 = 8;
 const MAX_GPU_UPLOAD_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+pub const MAX_TRUAPI_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_QUEUED_TRUAPI_FRAMES: usize = 32;
+const MAX_QUEUED_TRUAPI_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) fn validate_program_configuration(
     program_len: usize,
@@ -298,6 +301,10 @@ struct HostState {
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
     gpu_events: VecDeque<Vec<u8>>,
+    truapi_requests: VecDeque<Vec<u8>>,
+    truapi_request_bytes: usize,
+    truapi_responses: VecDeque<Vec<u8>>,
+    truapi_response_bytes: usize,
     gpu_last_sequence: u64,
     gpu_submits_remaining: u32,
     gpu_upload_bytes_remaining: usize,
@@ -329,6 +336,10 @@ impl HostState {
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
             gpu_events: VecDeque::new(),
+            truapi_requests: VecDeque::new(),
+            truapi_request_bytes: 0,
+            truapi_responses: VecDeque::new(),
+            truapi_response_bytes: 0,
             gpu_last_sequence: 0,
             gpu_submits_remaining: 0,
             gpu_upload_bytes_remaining: 0,
@@ -394,6 +405,26 @@ impl HostState {
             }
         }
         self.input.push_back(event);
+    }
+
+    fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
+        let frame = self.truapi_requests.pop_front()?;
+        self.truapi_request_bytes -= frame.len();
+        Some(frame)
+    }
+
+    fn queue_truapi_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.is_empty() || bytes.len() > MAX_TRUAPI_FRAME_BYTES {
+            return Err(anyhow!("invalid TrUAPI response frame"));
+        }
+        if self.truapi_responses.len() == MAX_QUEUED_TRUAPI_FRAMES
+            || self.truapi_response_bytes.saturating_add(bytes.len()) > MAX_QUEUED_TRUAPI_BYTES
+        {
+            return Err(anyhow!("TrUAPI response queue overflow"));
+        }
+        self.truapi_response_bytes += bytes.len();
+        self.truapi_responses.push_back(bytes);
+        Ok(())
     }
 }
 
@@ -662,6 +693,63 @@ impl Runtime {
                 },
             )
             .context("define host_gpu_receive")?;
+
+        linker
+            .define_typed(
+                "host_truapi_send",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if length == 0 || length > MAX_TRUAPI_FRAME_BYTES {
+                        return Ok(1);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    if caller.user_data.truapi_requests.len() == MAX_QUEUED_TRUAPI_FRAMES
+                        || caller.user_data.truapi_request_bytes.saturating_add(length)
+                            > MAX_QUEUED_TRUAPI_BYTES
+                    {
+                        return Ok(2);
+                    }
+                    let bytes = read_guest_memory(caller.instance, pointer, length)?;
+                    caller.user_data.truapi_request_bytes += bytes.len();
+                    caller.user_data.truapi_requests.push_back(bytes);
+                    Ok(0)
+                },
+            )
+            .context("define host_truapi_send")?;
+
+        linker
+            .define_typed(
+                "host_truapi_poll",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let Some(required_len) =
+                        caller.user_data.truapi_responses.front().map(Vec::len)
+                    else {
+                        return Ok(0);
+                    };
+                    let required = i32::try_from(required_len)
+                        .map_err(|_| anyhow!("TrUAPI response length overflow"))?;
+                    if (capacity as usize) < required_len {
+                        return Ok(-required);
+                    }
+                    caller.user_data.charge_hostcall_bytes(required_len)?;
+                    let response = caller.user_data.truapi_responses.front().unwrap();
+                    caller
+                        .instance
+                        .write_memory(pointer, response)
+                        .map_err(|error| anyhow!("write TrUAPI response: {error:?}"))?;
+                    caller.user_data.truapi_responses.pop_front();
+                    caller.user_data.truapi_response_bytes -= required_len;
+                    Ok(required)
+                },
+            )
+            .context("define host_truapi_poll")?;
 
         linker
             .define_typed(
@@ -944,6 +1032,14 @@ impl Runtime {
 
     pub fn take_gpu_batch(&mut self) -> Option<GpuBatch> {
         self.state.gpu_batches.pop_front()
+    }
+
+    pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
+        self.state.take_truapi_request()
+    }
+
+    pub fn send_truapi_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.state.queue_truapi_response(bytes)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1236,6 +1332,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truapi_queues_enforce_frame_count_and_byte_limits() {
+        let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
+        assert!(state.queue_truapi_response(Vec::new()).is_err());
+        assert!(state
+            .queue_truapi_response(vec![0; MAX_TRUAPI_FRAME_BYTES + 1])
+            .is_err());
+
+        for _ in 0..MAX_QUEUED_TRUAPI_FRAMES {
+            state
+                .queue_truapi_response(vec![0; 1])
+                .expect("bounded response should queue");
+        }
+        assert!(
+            state.queue_truapi_response(vec![0; 1]).is_err(),
+            "frame-count overflow must fail closed"
+        );
+
+        state.truapi_responses.clear();
+        state.truapi_response_bytes = 0;
+        for _ in 0..(MAX_QUEUED_TRUAPI_BYTES / MAX_TRUAPI_FRAME_BYTES) {
+            state
+                .queue_truapi_response(vec![0; MAX_TRUAPI_FRAME_BYTES])
+                .expect("response within byte budget should queue");
+        }
+        assert!(
+            state.queue_truapi_response(vec![0; 1]).is_err(),
+            "byte-budget overflow must fail closed"
+        );
+
+        state.truapi_requests.push_back(vec![1, 2, 3]);
+        state.truapi_request_bytes = 3;
+        assert_eq!(state.take_truapi_request(), Some(vec![1, 2, 3]));
+        assert_eq!(state.truapi_request_bytes, 0);
+    }
     #[test]
     fn launch_limits_reject_unbounded_native_inputs() {
         assert!(validate_program_configuration(0, 1).is_err());
