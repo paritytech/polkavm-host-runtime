@@ -1,6 +1,6 @@
 [package]
 name = "pvm-assets-export"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Exports host-neutral PolkaVM browser runtime assets"
 license = "MPL-2.0"
@@ -8,4 +8,4 @@ repository = "https://github.com/paritytech/pvm-host-runtime"
 publish = false
 
 [dependencies]
-pvm-runtime-assets = { version = "0.1.2", path = "../pvm-runtime-assets" }
+pvm-runtime-assets = { version = "0.1.3", path = "../pvm-runtime-assets" }
