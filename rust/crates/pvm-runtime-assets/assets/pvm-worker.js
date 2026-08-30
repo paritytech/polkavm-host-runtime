@@ -24,8 +24,8 @@
   const MAX_GPU_EVENTS = 256;
   const MAX_GPU_SUBMITS_PER_UPDATE = 8;
   const MAX_TRUAPI_FRAME_BYTES = 1024 * 1024;
-  const MAX_TRUAPI_RESPONSES = 32;
-  const MAX_TRUAPI_RESPONSE_BYTES = 4 * 1024 * 1024;
+  const MAX_TRUAPI_FRAMES = 32;
+  const MAX_TRUAPI_QUEUE_BYTES = 4 * 1024 * 1024;
   const MAX_GPU_COMMANDS = 16_384;
   const GPU_ERROR_MALFORMED_BATCH = -2;
   const GPU_ERROR_QUOTA_EXCEEDED = -3;
@@ -261,6 +261,8 @@
       this.gpuEvents = [];
       this.gpuSubmits = 0;
       this.gpuLastSequence = 0n;
+      this.truapiRequests = 0;
+      this.truapiRequestBytes = 0;
       this.truapiResponses = [];
       this.truapiResponseBytes = 0;
       this.tri2dSubmitted = false;
@@ -315,6 +317,8 @@
       }
       this.timeMs = timeMs;
       this.gpuSubmits = 0;
+      this.truapiRequests = 0;
+      this.truapiRequestBytes = 0;
       this.#resetBudget(
         this.coreVm && !this.coreVmStarted
           ? MAX_HOSTCALLS_PER_INIT
@@ -415,8 +419,8 @@
         throw new Error("invalid translated TrUAPI response");
       }
       if (
-        this.truapiResponses.length === MAX_TRUAPI_RESPONSES ||
-        this.truapiResponseBytes + bytes.byteLength > MAX_TRUAPI_RESPONSE_BYTES
+        this.truapiResponses.length === MAX_TRUAPI_FRAMES ||
+        this.truapiResponseBytes + bytes.byteLength > MAX_TRUAPI_QUEUE_BYTES
       ) {
         throw new Error("translated TrUAPI response queue overflow");
       }
@@ -428,6 +432,8 @@
       this.stopped = true;
       this.input.length = 0;
       this.coreInput.length = 0;
+      this.truapiRequests = 0;
+      this.truapiRequestBytes = 0;
       this.gpuEvents.length = 0;
       this.truapiResponses.length = 0;
       this.truapiResponseBytes = 0;
@@ -796,8 +802,17 @@
             this.#setReg(7, 1n);
             return false;
           }
+          if (
+            this.truapiRequests === MAX_TRUAPI_FRAMES ||
+            this.truapiRequestBytes + length > MAX_TRUAPI_QUEUE_BYTES
+          ) {
+            this.#setReg(7, 2n);
+            return false;
+          }
           const bytes = this.#read(this.#u32(a0), length);
           this.emit({ type: "truapi-request", bytes }, [bytes.buffer]);
+          this.truapiRequests++;
+          this.truapiRequestBytes += length;
           this.#setReg(7, 0n);
           return false;
         }
