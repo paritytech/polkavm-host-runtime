@@ -1,6 +1,6 @@
 {
   "name": "@parity/pvm-browser-runtime",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Host-neutral PolkaVM App v2 browser runtime artifacts",
   "license": "MPL-2.0",
   "type": "module",
