@@ -318,6 +318,14 @@ impl CoreVmRuntime {
     }
 
     fn send_input(&mut self, event: InputEvent) {
+        let pointer_delta = if event.event_type == InputEventType::PointerDelta {
+            match (corevm_pointer_delta(event.x), corevm_pointer_delta(event.y)) {
+                (Some(delta_x), Some(delta_y)) => Some((delta_x, delta_y)),
+                _ => return,
+            }
+        } else {
+            None
+        };
         if self.vm.uses_epoca_inputs() {
             self.vm.send_epoca_input(event);
             return;
@@ -345,9 +353,7 @@ impl CoreVmRuntime {
                 self.pointer = Some((event.x, event.y));
             }
             InputEventType::PointerDelta => {
-                if let (Some(delta_x), Some(delta_y)) =
-                    (corevm_pointer_delta(event.x), corevm_pointer_delta(event.y))
-                {
+                if let Some((delta_x, delta_y)) = pointer_delta {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
