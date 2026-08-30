@@ -457,18 +457,18 @@ dependencies = [
 
 [[package]]
 name = "pvm-assets-export"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pvm-runtime-assets",
 ]
 
 [[package]]
 name = "pvm-gpu-wire"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "pvm-runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "log",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "pvm-runtime-assets"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "sha2",
 ]
