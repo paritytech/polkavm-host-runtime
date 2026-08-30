@@ -60,7 +60,7 @@ struct Graphics {
     #[serde(rename = "abiVersion")]
     abi_version: u32,
     profile: String,
-    #[serde(rename = "requiredFeatures")]
+    #[serde(rename = "requiredFeatures", default)]
     required_features: Vec<String>,
     #[serde(rename = "requiredLimits", default)]
     required_limits: BTreeMap<String, u64>,
@@ -71,7 +71,7 @@ struct Graphics {
 struct DeviceInput {
     #[serde(rename = "abiVersion")]
     abi_version: u32,
-    #[serde(rename = "requiredFeatures")]
+    #[serde(rename = "requiredFeatures", default)]
     required_features: Vec<String>,
 }
 
@@ -80,7 +80,7 @@ struct DeviceInput {
 struct Audio {
     #[serde(rename = "abiVersion")]
     abi_version: u32,
-    #[serde(rename = "requiredFeatures")]
+    #[serde(rename = "requiredFeatures", default)]
     required_features: Vec<String>,
 }
 
@@ -185,6 +185,15 @@ mod tests {
     use crate::PresentationProfile;
 
     const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
+    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
+
+    #[test]
+    fn omitted_required_features_default_to_empty() {
+        let descriptor = AppDescriptor::parse_exact(MINIMAL, MINIMAL).unwrap();
+        assert_eq!(descriptor.presentation, PresentationProfile::Tri2d);
+        assert!(descriptor.input_features.is_empty());
+        assert!(descriptor.audio_enabled);
+    }
 
     #[test]
     fn parses_exact_strict_manifest() {

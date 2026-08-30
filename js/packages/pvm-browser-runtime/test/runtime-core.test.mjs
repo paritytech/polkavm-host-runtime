@@ -160,6 +160,56 @@ test("compiler backend enforces the declared graphics profile", async () => {
   await waitForMessage(messages, "terminated");
 });
 
+test("native-Wasm and translated backends round-trip opaque TrUAPI frames", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/truapi-roundtrip.polkavm",
+    ),
+  );
+  const requestBytes = new TextEncoder().encode(
+    "truapi-conformance-request-v1",
+  );
+  const responseBytes = new TextEncoder().encode(
+    "truapi-conformance-response-v1",
+  );
+  const successBytes = new TextEncoder().encode("truapi-roundtrip-ok");
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: `truapi-roundtrip-${forceInterpreter}`,
+        forceInterpreter,
+      },
+    });
+
+    const request = await waitForMessage(messages, "truapi-request");
+    assert.deepEqual(new Uint8Array(request.bytes), requestBytes);
+
+    receiver.onmessage({
+      data: {
+        type: "truapi-response",
+        bytes: bytesBuffer(responseBytes),
+      },
+    });
+    const save = await waitForMessage(messages, "save");
+    assert.deepEqual(new Uint8Array(save.bytes), successBytes);
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("compiler backend discards stale CoreVM mouse movement", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),

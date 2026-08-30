@@ -43,12 +43,12 @@ jobs:
           browser=false
           while IFS= read -r file; do
             case "$file" in
-              Cargo.toml|Cargo.lock|rust-toolchain.toml|rust/*|.github/*)
+              Cargo.toml|Cargo.lock|rust-toolchain.toml|rust/*|conformance/*|.github/*)
                 rust=true
                 ;;
             esac
             case "$file" in
-              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-runtime-assets/*|js/*|scripts/*|.github/*)
+              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-runtime-assets/*|conformance/*|js/*|scripts/*|.github/*)
                 browser=true
                 ;;
             esac
@@ -67,10 +67,16 @@ jobs:
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
           rustup toolchain install nightly --profile minimal --component rustfmt
+      - name: Install conformance guest toolchain
+        run: |
+          rustup toolchain install nightly-2025-10-09 --profile minimal --component rust-src
+          cargo install polkatool --version 0.31.0 --locked
       - name: Format
         run: cargo +nightly fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check conformance guests
+        run: scripts/check-conformance-guests.sh
       - name: Test
         run: cargo test --workspace --all-features
       - name: Check browser target
