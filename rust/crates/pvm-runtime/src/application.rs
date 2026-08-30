@@ -327,10 +327,13 @@ impl CoreVmRuntime {
                 }
                 self.pointer = Some((event.x, event.y));
             }
-            InputEventType::PointerDelta => self.vm.send_mouse_move(
-                (event.x as i16).clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                (event.y as i16).clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-            ),
+            InputEventType::PointerDelta => {
+                if let (Some(delta_x), Some(delta_y)) =
+                    (corevm_pointer_delta(event.x), corevm_pointer_delta(event.y))
+                {
+                    self.vm.send_mouse_move(delta_x, delta_y);
+                }
+            }
             InputEventType::SurfaceMetrics => {}
         }
     }
@@ -338,4 +341,26 @@ impl CoreVmRuntime {
 
 fn signed_delta(current: u16, previous: u16) -> i8 {
     (i32::from(current) - i32::from(previous)).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+}
+
+fn corevm_pointer_delta(value: u16) -> Option<i8> {
+    i8::try_from(value as i16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::corevm_pointer_delta;
+
+    #[test]
+    fn corevm_pointer_delta_preserves_representable_signed_values() {
+        assert_eq!(corevm_pointer_delta(127), Some(127));
+        assert_eq!(corevm_pointer_delta((-128_i16) as u16), Some(-128));
+    }
+
+    #[test]
+    fn corevm_pointer_delta_drops_safari_pointer_lock_discontinuities() {
+        assert_eq!(corevm_pointer_delta(128), None);
+        assert_eq!(corevm_pointer_delta((-129_i16) as u16), None);
+        assert_eq!(corevm_pointer_delta(430), None);
+    }
 }
