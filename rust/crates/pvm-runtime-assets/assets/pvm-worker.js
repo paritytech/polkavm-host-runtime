@@ -462,6 +462,18 @@
       this.motionSample = bytes.slice();
     }
 
+    setGpuCapabilities(bytes) {
+      if (
+        this.stopped ||
+        !(bytes instanceof Uint8Array) ||
+        bytes.byteLength < 56 ||
+        bytes.byteLength > 4096
+      ) {
+        throw new Error("invalid translated WebGPU capabilities");
+      }
+      this.gpuCapabilities = bytes.slice();
+    }
+
     sendGpuEvent(bytes) {
       if (
         this.stopped ||
@@ -2024,6 +2036,21 @@ globalThis.createPvmRuntime = (endpoint) => {
     );
   }
 
+  function sendGpuCapabilities(bytes) {
+    if (!running || bytes.byteLength < 56 || bytes.byteLength > 4096) {
+      return;
+    }
+    if (translated) {
+      translated.setGpuCapabilities(bytes);
+      return;
+    }
+    stage(bytes);
+    check(
+      pvm.pvm_browser_set_gpu_capabilities(),
+      "update PolkaVM browser GPU capabilities"
+    );
+  }
+
   function sendGpuEvent(bytes) {
     if (!running || !pvm || !bytes.byteLength) {
       return;
@@ -2078,6 +2105,14 @@ globalThis.createPvmRuntime = (endpoint) => {
     } else if (message?.type === "motion") {
       try {
         sendMotionSample(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "gpu-capabilities") {
+      try {
+        sendGpuCapabilities(new Uint8Array(message.bytes));
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
