@@ -1,6 +1,6 @@
 [package]
 name = "pvm-runtime-assets"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Source-built browser assets for the host-neutral PolkaVM runtime"
 license = "MPL-2.0"

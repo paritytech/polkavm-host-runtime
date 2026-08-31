@@ -1,6 +1,6 @@
 [package]
 name = "pvm-runtime"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Host-neutral App manifest v2 PolkaVM runtime and browser execution wrapper"
 license = "MPL-2.0"
@@ -16,8 +16,8 @@ ffi = ["dep:thiserror", "dep:uniffi"]
 [dependencies]
 anyhow = "1"
 log = "0.4"
-pvm-gpu-wire = { version = "0.1.5", path = "../pvm-gpu-wire" }
-pvm-motion-wire = { version = "0.1.5", path = "../pvm-motion-wire" }
+pvm-gpu-wire = { version = "0.1.6", path = "../pvm-gpu-wire" }
+pvm-motion-wire = { version = "0.1.6", path = "../pvm-motion-wire" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-encoder = "0.240"
