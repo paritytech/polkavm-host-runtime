@@ -466,6 +466,18 @@
       this.motionSample = bytes.slice();
     }
 
+    setGpuCapabilities(bytes) {
+      if (
+        this.stopped ||
+        !(bytes instanceof Uint8Array) ||
+        bytes.byteLength < 56 ||
+        bytes.byteLength > 4096
+      ) {
+        throw new Error("invalid translated WebGPU capabilities");
+      }
+      this.gpuCapabilities = bytes.slice();
+    }
+
     sendGpuEvent(bytes) {
       if (
         this.stopped ||
