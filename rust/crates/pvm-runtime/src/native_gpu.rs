@@ -120,44 +120,7 @@ impl NativeGpuRenderer {
     }
 
     pub fn capabilities(&self) -> Vec<u8> {
-        let limits = [
-            (1u16, 4096u64),
-            (2, 16 * 1024 * 1024),
-            (3, 16),
-            (4, 4),
-            (5, 8),
-            (6, 16),
-            (7, 4),
-            (8, 256 * 1024 * 1024),
-            (9, 64 * 1024 * 1024),
-            (10, 8192),
-            (11, gpu_wire::MAX_GPU_BATCH_BYTES as u64),
-            (12, 16 * 1024 * 1024),
-        ];
-        let mut bytes = vec![0; 56 + limits.len() * 16];
-        bytes[..4].copy_from_slice(&gpu_wire::GPU_CAPABILITIES_MAGIC);
-        bytes[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
-        let byte_len = bytes.len() as u32;
-        bytes[8..12].copy_from_slice(&byte_len.to_le_bytes());
-        bytes[12..14].copy_from_slice(&FORMAT_RGBA8_UNORM.to_le_bytes());
-        for (offset, value) in [
-            (16, self.width),
-            (20, self.height),
-            (24, self.width),
-            (28, self.height),
-            (36, self.generation),
-            (40, 1),
-        ] {
-            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        bytes[32..36].copy_from_slice(&1.0f32.to_le_bytes());
-        bytes[44..48].copy_from_slice(&(limits.len() as u16).to_le_bytes());
-        for (index, (key, value)) in limits.into_iter().enumerate() {
-            let offset = 56 + index * 16;
-            bytes[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
-            bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
-        }
-        bytes
+        encode_capabilities(self.width, self.height, self.generation)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1051,6 +1014,47 @@ impl NativeGpuRenderer {
     }
 }
 
+fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
+    let limits = [
+        (1u16, 4096u64),
+        (2, 16 * 1024 * 1024),
+        (3, 16),
+        (4, 4),
+        (5, 8),
+        (6, 16),
+        (7, 4),
+        (8, 256 * 1024 * 1024),
+        (9, 64 * 1024 * 1024),
+        (10, 8192),
+        (11, gpu_wire::MAX_GPU_BATCH_BYTES as u64),
+        (12, 16 * 1024 * 1024),
+    ];
+    let mut bytes = vec![0; 56 + limits.len() * 16];
+    bytes[..4].copy_from_slice(&gpu_wire::GPU_CAPABILITIES_MAGIC);
+    bytes[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+    let byte_len = bytes.len() as u32;
+    bytes[8..12].copy_from_slice(&byte_len.to_le_bytes());
+    bytes[12..14].copy_from_slice(&FORMAT_RGBA8_UNORM.to_le_bytes());
+    for (offset, value) in [
+        (16, width),
+        (20, height),
+        (24, width),
+        (28, height),
+        (36, generation),
+        (40, 1),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[32..36].copy_from_slice(&1.0f32.to_le_bytes());
+    bytes[44..48].copy_from_slice(&(limits.len() as u32).to_le_bytes());
+    for (index, (key, value)) in limits.into_iter().enumerate() {
+        let offset = 56 + index * 16;
+        bytes[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 fn create_surface(
     device: &wgpu::Device,
     width: u32,
@@ -1320,4 +1324,17 @@ fn batch_rejected(sequence: u64, message: &str) -> Vec<u8> {
     bytes[36..40].copy_from_slice(&u32::from(message.len() > text.len()).to_le_bytes());
     bytes[40..40 + text.len()].copy_from_slice(text);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_record_matches_runtime_contract() {
+        let bytes = encode_capabilities(800, 600, 7);
+
+        crate::validate_gpu_capabilities(&bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 12);
+    }
 }
