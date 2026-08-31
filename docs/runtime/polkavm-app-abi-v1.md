@@ -299,6 +299,11 @@ writing one complete sample, `0` when motion is unavailable, inactive, stale,
 or not authorized, and `-40` when `capacity` is too small. It never writes a
 partial sample.
 
+Every ABI v1 Host MUST resolve `host_motion_read`, including Hosts without a
+motion source. An unavailable Host returns `0`; it does not reject the import or
+trap the guest. This keeps pointer fallback deterministic across desktop and
+sensor-capable Hosts.
+
 The 40-byte `PMT1` sample is:
 
 ```text

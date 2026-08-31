@@ -140,7 +140,10 @@ impl ApplicationRuntime {
     pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_motion_tilt(sample),
-            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support motion-tilt input")),
+            Self::CoreVm(runtime) => runtime
+                .vm
+                .set_motion_tilt(sample)
+                .map_err(anyhow::Error::msg),
         }
     }
 

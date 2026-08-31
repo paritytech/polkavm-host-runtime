@@ -65,6 +65,7 @@ pub struct Vm {
     input_events: VecDeque<InputEvent>,
     audio_channels: u32,
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
+    motion_tilt: Option<[u8; crate::MOTION_TILT_BYTES]>,
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
     #[cfg(target_arch = "wasm32")]
@@ -87,6 +88,7 @@ pub struct Vm {
     import_log: Option<u32>,
     import_yield: Option<u32>,
     import_truapi_send: Option<u32>,
+    import_motion_read: Option<u32>,
     import_truapi_poll: Option<u32>,
 }
 
@@ -263,6 +265,7 @@ impl Vm {
         let mut import_log = None;
         let mut import_yield = None;
         let mut import_truapi_send = None;
+        let mut import_motion_read = None;
         let mut import_truapi_poll = None;
 
         for (import_index, import) in module.imports().into_iter().enumerate() {
@@ -285,6 +288,7 @@ impl Vm {
                 b"host_log" => import_log = Some(import_index),
                 b"pvm_yield" => import_yield = Some(import_index),
                 b"host_truapi_send" => import_truapi_send = Some(import_index),
+                b"host_motion_read" => import_motion_read = Some(import_index),
                 b"host_truapi_poll" => import_truapi_poll = Some(import_index),
                 _ => return Err(format!("unsupported import: {}", import).into()),
             }
@@ -301,6 +305,7 @@ impl Vm {
             input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             audio_channels: 0,
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
+            motion_tilt: None,
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
@@ -322,6 +327,7 @@ impl Vm {
             import_log,
             import_yield,
             import_truapi_send,
+            import_motion_read,
             import_truapi_poll,
         })
     }
@@ -364,6 +370,17 @@ impl Vm {
         }
         self.truapi_response_bytes += bytes.len();
         self.truapi_responses.push_back(bytes);
+        Ok(())
+    }
+
+    pub fn set_motion_tilt(
+        &mut self,
+        sample: Option<crate::MotionTiltSample>,
+    ) -> Result<(), String> {
+        self.motion_tilt = sample
+            .map(crate::MotionTiltSample::encode)
+            .transpose()
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -651,6 +668,27 @@ impl Vm {
                         written += event.len();
                     }
                     self.instance.set_reg(Reg::A0, written as u64);
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_motion_read => {
+                    let Some(sample) = self.motion_tilt else {
+                        self.instance.set_reg(Reg::A0, 0);
+                        continue;
+                    };
+                    let capacity =
+                        usize::try_from(self.instance.reg(Reg::A1)).unwrap_or(usize::MAX);
+                    if capacity < crate::MOTION_TILT_BYTES {
+                        self.instance.set_reg(
+                            Reg::A0,
+                            i64::from(-(crate::MOTION_TILT_BYTES as i32)) as u64,
+                        );
+                        continue;
+                    }
+                    let address = u32::try_from(self.instance.reg(Reg::A0))
+                        .map_err(|_| "motion-tilt address is out of range".to_owned())?;
+                    self.instance.write_memory(address, &sample)?;
+                    self.instance
+                        .set_reg(Reg::A0, crate::MOTION_TILT_BYTES as u64);
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_truapi_send => {
