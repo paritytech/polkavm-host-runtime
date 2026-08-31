@@ -8,6 +8,7 @@ extern crate polkavm_wasm as polkavm;
 mod application;
 mod corevm;
 pub use pvm_gpu_wire as gpu_wire;
+pub use pvm_motion_wire as motion_wire;
 mod manifest;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
@@ -270,6 +271,64 @@ impl HostClock {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MotionState {
+    availability: motion_wire::MotionAvailability,
+    sample: Option<[u8; motion_wire::MOTION_SAMPLE_BYTES]>,
+}
+
+impl MotionState {
+    fn new() -> Self {
+        Self {
+            availability: motion_wire::MotionAvailability::Unavailable,
+            sample: None,
+        }
+    }
+
+    pub(crate) fn set_availability(&mut self, availability: motion_wire::MotionAvailability) {
+        self.availability = availability;
+        if availability != motion_wire::MotionAvailability::Available {
+            self.sample = None;
+        }
+    }
+
+    pub(crate) fn set_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        motion_wire::MotionSample::decode(bytes)
+            .map_err(|error| anyhow!("invalid motion sample: {error}"))?;
+        let sample: [u8; motion_wire::MOTION_SAMPLE_BYTES] = bytes
+            .try_into()
+            .map_err(|_| anyhow!("invalid motion sample length"))?;
+        self.availability = motion_wire::MotionAvailability::Available;
+        self.sample = Some(sample);
+        Ok(())
+    }
+
+    pub(crate) fn read(
+        &self,
+        capacity: usize,
+    ) -> core::result::Result<Option<[u8; motion_wire::MOTION_SAMPLE_BYTES]>, i32> {
+        match self.availability {
+            motion_wire::MotionAvailability::Unavailable => {
+                Err(motion_wire::MOTION_ERROR_UNAVAILABLE)
+            }
+            motion_wire::MotionAvailability::PermissionDenied => {
+                Err(motion_wire::MOTION_ERROR_PERMISSION_DENIED)
+            }
+            motion_wire::MotionAvailability::Available => {
+                if capacity < motion_wire::MOTION_SAMPLE_BYTES {
+                    Err(motion_wire::MOTION_ERROR_BUFFER_TOO_SMALL)
+                } else {
+                    Ok(self.sample)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn consume(&mut self) {
+        self.sample = None;
+    }
+}
+
 pub(crate) fn preferred_backend() -> BackendKind {
     #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
     {
@@ -298,6 +357,7 @@ struct HostState {
     hostcall_bytes_remaining: usize,
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
+    motion: MotionState,
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
     gpu_events: VecDeque<Vec<u8>>,
@@ -333,6 +393,7 @@ impl HostState {
             hostcall_bytes_remaining: 0,
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
+            motion: MotionState::new(),
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
             gpu_events: VecDeque::new(),
@@ -785,6 +846,31 @@ impl Runtime {
 
         linker
             .define_typed(
+                motion_wire::MOTION_READ_IMPORT,
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let sample = match caller.user_data.motion.read(capacity as usize) {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(motion_wire::MOTION_READ_NO_SAMPLE),
+                        Err(status) => return Ok(status),
+                    };
+                    caller
+                        .user_data
+                        .charge_hostcall_bytes(motion_wire::MOTION_SAMPLE_BYTES)?;
+                    if caller.instance.write_memory(pointer, &sample).is_err() {
+                        return Ok(motion_wire::MOTION_ERROR_INVALID_GUEST_RANGE);
+                    }
+                    caller.user_data.motion.consume();
+                    Ok(motion_wire::MOTION_SAMPLE_BYTES as i32)
+                },
+            )
+            .context("define host_motion_read")?;
+
+        linker
+            .define_typed(
                 "host_time_ms",
                 |caller: polkavm::Caller<'_, HostState>| -> Result<u64> {
                     caller.user_data.charge_hostcall(0)?;
@@ -1002,6 +1088,14 @@ impl Runtime {
 
     pub fn send_input(&mut self, event: InputEvent) {
         self.state.queue_input(event);
+    }
+
+    pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
+        self.state.motion.set_availability(availability);
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        self.state.motion.set_sample(bytes)
     }
 
     pub fn gpu_ready(&self) -> bool {
@@ -1253,6 +1347,37 @@ fn map_call_result(result: Result<(), CallError<anyhow::Error>>, phase: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polkavm::Reg;
+    use polkavm_common::abi::MemoryMapBuilder;
+    use polkavm_common::program::{asm, InstructionSetKind};
+    use polkavm_common::writer::ProgramBlobBuilder;
+
+    fn motion_test_program() -> (Vec<u8>, u32) {
+        let rw_size = 64 * 1024;
+        let stack_size = 4 * 1024;
+        let memory = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(rw_size)
+            .stack_size(stack_size)
+            .build()
+            .unwrap();
+        let output = memory.rw_data_address();
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(rw_size);
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_motion_read");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, motion_wire::MOTION_SAMPLE_BYTES as i32),
+                asm::ecalli(0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        (builder.into_vec().unwrap(), output)
+    }
 
     #[test]
     fn presentation_profile_uses_tri2d_without_legacy_alias() {
@@ -1263,6 +1388,107 @@ mod tests {
         assert!(
             PresentationProfile::parse("ui-mesh").is_err(),
             "the provisional profile name must not remain an alias"
+        );
+    }
+
+    #[test]
+    fn motion_state_reports_status_and_consumes_only_successful_reads() {
+        let mut motion = MotionState::new();
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Err(motion_wire::MOTION_ERROR_UNAVAILABLE)
+        );
+
+        motion.set_availability(motion_wire::MotionAvailability::Available);
+        assert_eq!(motion.read(motion_wire::MOTION_SAMPLE_BYTES), Ok(None));
+        let sample = motion_wire::MotionSample {
+            flags: motion_wire::MOTION_FLAG_ROTATION | motion_wire::MOTION_FLAG_POINTER_EMULATED,
+            sequence: 1,
+            timestamp_ms: 20.0,
+            acceleration_x: 0.0,
+            acceleration_y: 0.0,
+            acceleration_z: 0.0,
+            rotation_alpha: 0.0,
+            rotation_beta: -2.0,
+            rotation_gamma: 4.0,
+        }
+        .encode()
+        .unwrap();
+        motion.set_sample(&sample).unwrap();
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES - 1),
+            Err(motion_wire::MOTION_ERROR_BUFFER_TOO_SMALL)
+        );
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Ok(Some(sample))
+        );
+        motion.consume();
+        assert_eq!(motion.read(motion_wire::MOTION_SAMPLE_BYTES), Ok(None));
+
+        motion.set_availability(motion_wire::MotionAvailability::PermissionDenied);
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Err(motion_wire::MOTION_ERROR_PERMISSION_DENIED)
+        );
+    }
+
+    #[test]
+    fn interpreter_motion_hostcall_reports_status_and_writes_one_sample() {
+        let (program, output) = motion_test_program();
+        let mut runtime = Runtime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+
+        runtime.init().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0) as u32 as i32,
+            motion_wire::MOTION_ERROR_UNAVAILABLE
+        );
+        runtime.set_motion_availability(motion_wire::MotionAvailability::Available);
+        runtime.update().unwrap();
+        assert_eq!(runtime.instance.reg(Reg::A0), 0);
+
+        let sample = motion_wire::MotionSample {
+            flags: motion_wire::MOTION_FLAG_ROTATION | motion_wire::MOTION_FLAG_POINTER_EMULATED,
+            sequence: 9,
+            timestamp_ms: 30.0,
+            acceleration_x: 0.0,
+            acceleration_y: 0.0,
+            acceleration_z: 0.0,
+            rotation_alpha: 0.0,
+            rotation_beta: 3.0,
+            rotation_gamma: -4.0,
+        }
+        .encode()
+        .unwrap();
+        runtime.send_motion_sample(&sample).unwrap();
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0),
+            motion_wire::MOTION_SAMPLE_BYTES as u64
+        );
+        assert_eq!(
+            runtime
+                .instance
+                .read_memory(output, motion_wire::MOTION_SAMPLE_BYTES as u32)
+                .unwrap(),
+            sample
+        );
+        runtime.update().unwrap();
+        assert_eq!(runtime.instance.reg(Reg::A0), 0);
+
+        runtime.set_motion_availability(motion_wire::MotionAvailability::PermissionDenied);
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0) as u32 as i32,
+            motion_wire::MOTION_ERROR_PERMISSION_DENIED
         );
     }
 

@@ -9,7 +9,7 @@
  *
  * @param {DedicatedWorkerGlobalScope} endpoint - Message endpoint owned by the runtime.
  */
-globalThis.createPvmRuntime = endpoint => {
+globalThis.createPvmRuntime = (endpoint) => {
   const postMessage = (message, transfers) => {
     if (transfers) {
       endpoint.postMessage(message, transfers);
@@ -26,6 +26,7 @@ globalThis.createPvmRuntime = endpoint => {
   const MAX_ASSET_NAME_BYTES = 1024;
   const MAX_ASSET_FILE_BYTES = 64 * 1024 * 1024;
   const MAX_ASSET_BYTES = 128 * 1024 * 1024;
+  const MOTION_SAMPLE_BYTES = 48;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -35,6 +36,8 @@ globalThis.createPvmRuntime = endpoint => {
   let backend = "interpreter";
   let running = false;
   let disposed = false;
+  let motionAvailability = 0;
+  let pendingMotionSample = null;
   let timer;
   let startedAt = 0;
   let updateCount = 0;
@@ -89,7 +92,7 @@ globalThis.createPvmRuntime = endpoint => {
     stage(packed);
     check(
       pvm.pvm_browser_launch_add_asset(path.byteLength),
-      `mount browser asset ${asset.path}`
+      `mount browser asset ${asset.path}`,
     );
   }
 
@@ -103,7 +106,7 @@ globalThis.createPvmRuntime = endpoint => {
     const source = new Uint8Array(
       pvm.memory.buffer,
       pvm.pvm_browser_frame_pointer(),
-      length
+      length,
     );
     const pixels = new Uint8Array(length);
     for (let index = 0; index < length; index += 4) {
@@ -123,7 +126,7 @@ globalThis.createPvmRuntime = endpoint => {
     const bytes = new Uint8Array(
       pvm.memory.buffer,
       pvm.pvm_browser_tri2d_pointer(),
-      length
+      length,
     ).slice();
     postMessage({ type: "tri2d", bytes }, [bytes.buffer]);
   }
@@ -134,7 +137,7 @@ globalThis.createPvmRuntime = endpoint => {
       const bytes = new Uint8Array(
         pvm.memory.buffer,
         pvm.pvm_browser_gpu_batch_pointer(),
-        length
+        length,
       ).slice();
       postMessage({ type: "gpu-batch", bytes }, [bytes.buffer]);
     }
@@ -146,7 +149,7 @@ globalThis.createPvmRuntime = endpoint => {
       const bytes = new Uint8Array(
         pvm.memory.buffer,
         pvm.pvm_browser_truapi_request_pointer(),
-        length
+        length,
       ).slice();
       postMessage({ type: "truapi-request", bytes }, [bytes.buffer]);
     }
@@ -160,7 +163,7 @@ globalThis.createPvmRuntime = endpoint => {
       const samples = new Uint8Array(
         pvm.memory.buffer,
         pvm.pvm_browser_audio_pointer(),
-        length
+        length,
       ).slice();
       postMessage({ type: "audio", sampleRate, channels, samples }, [
         samples.buffer,
@@ -174,7 +177,7 @@ globalThis.createPvmRuntime = endpoint => {
       const bytes = new Uint8Array(
         pvm.memory.buffer,
         pvm.pvm_browser_save_pointer(),
-        length
+        length,
       ).slice();
       postMessage({ type: "save", bytes }, [bytes.buffer]);
     }
@@ -185,7 +188,7 @@ globalThis.createPvmRuntime = endpoint => {
       const pointer = pvm.pvm_browser_log_pointer();
       const length = pvm.pvm_browser_log_length();
       const message = decoder.decode(
-        new Uint8Array(pvm.memory.buffer, pointer, length)
+        new Uint8Array(pvm.memory.buffer, pointer, length),
       );
       postMessage({ type: "log", message });
     }
@@ -206,7 +209,7 @@ globalThis.createPvmRuntime = endpoint => {
       } else {
         check(
           pvm.pvm_browser_update(before - startedAt),
-          "update PolkaVM browser guest"
+          "update PolkaVM browser guest",
         );
         drainFrame();
         drainTri2d();
@@ -233,7 +236,7 @@ globalThis.createPvmRuntime = endpoint => {
     }
     if (updateCount % 120 === 0) {
       const sorted = [...updateSamples].sort((a, b) => a - b);
-      const percentile = value =>
+      const percentile = (value) =>
         sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * value))];
       postMessage({
         type: "metrics",
@@ -271,7 +274,7 @@ globalThis.createPvmRuntime = endpoint => {
       path
         .split("/")
         .some(
-          component => !component || component === "." || component === ".."
+          (component) => !component || component === "." || component === "..",
         )
     ) {
       throw new Error(`invalid PolkaVM browser asset path ${path}`);
@@ -288,16 +291,16 @@ globalThis.createPvmRuntime = endpoint => {
     const program = asBytes(message.program, "PolkaVM browser program");
     if (!program.byteLength || program.byteLength > MAX_PROGRAM_BYTES) {
       throw new Error(
-        `PolkaVM browser program must contain 1..=${MAX_PROGRAM_BYTES} bytes`
+        `PolkaVM browser program must contain 1..=${MAX_PROGRAM_BYTES} bytes`,
       );
     }
     if (
       !["framebuffer", "tri2d", "webgpu-raster"].includes(
-        message.graphicsProfile
+        message.graphicsProfile,
       )
     ) {
       throw new Error(
-        `invalid PolkaVM browser graphics profile ${message.graphicsProfile}`
+        `invalid PolkaVM browser graphics profile ${message.graphicsProfile}`,
       );
     }
     if (
@@ -305,7 +308,7 @@ globalThis.createPvmRuntime = endpoint => {
       message.assets.length > MAX_ASSET_FILES
     ) {
       throw new Error(
-        `PolkaVM browser launch exceeds ${MAX_ASSET_FILES} assets`
+        `PolkaVM browser launch exceeds ${MAX_ASSET_FILES} assets`,
       );
     }
     const paths = new Set();
@@ -317,23 +320,23 @@ globalThis.createPvmRuntime = endpoint => {
       validateAssetPath(asset.path);
       if (paths.has(asset.path)) {
         throw new Error(
-          `PolkaVM browser asset path is duplicated: ${asset.path}`
+          `PolkaVM browser asset path is duplicated: ${asset.path}`,
         );
       }
       paths.add(asset.path);
       const length = asBytes(
         asset.bytes,
-        `PolkaVM browser asset ${asset.path}`
+        `PolkaVM browser asset ${asset.path}`,
       ).byteLength;
       if (length > MAX_ASSET_FILE_BYTES) {
         throw new Error(
-          `PolkaVM browser asset ${asset.path} exceeds ${MAX_ASSET_FILE_BYTES} bytes`
+          `PolkaVM browser asset ${asset.path} exceeds ${MAX_ASSET_FILE_BYTES} bytes`,
         );
       }
       assetBytes += length;
       if (!Number.isSafeInteger(assetBytes) || assetBytes > MAX_ASSET_BYTES) {
         throw new Error(
-          `PolkaVM browser assets exceed ${MAX_ASSET_BYTES} bytes`
+          `PolkaVM browser assets exceed ${MAX_ASSET_BYTES} bytes`,
         );
       }
     }
@@ -342,8 +345,16 @@ globalThis.createPvmRuntime = endpoint => {
       !(message.gpuCapabilities instanceof ArrayBuffer)
     ) {
       throw new Error(
-        "WebGPU capabilities are required before PVM initialization"
+        "WebGPU capabilities are required before PVM initialization",
       );
+    }
+    if (
+      message.motionAvailability !== undefined &&
+      (!Number.isInteger(message.motionAvailability) ||
+        message.motionAvailability < 0 ||
+        message.motionAvailability > 2)
+    ) {
+      throw new Error("invalid PolkaVM browser motion availability");
     }
     return program;
   }
@@ -356,6 +367,7 @@ globalThis.createPvmRuntime = endpoint => {
       throw new Error("PolkaVM browser worker is already started");
     }
     const program = validateStartMessage(message);
+    motionAvailability = message.motionAvailability ?? 0;
     const bootStarted = performance.now();
     let translationMs = 0;
     let compilationMs = 0;
@@ -385,7 +397,7 @@ globalThis.createPvmRuntime = endpoint => {
           const translationStarted = performance.now();
           check(
             pvm.pvm_browser_translate_staged(),
-            "translate PolkaVM browser guest"
+            "translate PolkaVM browser guest",
           );
           translationMs = performance.now() - translationStarted;
           const pointer = pvm.pvm_browser_translation_pointer();
@@ -398,7 +410,7 @@ globalThis.createPvmRuntime = endpoint => {
               cacheKey: message.cacheKey,
               bytes: persistent,
             },
-            [persistent.buffer]
+            [persistent.buffer],
           );
         }
         translatedWasmBytes = bytes.byteLength;
@@ -424,9 +436,14 @@ globalThis.createPvmRuntime = endpoint => {
         message.graphicsProfile,
         message.gpuCapabilities instanceof ArrayBuffer
           ? new Uint8Array(message.gpuCapabilities)
-          : null
+          : null,
+        motionAvailability,
       );
+      if (pendingMotionSample !== null) {
+        translated.sendMotionSample(pendingMotionSample);
+      }
       translated.initialize();
+      pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
       translated = null;
@@ -443,7 +460,7 @@ globalThis.createPvmRuntime = endpoint => {
       const begin = pvm.pvm_browser_launch_begin_v2;
       if (typeof begin !== "function") {
         throw new Error(
-          "PolkaVM interpreter does not support graphics profiles"
+          "PolkaVM interpreter does not support graphics profiles",
         );
       }
       postMessage({ type: "startup", stage: "interpreter-staging-program" });
@@ -452,7 +469,7 @@ globalThis.createPvmRuntime = endpoint => {
       postMessage({ type: "startup", stage: "interpreter-launch-begin" });
       check(
         begin(MAX_GAS_PER_UPDATE, message.audioEnabled ? 1 : 0, presentation),
-        "begin PolkaVM browser launch"
+        "begin PolkaVM browser launch",
       );
       postMessage({ type: "startup", stage: "interpreter-launch-begun" });
       postMessage({ type: "startup", stage: "interpreter-mounting-assets" });
@@ -463,16 +480,28 @@ globalThis.createPvmRuntime = endpoint => {
       postMessage({ type: "startup", stage: "interpreter-launch-starting" });
       check(pvm.pvm_browser_launch_start(), "start PolkaVM browser launch");
       postMessage({ type: "startup", stage: "interpreter-launch-started" });
+      check(
+        pvm.pvm_browser_set_motion_availability(motionAvailability),
+        "set PolkaVM browser motion availability",
+      );
+      if (pendingMotionSample !== null) {
+        stage(pendingMotionSample);
+        check(
+          pvm.pvm_browser_send_motion_sample(),
+          "send PolkaVM browser motion sample",
+        );
+        pendingMotionSample = null;
+      }
       if (message.graphicsProfile === "webgpu-raster") {
         if (!(message.gpuCapabilities instanceof ArrayBuffer)) {
           throw new Error(
-            "WebGPU capabilities are required before PVM initialization"
+            "WebGPU capabilities are required before PVM initialization",
           );
         }
         stage(new Uint8Array(message.gpuCapabilities));
         check(
           pvm.pvm_browser_set_gpu_capabilities(),
-          "set PolkaVM browser GPU capabilities"
+          "set PolkaVM browser GPU capabilities",
         );
       }
       postMessage({ type: "startup", stage: "interpreter-initializing" });
@@ -519,9 +548,54 @@ globalThis.createPvmRuntime = endpoint => {
         bytes[0],
         bytes[1],
         view.getUint16(2, true),
-        view.getUint16(4, true)
+        view.getUint16(4, true),
       ),
-      "send PolkaVM browser input"
+      "send PolkaVM browser input",
+    );
+  }
+
+  function setMotionAvailability(availability) {
+    if (
+      !Number.isInteger(availability) ||
+      availability < 0 ||
+      availability > 2
+    ) {
+      throw new Error("invalid PolkaVM browser motion availability");
+    }
+    motionAvailability = availability;
+    if (availability !== 1) {
+      pendingMotionSample = null;
+    }
+    if (!running || !pvm) {
+      return;
+    }
+    if (translated) {
+      translated.setMotionAvailability(availability);
+      return;
+    }
+    check(
+      pvm.pvm_browser_set_motion_availability(availability),
+      "set PolkaVM browser motion availability",
+    );
+  }
+
+  function sendMotionSample(bytes) {
+    if (bytes.byteLength !== MOTION_SAMPLE_BYTES) {
+      throw new Error("invalid PolkaVM browser motion sample");
+    }
+    if (!running || !pvm) {
+      pendingMotionSample = bytes.slice();
+      motionAvailability = 1;
+      return;
+    }
+    if (translated) {
+      translated.sendMotionSample(bytes);
+      return;
+    }
+    stage(bytes);
+    check(
+      pvm.pvm_browser_send_motion_sample(),
+      "send PolkaVM browser motion sample",
     );
   }
 
@@ -548,14 +622,14 @@ globalThis.createPvmRuntime = endpoint => {
     stage(bytes);
     check(
       pvm.pvm_browser_send_truapi_response(),
-      "send PolkaVM browser TrUAPI response"
+      "send PolkaVM browser TrUAPI response",
     );
   }
 
-  endpoint.onmessage = event => {
+  endpoint.onmessage = (event) => {
     const message = event.data;
     if (message?.type === "start") {
-      void start(message).catch(error => {
+      void start(message).catch((error) => {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
         postMessage({ type: "terminated" });
@@ -563,6 +637,22 @@ globalThis.createPvmRuntime = endpoint => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "motion-status") {
+      try {
+        setMotionAvailability(message.availability);
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "motion") {
+      try {
+        sendMotionSample(new Uint8Array(message.bytes));
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

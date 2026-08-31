@@ -17,6 +17,7 @@ ffi = ["dep:thiserror", "dep:uniffi"]
 anyhow = "1"
 log = "0.4"
 pvm-gpu-wire = { version = "0.1.5", path = "../pvm-gpu-wire" }
+pvm-motion-wire = { version = "0.1.5", path = "../pvm-motion-wire" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-encoder = "0.240"
@@ -31,4 +32,5 @@ polkavm-wasm = { package = "polkavm", git = "https://github.com/paritytech/polka
 
 [dev-dependencies]
 wasmi = "0.40"
+polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "e06cce9da5c6d3f72458168876ea304e27992094", version = "=0.37.0" }
 wasmparser = "0.240"
