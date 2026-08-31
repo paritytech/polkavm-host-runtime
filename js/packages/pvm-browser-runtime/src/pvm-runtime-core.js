@@ -132,6 +132,19 @@ globalThis.createPvmRuntime = (endpoint) => {
     postMessage({ type: "tri2d", bytes }, [bytes.buffer]);
   }
 
+  function drainUiSemantics() {
+    if (!pvm.pvm_browser_take_ui_semantics?.()) {
+      return;
+    }
+    const length = pvm.pvm_browser_ui_semantics_length();
+    const bytes = new Uint8Array(
+      pvm.memory.buffer,
+      pvm.pvm_browser_ui_semantics_pointer(),
+      length,
+    ).slice();
+    postMessage({ type: "ui-semantics", bytes }, [bytes.buffer]);
+  }
+
   function drainGpuBatches() {
     while (pvm.pvm_browser_take_gpu_batch?.()) {
       const length = pvm.pvm_browser_gpu_batch_length();
@@ -214,6 +227,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         );
         drainFrame();
         drainTri2d();
+        drainUiSemantics();
         drainGpuBatches();
         drainTruapiRequests();
         drainAudio();
@@ -547,15 +561,23 @@ globalThis.createPvmRuntime = (endpoint) => {
       translated.sendInput(bytes);
       return;
     }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes[0] <= 7) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      check(
+        pvm.pvm_browser_send_input(
+          bytes[0],
+          bytes[1],
+          view.getUint16(2, true),
+          view.getUint16(4, true),
+        ),
+        "send PolkaVM browser input",
+      );
+      return;
+    }
+    stage(bytes);
     check(
-      pvm.pvm_browser_send_input(
-        bytes[0],
-        bytes[1],
-        view.getUint16(2, true),
-        view.getUint16(4, true),
-      ),
-      "send PolkaVM browser input",
+      pvm.pvm_browser_send_input_record(),
+      "send PolkaVM browser extended input",
     );
   }
 
