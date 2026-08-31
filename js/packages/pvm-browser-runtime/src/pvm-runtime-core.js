@@ -38,6 +38,7 @@ globalThis.createPvmRuntime = (endpoint) => {
   let disposed = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
+  let pendingGpuCapabilities = null;
   let timer;
   let startedAt = 0;
   let updateCount = 0;
@@ -368,6 +369,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     }
     const program = validateStartMessage(message);
     motionAvailability = message.motionAvailability ?? 0;
+    pendingGpuCapabilities =
+      message.gpuCapabilities instanceof ArrayBuffer
+        ? new Uint8Array(message.gpuCapabilities).slice()
+        : null;
     const bootStarted = performance.now();
     let translationMs = 0;
     let compilationMs = 0;
@@ -434,15 +439,14 @@ globalThis.createPvmRuntime = (endpoint) => {
         MAX_TRANSLATED_LOOPS_PER_UPDATE,
         message.audioEnabled,
         message.graphicsProfile,
-        message.gpuCapabilities instanceof ArrayBuffer
-          ? new Uint8Array(message.gpuCapabilities)
-          : null,
+        pendingGpuCapabilities,
         motionAvailability,
       );
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
       }
       translated.initialize();
+      pendingGpuCapabilities = null;
       pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
@@ -493,16 +497,17 @@ globalThis.createPvmRuntime = (endpoint) => {
         pendingMotionSample = null;
       }
       if (message.graphicsProfile === "webgpu-raster") {
-        if (!(message.gpuCapabilities instanceof ArrayBuffer)) {
+        if (pendingGpuCapabilities === null) {
           throw new Error(
             "WebGPU capabilities are required before PVM initialization",
           );
         }
-        stage(new Uint8Array(message.gpuCapabilities));
+        stage(pendingGpuCapabilities);
         check(
           pvm.pvm_browser_set_gpu_capabilities(),
           "set PolkaVM browser GPU capabilities",
         );
+        pendingGpuCapabilities = null;
       }
       postMessage({ type: "startup", stage: "interpreter-initializing" });
       try {
@@ -600,7 +605,11 @@ globalThis.createPvmRuntime = (endpoint) => {
   }
 
   function sendGpuCapabilities(bytes) {
-    if (!running || bytes.byteLength < 56 || bytes.byteLength > 4096) {
+    if (bytes.byteLength < 56 || bytes.byteLength > 4096) {
+      throw new Error("invalid PolkaVM browser GPU capabilities");
+    }
+    if (!running || !pvm) {
+      pendingGpuCapabilities = bytes.slice();
       return;
     }
     if (translated) {
@@ -610,7 +619,7 @@ globalThis.createPvmRuntime = (endpoint) => {
     stage(bytes);
     check(
       pvm.pvm_browser_set_gpu_capabilities(),
-      "update PolkaVM browser GPU capabilities"
+      "update PolkaVM browser GPU capabilities",
     );
   }
 
