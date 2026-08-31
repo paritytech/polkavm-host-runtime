@@ -26,13 +26,13 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "pvm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/pvm-browser-runtime.wasm"),
-        sha256: "3b448399a39ee571765f41266032c621ce3668176d7f0d6372c85d6068e7d4a5",
+        sha256: "e5272df5ed0ef9c682ef39198161b44c4b46f1fa17c2df6f3d7c216c5934c32b",
     },
     BrowserAsset {
         path: "pvm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-worker.js"),
-        sha256: "55ce96805e22f60ec9a4da072a316c34c1f650d99bdf1421805c1ba35c2d8161",
+        sha256: "48df143a60691765029e39555a9b4a3e51176000806fb3abb8a04f22e97c89ba",
     },
     BrowserAsset {
         path: "pvm-gpu-worker.js",
@@ -44,13 +44,13 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "pvm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-wasm-translated.js"),
-        sha256: "a4c2a9ed4274c79b0c11ddbac163f1de200d41005ca1ce54909a5b8116d82c46",
+        sha256: "3bdb850c57ec1fc32f0d08bacca74313a2d77a6d4d4fedffcad87ddfd3028a7b",
     },
     BrowserAsset {
         path: "pvm-runtime-core.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-runtime-core.js"),
-        sha256: "79dce3ab925e78e9ef8e5df6e34fb2823e6f362cbc97d265a9ffdcc22cc24ed4",
+        sha256: "7e746495b2e3048fcba922f714f439e84942175c67c8e73de36f5b892af1f965",
     },
     BrowserAsset {
         path: "pvm-wasm-worker-entry.js",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "8e582ed7a2aca06918f2866e7977af85142333793c15c063d9a2c9b9432f7410",
+        sha256: "a9c87b9444779af81ea7cf01f004016a01034bd78665502b2f24d8e86962c719",
     },
 ];
 

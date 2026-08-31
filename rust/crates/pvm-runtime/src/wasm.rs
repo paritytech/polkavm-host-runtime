@@ -4,8 +4,8 @@
 
 use crate::{
     ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, Tri2dFrame, MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES,
-    MAX_PROGRAM_BYTES,
+    PresentationProfile, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_ASSET_BYTES,
+    MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -35,6 +35,7 @@ struct BrowserHost {
     staging: Vec<u8>,
     frame: Option<Frame>,
     tri2d: Option<Tri2dFrame>,
+    ui_semantics: Option<UiSemanticsFrame>,
     gpu_batch: Option<GpuBatch>,
     audio: Option<AudioChunk>,
     truapi_request: Option<Vec<u8>>,
@@ -51,6 +52,7 @@ impl BrowserHost {
             staging: Vec::new(),
             frame: None,
             tri2d: None,
+            ui_semantics: None,
             gpu_batch: None,
             audio: None,
             truapi_request: None,
@@ -71,6 +73,7 @@ impl BrowserHost {
     fn clear_outputs(&mut self) {
         self.frame = None;
         self.tri2d = None;
+        self.ui_semantics = None;
         self.gpu_batch = None;
         self.truapi_request = None;
         self.audio = None;
@@ -336,6 +339,17 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
 }
 
 #[no_mangle]
+pub extern "C" fn pvm_browser_send_input_record() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        let record: [u8; INPUT_EVENT_BYTES] = bytes
+            .try_into()
+            .map_err(|_| anyhow!("extended input record must contain {INPUT_EVENT_BYTES} bytes"))?;
+        host.running()?.send_input_record(record)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn pvm_browser_take_frame() -> u32 {
     HOST.with(|host| {
         let mut host = host.borrow_mut();
@@ -404,6 +418,38 @@ pub extern "C" fn pvm_browser_tri2d_length() -> u32 {
     HOST.with(|host| {
         host.borrow()
             .tri2d
+            .as_ref()
+            .map_or(0, |frame| frame.bytes.len() as u32)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_take_ui_semantics() -> u32 {
+    HOST.with(|host| {
+        let mut host = host.borrow_mut();
+        host.ui_semantics = match &mut host.phase {
+            Phase::Running(runtime) => runtime.take_ui_semantics(),
+            _ => None,
+        };
+        u32::from(host.ui_semantics.is_some())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_ui_semantics_pointer() -> u32 {
+    HOST.with(|host| {
+        host.borrow()
+            .ui_semantics
+            .as_ref()
+            .map_or(0, |frame| frame.bytes.as_ptr() as usize as u32)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_ui_semantics_length() -> u32 {
+    HOST.with(|host| {
+        host.borrow()
+            .ui_semantics
             .as_ref()
             .map_or(0, |frame| frame.bytes.len() as u32)
     })
