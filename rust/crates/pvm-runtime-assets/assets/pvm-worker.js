@@ -1866,9 +1866,9 @@ globalThis.createPvmRuntime = (endpoint) => {
       );
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
-        pendingMotionSample = null;
       }
       translated.initialize();
+      pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
       translated = null;
