@@ -265,6 +265,59 @@ The device-input contract defines code values, coordinate interpretation, and
 surface-metric scaling. ABI v1 does not define touch, wheel, UTF-8 text, IME,
 or focus events.
 
+### Motion
+
+```text
+host_motion_read(pointer: u32, capacity: u32) -> i32
+```
+
+The hostcall is part of the base ABI and MUST always resolve. A Host without a
+motion source returns an explicit status instead of leaving the import
+unresolved. One successful read consumes the latest sample; later reads return
+zero until a newer sample arrives.
+
+```text
+ 48  one complete MotionSample v1 record written
+  0  no newer sample
+ -1  motion unavailable
+ -2  motion permission denied
+ -3  invalid guest output range
+ -4  output capacity is smaller than 48 bytes
+```
+
+MotionSample v1 is a fixed 48-byte little-endian record:
+
+```text
+offset  type    field
+0       [u8;4] magic "PMO1"
+4       u16    version = 1
+6       u16    flags
+8       u32    byte length = 48
+12      u32    nonzero sequence
+16      f64    monotonic timestamp, milliseconds
+24      f32    acceleration including gravity X, m/s²
+28      f32    acceleration including gravity Y, m/s²
+32      f32    acceleration including gravity Z, m/s²
+36      f32    rotation rate alpha around Z, degrees/second
+40      f32    rotation rate beta around X, degrees/second
+44      f32    rotation rate gamma around Y, degrees/second
+```
+
+Flags are:
+
+```text
+bit 0  acceleration fields are valid
+bit 1  rotation fields are valid
+bit 2  rotation is emulated from pointer movement
+```
+
+All numeric fields MUST be finite. Pointer emulation sets alpha and all
+acceleration fields to zero, fills beta and gamma, and sets bits 1 and 2.
+
+An application that cannot operate without motion lists `"motion"` in
+`deviceInput.requiredFeatures`. An application with pointer or keyboard
+fallback does not require motion and MUST handle `-1` and `-2`.
+
 ### Time
 
 ```text

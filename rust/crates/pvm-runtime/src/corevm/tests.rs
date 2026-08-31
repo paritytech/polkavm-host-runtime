@@ -3,6 +3,20 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::*;
+use polkavm_common::program::{asm, InstructionSetKind};
+use polkavm_common::writer::ProgramBlobBuilder;
+
+#[test]
+fn corevm_accepts_the_motion_hostcall() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(b"host_motion_read");
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert_eq!(vm.import_motion_read, Some(0));
+}
 
 #[test]
 fn open_files_enforce_the_descriptor_limit() {

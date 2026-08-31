@@ -65,6 +65,7 @@ pub struct Vm {
     input_events: VecDeque<InputEvent>,
     audio_channels: u32,
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
+    motion: crate::MotionState,
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
     #[cfg(target_arch = "wasm32")]
@@ -87,6 +88,7 @@ pub struct Vm {
     import_log: Option<u32>,
     import_yield: Option<u32>,
     import_truapi_send: Option<u32>,
+    import_motion_read: Option<u32>,
     import_truapi_poll: Option<u32>,
 }
 
@@ -264,6 +266,7 @@ impl Vm {
         let mut import_yield = None;
         let mut import_truapi_send = None;
         let mut import_truapi_poll = None;
+        let mut import_motion_read = None;
 
         for (import_index, import) in module.imports().into_iter().enumerate() {
             let Some(import) = import else {
@@ -286,6 +289,7 @@ impl Vm {
                 b"pvm_yield" => import_yield = Some(import_index),
                 b"host_truapi_send" => import_truapi_send = Some(import_index),
                 b"host_truapi_poll" => import_truapi_poll = Some(import_index),
+                b"host_motion_read" => import_motion_read = Some(import_index),
                 _ => return Err(format!("unsupported import: {}", import).into()),
             }
         }
@@ -301,6 +305,7 @@ impl Vm {
             input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             audio_channels: 0,
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
+            motion: crate::MotionState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
@@ -323,6 +328,7 @@ impl Vm {
             import_yield,
             import_truapi_send,
             import_truapi_poll,
+            import_motion_read,
         })
     }
 
@@ -340,6 +346,19 @@ impl Vm {
         {
             self.started.elapsed().as_millis() as u64
         }
+    }
+
+    pub fn set_motion_availability(
+        &mut self,
+        availability: crate::motion_wire::MotionAvailability,
+    ) {
+        self.motion.set_availability(availability);
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.motion
+            .set_sample(bytes)
+            .map_err(|error| error.to_string())
     }
 
     pub fn backend(&self) -> polkavm::BackendKind {
@@ -651,6 +670,35 @@ impl Vm {
                         written += event.len();
                     }
                     self.instance.set_reg(Reg::A0, written as u64);
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_motion_read => {
+                    let address = u32::try_from(self.instance.reg(Reg::A0))
+                        .map_err(|_| "motion output address is out of range".to_owned())?;
+                    let capacity =
+                        usize::try_from(self.instance.reg(Reg::A1)).unwrap_or(usize::MAX);
+                    let sample = match self.motion.read(capacity) {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => {
+                            self.instance
+                                .set_reg(Reg::A0, crate::motion_wire::MOTION_READ_NO_SAMPLE as u64);
+                            continue;
+                        }
+                        Err(status) => {
+                            self.instance.set_reg(Reg::A0, status as i64 as u64);
+                            continue;
+                        }
+                    };
+                    if self.instance.write_memory(address, &sample).is_err() {
+                        self.instance.set_reg(
+                            Reg::A0,
+                            crate::motion_wire::MOTION_ERROR_INVALID_GUEST_RANGE as i64 as u64,
+                        );
+                        continue;
+                    }
+                    self.motion.consume();
+                    self.instance
+                        .set_reg(Reg::A0, crate::motion_wire::MOTION_SAMPLE_BYTES as u64);
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_truapi_send => {

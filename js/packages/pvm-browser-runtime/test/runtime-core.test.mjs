@@ -47,11 +47,7 @@ async function waitForMessage(messages, type, timeoutMs = 10_000) {
   }
   throw new Error(`timed out waiting for browser runtime message ${type}`);
 }
-async function waitForStartupStage(
-  messages,
-  stage,
-  timeoutMs = 10_000,
-) {
+async function waitForStartupStage(messages, stage, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (
@@ -68,7 +64,9 @@ async function waitForStartupStage(
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(`timed out waiting for browser runtime startup stage ${stage}`);
+  throw new Error(
+    `timed out waiting for browser runtime startup stage ${stage}`,
+  );
 }
 
 function invalidStart(overrides = {}) {
@@ -93,6 +91,20 @@ function pointerDelta(x, y) {
   return bytes;
 }
 
+function motionSample() {
+  const bytes = new Uint8Array(48);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x50, 0x4d, 0x4f, 0x31]);
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 6, true);
+  view.setUint32(8, 48, true);
+  view.setUint32(12, 1, true);
+  view.setFloat64(16, 10, true);
+  view.setFloat32(40, -2, true);
+  view.setFloat32(44, 4, true);
+  return bytes;
+}
+
 test("browser runtime rejects unbounded launch inputs before compilation", async () => {
   for (const [message, expected] of [
     [invalidStart({ program: new Uint8Array() }), /program must contain/],
@@ -114,6 +126,10 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
     [
       invalidStart({ graphicsProfile: "webgpu-raster" }),
       /WebGPU capabilities are required/,
+    ],
+    [
+      invalidStart({ motionAvailability: 3 }),
+      /invalid PolkaVM browser motion availability/,
     ],
   ]) {
     const { messages, receiver } = endpoint();
@@ -210,6 +226,99 @@ test("native-Wasm and translated backends round-trip opaque TrUAPI frames", asyn
   }
 });
 
+test("compiler backend implements MotionSample v1 status and reads", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/motion-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "motion-sample-v1",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+    null,
+    1,
+  );
+  const sample = motionSample();
+  translated.sendMotionSample(sample);
+  translated.initialize();
+  assert.equal(Number(translated.pvm.r7.value), 48);
+  assert.deepEqual(
+    new Uint8Array(
+      translated.memory.buffer,
+      translated.metadata.layout.rwPhysical,
+      48,
+    ),
+    sample,
+  );
+  translated.update(16);
+  assert.equal(Number(translated.pvm.r7.value), 0);
+  translated.setMotionAvailability(2);
+  translated.update(32);
+  assert.equal(Number(BigInt.asIntN(32, translated.pvm.r7.value)), -2);
+  translated.stop();
+});
+
+test("browser endpoint routes motion samples to the interpreter", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/motion-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "motion-sample-interpreter",
+      forceInterpreter: true,
+      motionAvailability: 1,
+    },
+  });
+  receiver.onmessage({
+    data: { type: "motion", bytes: motionSample().buffer },
+  });
+  await waitForMessage(messages, "ready");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(
+    messages.some((message) => message.type === "error"),
+    false,
+  );
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+});
+
 test("compiler backend discards stale CoreVM mouse movement", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
@@ -256,6 +365,17 @@ test("compiler backend discards stale CoreVM mouse movement", async () => {
   translated.sendInput(pointerDelta(100, 0));
   translated.sendInput(pointerDelta(80, 0));
   assert.deepEqual(translated.coreInput, [[0xa3, 80]]);
+
+  translated.setMotionAvailability(2);
+  assert.equal(translated.motionAvailability, 2);
+  assert.throws(
+    () => translated.sendMotionSample(new Uint8Array(48)),
+    /invalid motion sample/,
+  );
+  const motion = motionSample();
+  translated.sendMotionSample(motion);
+  assert.equal(translated.motionAvailability, 1);
+  assert.deepEqual(translated.motionSample, motion);
 });
 
 test("browser runtime can select the interpreter without attempting translation", async () => {

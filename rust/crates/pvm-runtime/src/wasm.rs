@@ -251,6 +251,24 @@ pub extern "C" fn pvm_browser_launch_start() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 {
+    status(|host| {
+        let availability = crate::motion_wire::MotionAvailability::try_from(availability)
+            .map_err(|_| anyhow!("invalid motion availability"))?;
+        host.running()?.set_motion_availability(availability);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_send_motion_sample() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        host.running()?.send_motion_sample(&bytes)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn pvm_browser_set_gpu_capabilities() -> u32 {
     status(|host| {
         let bytes = std::mem::take(&mut host.staging);

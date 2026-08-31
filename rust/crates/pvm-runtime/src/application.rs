@@ -137,6 +137,26 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn set_motion_availability(
+        &mut self,
+        availability: crate::motion_wire::MotionAvailability,
+    ) {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_motion_availability(availability),
+            Self::CoreVm(runtime) => runtime.vm.set_motion_availability(availability),
+        }
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_motion_sample(bytes),
+            Self::CoreVm(runtime) => runtime
+                .vm
+                .send_motion_sample(bytes)
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     pub fn gpu_ready(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.gpu_ready(),

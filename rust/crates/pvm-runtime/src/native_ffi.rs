@@ -51,6 +51,23 @@ impl From<NativePvmInputEventType> for InputEventType {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum NativePvmMotionAvailability {
+    Unavailable,
+    Available,
+    PermissionDenied,
+}
+
+impl From<NativePvmMotionAvailability> for crate::motion_wire::MotionAvailability {
+    fn from(value: NativePvmMotionAvailability) -> Self {
+        match value {
+            NativePvmMotionAvailability::Unavailable => Self::Unavailable,
+            NativePvmMotionAvailability::Available => Self::Available,
+            NativePvmMotionAvailability::PermissionDenied => Self::PermissionDenied,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmAsset {
     pub path: String,
@@ -217,6 +234,20 @@ impl NativePvmRuntime {
             y,
         });
         Ok(())
+    }
+
+    pub fn set_motion_availability(
+        &self,
+        availability: NativePvmMotionAvailability,
+    ) -> Result<(), NativePvmError> {
+        self.lock()?.set_motion_availability(availability.into());
+        Ok(())
+    }
+
+    pub fn send_motion_sample(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
+        self.lock()?
+            .send_motion_sample(&bytes)
+            .map_err(NativePvmError::runtime)
     }
 
     pub fn gpu_ready(&self) -> Result<bool, NativePvmError> {
