@@ -365,6 +365,10 @@ impl Vm {
         self.backend
     }
 
+    pub fn uses_motion(&self) -> bool {
+        self.import_motion_read.is_some()
+    }
+
     pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
         let frame = self.truapi_requests.pop_front()?;
         self.truapi_request_bytes -= frame.len();

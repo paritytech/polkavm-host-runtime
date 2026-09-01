@@ -121,6 +121,13 @@ impl ApplicationRuntime {
             Self::CoreVm(runtime) => runtime.vm.backend(),
         }
     }
+
+    pub fn uses_motion(&self) -> bool {
+        match self {
+            Self::Cooperative(runtime) => runtime.uses_motion(),
+            Self::CoreVm(runtime) => runtime.vm.uses_motion(),
+        }
+    }
     pub fn last_gas_used(&self) -> u64 {
         match self {
             Self::Cooperative(runtime) => runtime.last_gas_used(),

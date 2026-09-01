@@ -517,11 +517,15 @@ globalThis.createPvmRuntime = (endpoint) => {
       drainTruapiRequests();
       drainLogs();
     }
+    const usesMotion = translated
+      ? translated.usesMotion()
+      : pvm.pvm_browser_uses_motion() === 1;
     startedAt = performance.now();
     running = true;
     postMessage({
       type: "ready",
       backend,
+      usesMotion,
       cacheHit,
       translationMs,
       compilationMs,

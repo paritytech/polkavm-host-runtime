@@ -216,6 +216,10 @@ impl NativePvmRuntime {
         Ok(format!("{:?}", self.lock()?.backend()).to_ascii_lowercase())
     }
 
+    pub fn uses_motion(&self) -> Result<bool, NativePvmError> {
+        Ok(self.lock()?.uses_motion())
+    }
+
     pub fn last_gas_used(&self) -> Result<u64, NativePvmError> {
         Ok(self.lock()?.last_gas_used())
     }

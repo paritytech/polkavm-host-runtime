@@ -347,6 +347,10 @@
       }
     }
 
+    usesMotion() {
+      return this.imports.includes("host_motion_read");
+    }
+
     update(timeMs) {
       if (this.stopped) {
         return;
