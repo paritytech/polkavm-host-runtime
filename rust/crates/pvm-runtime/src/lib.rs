@@ -368,6 +368,7 @@ struct HostState {
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
     motion: MotionState,
+    uses_motion: bool,
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
     gpu_events: VecDeque<Vec<u8>>,
@@ -385,6 +386,7 @@ impl HostState {
         assets: HashMap<String, Vec<u8>>,
         presentation: PresentationProfile,
         audio_enabled: bool,
+        uses_motion: bool,
     ) -> Self {
         Self {
             frame: None,
@@ -406,6 +408,7 @@ impl HostState {
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
             motion: MotionState::new(),
+            uses_motion,
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
             gpu_events: VecDeque::new(),
@@ -588,6 +591,11 @@ impl Runtime {
         max_gas_per_update: u64,
         backend: BackendKind,
     ) -> Result<Self> {
+        let uses_motion = blob
+            .imports()
+            .iter()
+            .flatten()
+            .any(|import| import.as_bytes() == motion_wire::MOTION_READ_IMPORT.as_bytes());
         let mut engine_config = Config::new();
         // macOS requires PolkaVM's experimental generic sandbox for native
         // recompilation. Keep sandboxing enabled while opting into that boundary.
@@ -1087,7 +1095,7 @@ impl Runtime {
 
         Ok(Self {
             instance,
-            state: HostState::new(assets, presentation, audio_enabled),
+            state: HostState::new(assets, presentation, audio_enabled, uses_motion),
             max_gas_per_update,
             last_gas_used: 0,
             backend,
@@ -1152,6 +1160,10 @@ impl Runtime {
 
     pub fn backend(&self) -> polkavm::BackendKind {
         self.backend
+    }
+
+    pub fn uses_motion(&self) -> bool {
+        self.state.uses_motion
     }
 
     pub fn send_input(&mut self, event: InputEvent) {
@@ -1459,6 +1471,40 @@ mod tests {
         );
         (builder.into_vec().unwrap(), output)
     }
+    fn no_motion_test_program() -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4 * 1024);
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(&[asm::ret()], &[]);
+        builder.into_vec().unwrap()
+    }
+
+    #[test]
+    fn runtime_reports_motion_import_usage() {
+        let (motion_program, _) = motion_test_program();
+        let motion_runtime = Runtime::new_with_backend(
+            &motion_program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(motion_runtime.uses_motion());
+
+        let no_motion_runtime = Runtime::new_with_backend(
+            &no_motion_test_program(),
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(!no_motion_runtime.uses_motion());
+    }
 
     #[test]
     fn presentation_profile_uses_tri2d_without_legacy_alias() {
@@ -1575,7 +1621,12 @@ mod tests {
 
     #[test]
     fn input_queue_coalesces_pointer_motion_and_stays_bounded() {
-        let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
+        let mut state = HostState::new(
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            false,
+        );
         for coordinate in 0..10_000u16 {
             state.queue_input(InputEvent {
                 event_type: InputEventType::PointerMove,
@@ -1647,7 +1698,12 @@ mod tests {
 
     #[test]
     fn truapi_queues_enforce_frame_count_and_byte_limits() {
-        let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
+        let mut state = HostState::new(
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            false,
+        );
         assert!(state.queue_truapi_response(Vec::new()).is_err());
         assert!(state
             .queue_truapi_response(vec![0; MAX_TRUAPI_FRAME_BYTES + 1])
