@@ -967,6 +967,7 @@ dependencies = [
  "polkavm 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=3df1d0309c4c81a1aad0a755d83570d203bba1d9)",
  "polkavm 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=e06cce9da5c6d3f72458168876ea304e27992094)",
  "polkavm-common 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=e06cce9da5c6d3f72458168876ea304e27992094)",
+ "pollster",
  "pvm-gpu-wire",
  "pvm-motion-wire",
  "serde",
