@@ -147,14 +147,19 @@ impl ApplicationRuntime {
     pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_input_record(record),
-            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support extended input records")),
+            Self::CoreVm(runtime) => runtime.send_input_record(record),
         }
     }
 
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_text_input(kind, text),
-            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support text input")),
+            Self::CoreVm(runtime) => {
+                for record in crate::encode_text_input(kind, text)? {
+                    runtime.send_input_record(record)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -407,6 +412,15 @@ impl CoreVmRuntime {
             }
             InputEventType::SurfaceMetrics => {}
         }
+    }
+
+    fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        crate::ui::validate_input_record(&record)?;
+        if !self.vm.uses_epoca_inputs() {
+            return Err(anyhow!("CoreVM does not support extended input records"));
+        }
+        self.vm.send_epoca_input_record(record);
+        Ok(())
     }
 }
 

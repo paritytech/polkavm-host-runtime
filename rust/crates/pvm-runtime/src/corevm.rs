@@ -120,7 +120,7 @@ const EINVAL: u64 = 22;
 const EMFILE: u64 = 24;
 const AT_FDCWD: u64 = (-100_i64) as u64;
 const IOV_MAX: u64 = 1024;
-const MAX_QUEUED_INPUT_EVENTS: usize = 256;
+const MAX_QUEUED_INPUT_EVENTS: usize = 4_096;
 const MAX_GUEST_WRITE_BYTES: u64 = 4 * 1024;
 const MAX_OPEN_FILES: usize = 256;
 const O_WRONLY: u64 = 1;
@@ -141,16 +141,16 @@ fn queue_input_event(events: &mut VecDeque<InputEvent>, key: u8, value: u8) {
     events.push_back(InputEvent { key, value });
 }
 
-fn queue_epoca_input_event(
+fn queue_epoca_input_record(
     events: &mut VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
-    event: crate::InputEvent,
+    record: [u8; crate::INPUT_EVENT_BYTES],
 ) {
-    if event.event_type == crate::InputEventType::PointerDelta {
+    if record[0] == crate::InputEventType::PointerDelta as u8 {
         if let Some(queued) = events
             .iter_mut()
             .find(|queued| queued[0] == crate::InputEventType::PointerDelta as u8)
         {
-            *queued = event.encode();
+            *queued = record;
             return;
         }
     }
@@ -158,7 +158,7 @@ fn queue_epoca_input_event(
     if events.len() == MAX_QUEUED_INPUT_EVENTS {
         events.pop_front();
     }
-    events.push_back(event.encode());
+    events.push_back(record);
 }
 
 fn errno(error: u64) -> u64 {
@@ -281,7 +281,9 @@ impl Vm {
                 b"pvm_fetch_inputs" => import_fetch_inputs = Some(import_index),
                 b"pvm_init_audio" => import_init_audio = Some(import_index),
                 b"pvm_output_audio" => import_output_audio = Some(import_index),
-                b"pvm_fetch_epoca_inputs" => import_epoca_inputs = Some(import_index),
+                b"pvm_fetch_epoca_inputs" | b"host_poll_input" => {
+                    import_epoca_inputs = Some(import_index)
+                }
                 b"host_audio_submit" => import_epoca_audio = Some(import_index),
                 b"pvm_asset_read" => import_asset_read = Some(import_index),
                 b"pvm_time_ms" => import_time_ms = Some(import_index),
@@ -419,7 +421,11 @@ impl Vm {
     }
 
     pub fn send_epoca_input(&mut self, event: crate::InputEvent) {
-        queue_epoca_input_event(&mut self.epoca_input_events, event);
+        queue_epoca_input_record(&mut self.epoca_input_events, event.encode());
+    }
+
+    pub fn send_epoca_input_record(&mut self, record: [u8; crate::INPUT_EVENT_BYTES]) {
+        queue_epoca_input_record(&mut self.epoca_input_events, record);
     }
 
     fn read_cstr(&mut self, address: u64) -> Result<Option<Vec<u8>>, String> {

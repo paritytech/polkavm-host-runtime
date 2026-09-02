@@ -31,6 +31,18 @@ fn corevm_reports_when_motion_is_not_imported() {
 }
 
 #[test]
+fn corevm_accepts_the_standard_input_hostcall() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(b"host_poll_input");
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert!(vm.uses_epoca_inputs());
+}
+
+#[test]
 fn open_files_enforce_the_descriptor_limit() {
     let file = Arc::new(File { blob: Vec::new() });
     let mut open_files = OpenFiles::new();
@@ -119,11 +131,23 @@ fn epoca_mouse_backlog_keeps_only_the_latest_frame_delta() {
         y: (-7_i16) as u16,
     };
 
-    queue_epoca_input_event(&mut events, key);
-    queue_epoca_input_event(&mut events, stale);
-    queue_epoca_input_event(&mut events, latest);
+    queue_epoca_input_record(&mut events, key.encode());
+    queue_epoca_input_record(&mut events, stale.encode());
+    queue_epoca_input_record(&mut events, latest.encode());
 
     assert_eq!(events.len(), 2);
     assert_eq!(events.pop_front(), Some(key.encode()));
     assert_eq!(events.pop_front(), Some(latest.encode()));
+}
+
+#[test]
+fn epoca_input_queue_preserves_advanced_records() {
+    let mut events = VecDeque::new();
+    let text = [crate::INPUT_TEXT_COMMIT, 0xc1, b'a', 0, 0, 0, 0, 0];
+    let wheel = crate::wheel_record(-4, 12);
+
+    queue_epoca_input_record(&mut events, text);
+    queue_epoca_input_record(&mut events, wheel);
+
+    assert_eq!(events.into_iter().collect::<Vec<_>>(), [text, wheel]);
 }
