@@ -271,6 +271,15 @@ impl NativePvmRuntime {
         Ok(())
     }
 
+    pub fn send_input_record(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
+        let record: [u8; crate::INPUT_EVENT_BYTES] = bytes
+            .try_into()
+            .map_err(|_| NativePvmError::runtime("input record must contain exactly 8 bytes"))?;
+        self.lock()?
+            .send_input_record(record)
+            .map_err(NativePvmError::runtime)
+    }
+
     pub fn set_motion_availability(
         &self,
         availability: NativePvmMotionAvailability,
