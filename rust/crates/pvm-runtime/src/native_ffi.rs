@@ -6,6 +6,8 @@ use crate::{
     ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
     PresentationProfile, Tri2dFrame,
 };
+#[cfg(feature = "native-gpu")]
+use crate::{NativeGpuFrame, NativeGpuRenderer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -142,6 +144,24 @@ impl From<GpuBatch> for NativePvmGpuBatch {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct NativePvmGpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[cfg(feature = "native-gpu")]
+impl From<NativeGpuFrame> for NativePvmGpuFrame {
+    fn from(frame: NativeGpuFrame) -> Self {
+        Self {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.rgba,
+        }
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum NativePvmError {
     #[error("{detail}")]
@@ -163,11 +183,20 @@ impl NativePvmError {
 #[derive(uniffi::Object)]
 pub struct NativePvmRuntime {
     runtime: Mutex<ApplicationRuntime>,
+    #[cfg(feature = "native-gpu")]
+    renderer: Mutex<Option<NativeGpuRenderer>>,
 }
 
 impl NativePvmRuntime {
     fn lock(&self) -> Result<MutexGuard<'_, ApplicationRuntime>, NativePvmError> {
         self.runtime
+            .lock()
+            .map_err(|_| NativePvmError::RuntimePoisoned)
+    }
+
+    #[cfg(feature = "native-gpu")]
+    fn renderer_lock(&self) -> Result<MutexGuard<'_, Option<NativeGpuRenderer>>, NativePvmError> {
+        self.renderer
             .lock()
             .map_err(|_| NativePvmError::RuntimePoisoned)
     }
@@ -201,6 +230,8 @@ impl NativePvmRuntime {
         .map_err(NativePvmError::runtime)?;
         Ok(Arc::new(Self {
             runtime: Mutex::new(runtime),
+            #[cfg(feature = "native-gpu")]
+            renderer: Mutex::new(None),
         }))
     }
 
@@ -214,6 +245,10 @@ impl NativePvmRuntime {
 
     pub fn backend(&self) -> Result<String, NativePvmError> {
         Ok(format!("{:?}", self.lock()?.backend()).to_ascii_lowercase())
+    }
+
+    pub fn uses_motion(&self) -> Result<bool, NativePvmError> {
+        Ok(self.lock()?.uses_motion())
     }
 
     pub fn last_gas_used(&self) -> Result<u64, NativePvmError> {
@@ -264,6 +299,82 @@ impl NativePvmRuntime {
         self.lock()?
             .send_gpu_event(bytes)
             .map_err(NativePvmError::runtime)
+    }
+
+    pub fn configure_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePvmError> {
+        #[cfg(feature = "native-gpu")]
+        {
+            let renderer =
+                NativeGpuRenderer::new(width, height).map_err(NativePvmError::runtime)?;
+            let capabilities = renderer.capabilities();
+            let mut runtime = self.lock()?;
+            runtime
+                .set_gpu_capabilities(capabilities)
+                .map_err(NativePvmError::runtime)?;
+            *self.renderer_lock()? = Some(renderer);
+            Ok(())
+        }
+        #[cfg(not(feature = "native-gpu"))]
+        {
+            let _ = (width, height);
+            Err(NativePvmError::runtime(
+                "native GPU support is not included in this host build",
+            ))
+        }
+    }
+
+    pub fn resize_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePvmError> {
+        #[cfg(feature = "native-gpu")]
+        {
+            let mut runtime = self.lock()?;
+            let mut renderer = self.renderer_lock()?;
+            let renderer = renderer
+                .as_mut()
+                .ok_or_else(|| NativePvmError::runtime("native GPU renderer is not configured"))?;
+            renderer
+                .resize(width, height)
+                .map_err(NativePvmError::runtime)?;
+            runtime
+                .set_gpu_capabilities(renderer.capabilities())
+                .map_err(NativePvmError::runtime)
+        }
+        #[cfg(not(feature = "native-gpu"))]
+        {
+            let _ = (width, height);
+            Err(NativePvmError::runtime(
+                "native GPU support is not included in this host build",
+            ))
+        }
+    }
+
+    pub fn render_native_gpu(&self) -> Result<Option<NativePvmGpuFrame>, NativePvmError> {
+        #[cfg(feature = "native-gpu")]
+        {
+            let mut runtime = self.lock()?;
+            let mut renderer = self.renderer_lock()?;
+            let renderer = renderer
+                .as_mut()
+                .ok_or_else(|| NativePvmError::runtime("native GPU renderer is not configured"))?;
+            let mut frame = None;
+            while let Some(batch) = runtime.take_gpu_batch() {
+                let rendered = renderer.execute(&batch.bytes);
+                for event in rendered.events {
+                    runtime
+                        .send_gpu_event(event)
+                        .map_err(NativePvmError::runtime)?;
+                }
+                if let Some(rendered_frame) = rendered.frame {
+                    frame = Some(rendered_frame.into());
+                }
+            }
+            Ok(frame)
+        }
+        #[cfg(not(feature = "native-gpu"))]
+        {
+            Err(NativePvmError::runtime(
+                "native GPU support is not included in this host build",
+            ))
+        }
     }
 
     pub fn take_frame(&self) -> Result<Option<NativePvmFrame>, NativePvmError> {

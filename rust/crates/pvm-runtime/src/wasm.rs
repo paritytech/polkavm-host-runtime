@@ -254,6 +254,14 @@ pub extern "C" fn pvm_browser_launch_start() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn pvm_browser_uses_motion() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => u32::from(runtime.uses_motion()),
+        _ => 0,
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 {
     status(|host| {
         let availability = crate::motion_wire::MotionAvailability::try_from(availability)

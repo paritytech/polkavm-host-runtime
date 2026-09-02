@@ -195,6 +195,7 @@ test("compiler backend enforces the declared graphics profile", async () => {
   });
   const ready = await waitForMessage(messages, "ready");
   assert.equal(ready.backend, "compiler");
+  assert.equal(ready.usesMotion, false);
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(
     messages.some((message) => message.type === "frame"),
@@ -404,7 +405,8 @@ test("browser endpoint routes motion samples to the interpreter", async () => {
   receiver.onmessage({
     data: { type: "motion", bytes: motionSample().buffer },
   });
-  await waitForMessage(messages, "ready");
+  const ready = await waitForMessage(messages, "ready");
+  assert.equal(ready.usesMotion, true);
   const result = motionResult((await waitForMessage(messages, "save")).bytes);
   assert.equal(result.status, 48);
   assert.deepEqual(result.sample, motionSample());
@@ -449,6 +451,7 @@ test("JIT fallback preserves a motion sample queued during startup", async () =>
     });
     const ready = await waitForMessage(messages, "ready");
     assert.equal(ready.backend, "interpreter");
+    assert.equal(ready.usesMotion, true);
     const result = motionResult((await waitForMessage(messages, "save")).bytes);
     assert.equal(result.status, 48);
     assert.deepEqual(result.sample, motionSample());
@@ -545,6 +548,7 @@ test("browser runtime can select the interpreter without attempting translation"
 
   const ready = await waitForMessage(messages, "ready");
   assert.equal(ready.backend, "interpreter");
+  assert.equal(ready.usesMotion, false);
   assert.equal(ready.cacheHit, false);
   assert.equal(ready.translationMs, 0);
   assert.equal(ready.compilationMs, 0);

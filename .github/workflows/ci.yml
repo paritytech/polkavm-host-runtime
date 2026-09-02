@@ -99,6 +99,12 @@ jobs:
         run: npm ci
       - name: Build, test, and reproduce assets
         run: npm test
+      - name: Upload reproduced browser assets
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproduced-browser-assets
+          path: js/packages/pvm-browser-runtime/dist
       - name: Check browser package contents
         run: npm pack --workspace @parity/pvm-browser-runtime --dry-run --json
       - name: Check asset exporter
