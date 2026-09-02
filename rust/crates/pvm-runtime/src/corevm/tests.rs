@@ -93,11 +93,11 @@ fn epoca_mouse_backlog_keeps_only_the_latest_frame_delta() {
         y: (-7_i16) as u16,
     };
 
-    queue_epoca_input_event(&mut events, key);
-    queue_epoca_input_event(&mut events, stale);
-    queue_epoca_input_event(&mut events, latest);
+    queue_epoca_input_record(&mut events, key.encode());
+    queue_epoca_input_record(&mut events, stale.encode());
+    queue_epoca_input_record(&mut events, latest.encode());
 
     assert_eq!(events.len(), 2);
-    assert_eq!(events.pop_front(), Some(key.encode()));
-    assert_eq!(events.pop_front(), Some(latest.encode()));
+    assert_eq!(events.pop_front(), Some(key.encode().into_bytes()));
+    assert_eq!(events.pop_front(), Some(latest.encode().into_bytes()));
 }

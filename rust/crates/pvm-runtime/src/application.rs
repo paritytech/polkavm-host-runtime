@@ -4,8 +4,8 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample, PresentationProfile,
-    Runtime, Tri2dFrame, MAX_FRAME_BYTES,
+    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, InputRecord, MotionTiltSample,
+    PresentationProfile, Runtime, Tri2dFrame, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -134,6 +134,13 @@ impl ApplicationRuntime {
         match self {
             Self::Cooperative(runtime) => runtime.send_input(event),
             Self::CoreVm(runtime) => runtime.send_input(event),
+        }
+    }
+
+    pub fn send_input_record(&mut self, record: InputRecord) {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_input_record(record),
+            Self::CoreVm(runtime) => runtime.send_input_record(record),
         }
     }
 
@@ -367,8 +374,33 @@ impl CoreVmRuntime {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
-            InputEventType::SurfaceMetrics => {}
+            InputEventType::SurfaceMetrics
+            | InputEventType::Text
+            | InputEventType::ImePreedit
+            | InputEventType::ImeCommit
+            | InputEventType::ImeEnabled
+            | InputEventType::ImeDisabled
+            | InputEventType::Focus
+            | InputEventType::Wheel => {}
         }
+    }
+
+    fn send_input_record(&mut self, record: InputRecord) {
+        if self.vm.uses_epoca_inputs() {
+            self.vm.send_epoca_input_record(record);
+            return;
+        }
+        let event_type = record.event_type();
+        if (event_type as u8) > InputEventType::SurfaceMetrics as u8 {
+            return;
+        }
+        let bytes = record.as_bytes();
+        self.send_input(InputEvent {
+            event_type,
+            code: bytes[1],
+            x: u16::from_le_bytes([bytes[2], bytes[3]]),
+            y: u16::from_le_bytes([bytes[4], bytes[5]]),
+        });
     }
 }
 

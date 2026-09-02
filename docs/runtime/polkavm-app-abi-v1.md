@@ -246,7 +246,7 @@ and returns the number of bytes written. It never writes a partial record.
 Zero means that no event was available or that the capacity was smaller than
 one record.
 
-An input record is:
+An input record is eight bytes. Event types 1–7 use the base layout:
 
 ```text
 offset  type  field
@@ -260,18 +260,33 @@ offset  type  field
 ABI v1 event types are:
 
 ```text
-1  key down
-2  key up
-3  pointer button down
-4  pointer button up
-5  pointer position
-6  pointer delta
-7  surface metrics
+1   key down
+2   key up
+3   pointer button down
+4   pointer button up
+5   pointer position
+6   pointer delta
+7   surface metrics
+8   UTF-8 text chunk
+9   IME preedit UTF-8 chunk
+10  IME commit UTF-8 chunk
+11  IME enabled
+12  IME disabled
+13  window focus
+14  wheel delta
 ```
 
-The device-input contract defines code values, coordinate interpretation, and
-surface-metric scaling. ABI v1 does not define touch, wheel, UTF-8 text, IME,
-or focus events.
+Text records use byte 1 as flags: bits 0–2 are the payload length (0–6),
+bit 6 starts a value, and bit 7 ends it. Bytes 2–7 carry UTF-8 and unused bytes
+are zero. A Host splits values only on UTF-8 code-point boundaries and an App
+buffers chunks until the end flag. IME lifecycle records have zero payload.
+Focus uses code 0/1 for unfocused/focused. Wheel uses signed little-endian i16
+horizontal and vertical point deltas at bytes 2–5, with all other bytes zero.
+
+The corresponding required feature names are `pointer`, `keyboard`, `text`,
+`ime`, `focus`, and `wheel`. Hosts deliver keyboard/text/IME/focus records only
+to the focused App and wheel records only while the App owns pointer or focus
+interaction. These ordinary UI inputs require no permission prompt.
 
 #### Optional motion tilt
 

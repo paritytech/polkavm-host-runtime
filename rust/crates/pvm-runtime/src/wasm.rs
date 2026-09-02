@@ -3,9 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample,
-    PresentationProfile, Tri2dFrame, MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES,
-    MAX_PROGRAM_BYTES,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, InputRecord,
+    MotionTiltSample, PresentationProfile, Tri2dFrame, MAX_ASSET_BYTES, MAX_ASSET_FILES,
+    MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -313,6 +313,18 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
             x,
             y,
         });
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_send_input_record() -> u32 {
+    status(|host| {
+        let bytes: [u8; crate::INPUT_EVENT_BYTES] = std::mem::take(&mut host.staging)
+            .try_into()
+            .map_err(|_| anyhow!("input record must contain exactly 8 bytes"))?;
+        let record = InputRecord::new(bytes)?;
+        host.running()?.send_input_record(record);
         Ok(())
     })
 }

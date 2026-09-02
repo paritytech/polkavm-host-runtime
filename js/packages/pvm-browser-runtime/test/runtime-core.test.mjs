@@ -210,7 +210,7 @@ test("native-Wasm and translated backends round-trip opaque TrUAPI frames", asyn
   }
 });
 
-test("compiler backend discards stale CoreVM mouse movement", async () => {
+test("translated backend validates advanced input and bounds CoreVM motion", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
   );
@@ -256,6 +256,16 @@ test("compiler backend discards stale CoreVM mouse movement", async () => {
   translated.sendInput(pointerDelta(100, 0));
   translated.sendInput(pointerDelta(80, 0));
   assert.deepEqual(translated.coreInput, [[0xa3, 80]]);
+
+  translated.coreVm = false;
+  translated.input.length = 0;
+  const text = new Uint8Array([8, 0xc5, 104, 101, 108, 108, 111, 0]);
+  translated.sendInput(text);
+  assert.deepEqual(translated.input, [text]);
+  const invalid = text.slice();
+  invalid[7] = 1;
+  translated.sendInput(invalid);
+  assert.deepEqual(translated.input, [text]);
 });
 
 test("browser runtime can select the interpreter without attempting translation", async () => {

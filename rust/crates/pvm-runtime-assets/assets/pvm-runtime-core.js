@@ -513,15 +513,10 @@ globalThis.createPvmRuntime = endpoint => {
       translated.sendInput(bytes);
       return;
     }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    stage(bytes);
     check(
-      pvm.pvm_browser_send_input(
-        bytes[0],
-        bytes[1],
-        view.getUint16(2, true),
-        view.getUint16(4, true)
-      ),
-      "send PolkaVM browser input"
+      pvm.pvm_browser_send_input_record(),
+      "send PolkaVM browser input record"
     );
   }
 

@@ -49,6 +49,33 @@
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
+  function validInputRecord(bytes) {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength !== INPUT_EVENT_BYTES) {
+      return false;
+    }
+    const type = bytes[0];
+    if (type < 1 || type > 14) {
+      return false;
+    }
+    if (type <= 7) {
+      return bytes[6] === 0 && bytes[7] === 0;
+    }
+    if (type <= 10) {
+      const length = bytes[1] & 7;
+      if ((bytes[1] & ~0xc7) !== 0 || length > 6) {
+        return false;
+      }
+      return bytes.subarray(2 + length).every(byte => byte === 0);
+    }
+    if (type === 11 || type === 12) {
+      return bytes.subarray(1).every(byte => byte === 0);
+    }
+    if (type === 13) {
+      return bytes[1] <= 1 && bytes.subarray(2).every(byte => byte === 0);
+    }
+    return bytes[1] === 0 && bytes[6] === 0 && bytes[7] === 0;
+  }
+
   function validMotionTilt(bytes) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength !== MOTION_TILT_BYTES) {
       return false;
@@ -356,7 +383,7 @@
     }
 
     sendInput(bytes) {
-      if (this.stopped || bytes.byteLength !== INPUT_EVENT_BYTES) {
+      if (this.stopped || !validInputRecord(bytes)) {
         return;
       }
       if (!this.coreVm) {
@@ -379,7 +406,10 @@
       ) {
         return;
       }
-      if (this.imports.includes("pvm_fetch_epoca_inputs")) {
+      if (
+        this.imports.includes("pvm_fetch_epoca_inputs") ||
+        this.imports.includes("host_poll_input")
+      ) {
         this.#queueEpocaInput(bytes);
         return;
       }

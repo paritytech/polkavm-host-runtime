@@ -159,7 +159,9 @@ impl AppDescriptor {
                 bail!("device input features must be unique");
             }
             for feature in &input.required_features {
-                if feature != "pointer" && feature != "keyboard" {
+                if !["pointer", "keyboard", "text", "ime", "focus", "wheel"]
+                    .contains(&feature.as_str())
+                {
                     bail!("unsupported required device input feature {feature}");
                 }
             }
@@ -226,6 +228,7 @@ mod tests {
     }
 
     const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"webgpu-raster","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer"],"optionalFeatures":["motion-tilt"]}}}"#;
+    const ADVANCED_INPUT: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard","text","ime","focus","wheel"]}}}"#;
 
     #[test]
     fn parses_exact_strict_manifest() {
@@ -240,6 +243,15 @@ mod tests {
         let descriptor = AppDescriptor::parse_exact(MOTION, MOTION).unwrap();
         assert_eq!(descriptor.input_features, ["pointer"]);
         assert_eq!(descriptor.optional_input_features, ["motion-tilt"]);
+    }
+
+    #[test]
+    fn parses_standard_advanced_input_features() {
+        let descriptor = AppDescriptor::parse_exact(ADVANCED_INPUT, ADVANCED_INPUT).unwrap();
+        assert_eq!(
+            descriptor.input_features,
+            ["pointer", "keyboard", "text", "ime", "focus", "wheel"]
+        );
     }
 
     #[test]

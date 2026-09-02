@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, MotionTiltSample,
-    PresentationProfile, Tri2dFrame,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, InputRecord,
+    MotionTiltSample, PresentationProfile, Tri2dFrame,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -237,6 +237,15 @@ impl NativePvmRuntime {
             x,
             y,
         });
+        Ok(())
+    }
+
+    pub fn send_input_record(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
+        let bytes: [u8; crate::INPUT_EVENT_BYTES] = bytes
+            .try_into()
+            .map_err(|_| NativePvmError::runtime("input record must contain exactly 8 bytes"))?;
+        let record = InputRecord::new(bytes).map_err(NativePvmError::runtime)?;
+        self.lock()?.send_input_record(record);
         Ok(())
     }
 

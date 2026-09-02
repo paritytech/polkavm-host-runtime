@@ -252,6 +252,101 @@ pub enum InputEventType {
     PointerMove = 5,
     PointerDelta = 6,
     SurfaceMetrics = 7,
+    Text = 8,
+    ImePreedit = 9,
+    ImeCommit = 10,
+    ImeEnabled = 11,
+    ImeDisabled = 12,
+    Focus = 13,
+    Wheel = 14,
+}
+
+impl TryFrom<u8> for InputEventType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::KeyDown),
+            2 => Ok(Self::KeyUp),
+            3 => Ok(Self::ButtonDown),
+            4 => Ok(Self::ButtonUp),
+            5 => Ok(Self::PointerMove),
+            6 => Ok(Self::PointerDelta),
+            7 => Ok(Self::SurfaceMetrics),
+            8 => Ok(Self::Text),
+            9 => Ok(Self::ImePreedit),
+            10 => Ok(Self::ImeCommit),
+            11 => Ok(Self::ImeEnabled),
+            12 => Ok(Self::ImeDisabled),
+            13 => Ok(Self::Focus),
+            14 => Ok(Self::Wheel),
+            _ => Err(anyhow!("unknown input event type {value}")),
+        }
+    }
+}
+
+pub const INPUT_TEXT_CHUNK_START: u8 = 1 << 6;
+pub const INPUT_TEXT_CHUNK_END: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputRecord {
+    bytes: [u8; INPUT_EVENT_BYTES],
+}
+
+impl InputRecord {
+    pub fn new(bytes: [u8; INPUT_EVENT_BYTES]) -> Result<Self> {
+        let event_type = InputEventType::try_from(bytes[0])?;
+        match event_type {
+            InputEventType::KeyDown
+            | InputEventType::KeyUp
+            | InputEventType::ButtonDown
+            | InputEventType::ButtonUp
+            | InputEventType::PointerMove
+            | InputEventType::PointerDelta
+            | InputEventType::SurfaceMetrics => {
+                if bytes[6..] != [0, 0] {
+                    bail!("base input record has nonzero reserved bytes");
+                }
+            }
+            InputEventType::Text | InputEventType::ImePreedit | InputEventType::ImeCommit => {
+                let length = usize::from(bytes[1] & 0x07);
+                if bytes[1] & !(0x07 | INPUT_TEXT_CHUNK_START | INPUT_TEXT_CHUNK_END) != 0
+                    || length > 6
+                    || bytes[2 + length..].iter().any(|byte| *byte != 0)
+                {
+                    bail!("invalid text input chunk");
+                }
+            }
+            InputEventType::ImeEnabled | InputEventType::ImeDisabled => {
+                if bytes[1..].iter().any(|byte| *byte != 0) {
+                    bail!("IME lifecycle record has nonzero payload");
+                }
+            }
+            InputEventType::Focus => {
+                if bytes[1] > 1 || bytes[2..].iter().any(|byte| *byte != 0) {
+                    bail!("invalid focus input record");
+                }
+            }
+            InputEventType::Wheel => {
+                if bytes[1] != 0 || bytes[6..] != [0, 0] {
+                    bail!("invalid wheel input record");
+                }
+            }
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn event_type(self) -> InputEventType {
+        InputEventType::try_from(self.bytes[0]).expect("validated input record")
+    }
+
+    pub fn as_bytes(&self) -> &[u8; INPUT_EVENT_BYTES] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> [u8; INPUT_EVENT_BYTES] {
+        self.bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,19 +358,21 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
-    fn encode(self) -> [u8; INPUT_EVENT_BYTES] {
+    fn encode(self) -> InputRecord {
         let x = self.x.to_le_bytes();
         let y = self.y.to_le_bytes();
-        [
-            self.event_type as u8,
-            self.code,
-            x[0],
-            x[1],
-            y[0],
-            y[1],
-            0,
-            0,
-        ]
+        InputRecord {
+            bytes: [
+                self.event_type as u8,
+                self.code,
+                x[0],
+                x[1],
+                y[0],
+                y[1],
+                0,
+                0,
+            ],
+        }
     }
 }
 
@@ -363,7 +460,7 @@ struct HostState {
     tri2d_submitted: bool,
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
-    input: VecDeque<InputEvent>,
+    input: VecDeque<InputRecord>,
     motion_tilt: Option<[u8; MOTION_TILT_BYTES]>,
     assets: HashMap<String, Vec<u8>>,
     clock: HostClock,
@@ -446,20 +543,21 @@ impl HostState {
         Ok(())
     }
 
-    fn queue_input(&mut self, event: InputEvent) {
-        if event.event_type == InputEventType::SurfaceMetrics {
+    fn queue_input(&mut self, record: InputRecord) {
+        let event_type = record.event_type();
+        if event_type == InputEventType::SurfaceMetrics {
             if let Some(position) = self
                 .input
                 .iter()
-                .rposition(|queued| queued.event_type == InputEventType::SurfaceMetrics)
+                .rposition(|queued| queued.event_type() == InputEventType::SurfaceMetrics)
             {
                 self.input.remove(position);
             }
-        } else if event.event_type == InputEventType::PointerMove
+        } else if event_type == InputEventType::PointerMove
             && self
                 .input
                 .back()
-                .is_some_and(|queued| queued.event_type == InputEventType::PointerMove)
+                .is_some_and(|queued| queued.event_type() == InputEventType::PointerMove)
         {
             self.input.pop_back();
         }
@@ -467,11 +565,11 @@ impl HostState {
             let discardable = self
                 .input
                 .iter()
-                .position(|queued| queued.event_type == InputEventType::PointerMove)
+                .position(|queued| queued.event_type() == InputEventType::PointerMove)
                 .or_else(|| {
                     self.input
                         .iter()
-                        .position(|queued| queued.event_type != InputEventType::SurfaceMetrics)
+                        .position(|queued| queued.event_type() != InputEventType::SurfaceMetrics)
                 });
             if let Some(position) = discardable {
                 self.input.remove(position);
@@ -479,7 +577,7 @@ impl HostState {
                 self.input.pop_front();
             }
         }
-        self.input.push_back(event);
+        self.input.push_back(record);
     }
 
     fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
@@ -873,7 +971,7 @@ impl Runtime {
                             .ok_or_else(|| anyhow!("guest input destination overflow"))?;
                         caller
                             .instance
-                            .write_memory(destination, &event.encode())
+                            .write_memory(destination, event.as_bytes())
                             .map_err(|error| anyhow!("write guest input: {error:?}"))?;
                         written += INPUT_EVENT_BYTES as u32;
                     }
@@ -1100,7 +1198,13 @@ impl Runtime {
     }
 
     pub fn send_input(&mut self, event: InputEvent) {
-        self.state.queue_input(event);
+        if (event.event_type as u8) <= InputEventType::SurfaceMetrics as u8 {
+            self.state.queue_input(event.encode());
+        }
+    }
+
+    pub fn send_input_record(&mut self, record: InputRecord) {
+        self.state.queue_input(record);
     }
 
     pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
@@ -1397,67 +1501,130 @@ mod tests {
     }
 
     #[test]
+    fn advanced_input_records_validate_payloads_and_reserved_bytes() {
+        let text = InputRecord::new([
+            InputEventType::Text as u8,
+            INPUT_TEXT_CHUNK_START | INPUT_TEXT_CHUNK_END | 5,
+            b'h',
+            b'e',
+            b'l',
+            b'l',
+            b'o',
+            0,
+        ])
+        .unwrap();
+        assert_eq!(text.event_type(), InputEventType::Text);
+        assert!(InputRecord::new([
+            InputEventType::Text as u8,
+            INPUT_TEXT_CHUNK_END | 1,
+            b'a',
+            1,
+            0,
+            0,
+            0,
+            0,
+        ])
+        .is_err());
+        assert!(InputRecord::new([InputEventType::ImeEnabled as u8, 0, 0, 0, 0, 0, 0, 0]).is_ok());
+        assert!(InputRecord::new([InputEventType::Focus as u8, 1, 0, 0, 0, 0, 0, 0]).is_ok());
+        assert!(InputRecord::new([InputEventType::Focus as u8, 2, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(InputRecord::new([InputEventType::Wheel as u8, 0, 1, 0, 255, 255, 0, 0]).is_ok());
+        assert!(
+            InputRecord::new([InputEventType::PointerMove as u8, 0, 1, 0, 1, 0, 1, 0,]).is_err()
+        );
+    }
+
+    #[test]
     fn input_queue_coalesces_pointer_motion_and_stays_bounded() {
         let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
         for coordinate in 0..10_000u16 {
-            state.queue_input(InputEvent {
-                event_type: InputEventType::PointerMove,
-                code: 0,
-                x: coordinate,
-                y: coordinate,
-            });
+            state.queue_input(
+                InputEvent {
+                    event_type: InputEventType::PointerMove,
+                    code: 0,
+                    x: coordinate,
+                    y: coordinate,
+                }
+                .encode(),
+            );
         }
         assert_eq!(state.input.len(), 1);
-        assert_eq!(state.input.back().unwrap().x, 9_999);
+        assert_eq!(
+            u16::from_le_bytes(
+                state.input.back().unwrap().as_bytes()[2..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            9_999
+        );
 
-        state.queue_input(InputEvent {
-            event_type: InputEventType::SurfaceMetrics,
-            code: 32,
-            x: 1_280,
-            y: 800,
-        });
-        state.queue_input(InputEvent {
-            event_type: InputEventType::SurfaceMetrics,
-            code: 64,
-            x: 2_560,
-            y: 1_600,
-        });
+        state.queue_input(
+            InputEvent {
+                event_type: InputEventType::SurfaceMetrics,
+                code: 32,
+                x: 1_280,
+                y: 800,
+            }
+            .encode(),
+        );
+        state.queue_input(
+            InputEvent {
+                event_type: InputEventType::SurfaceMetrics,
+                code: 64,
+                x: 2_560,
+                y: 1_600,
+            }
+            .encode(),
+        );
         assert_eq!(
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type == InputEventType::SurfaceMetrics)
+                .filter(|event| event.event_type() == InputEventType::SurfaceMetrics)
                 .count(),
             1
         );
-        assert_eq!(state.input.back().unwrap().x, 2_560);
+        assert_eq!(
+            u16::from_le_bytes(
+                state.input.back().unwrap().as_bytes()[2..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            2_560
+        );
 
         for index in 0..(MAX_QUEUED_INPUT_EVENTS + 100) {
-            state.queue_input(InputEvent {
-                event_type: InputEventType::KeyDown,
-                code: index as u8,
-                x: 0,
-                y: 0,
-            });
+            state.queue_input(
+                InputEvent {
+                    event_type: InputEventType::KeyDown,
+                    code: index as u8,
+                    x: 0,
+                    y: 0,
+                }
+                .encode(),
+            );
         }
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type == InputEventType::SurfaceMetrics)
+                .filter(|event| event.event_type() == InputEventType::SurfaceMetrics)
                 .count(),
             1
         );
-        state.queue_input(InputEvent {
-            event_type: InputEventType::SurfaceMetrics,
-            code: 64,
-            x: 3_000,
-            y: 2_000,
-        });
+        state.queue_input(
+            InputEvent {
+                event_type: InputEventType::SurfaceMetrics,
+                code: 64,
+                x: 3_000,
+                y: 2_000,
+            }
+            .encode(),
+        );
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
-            state.input.back().unwrap().event_type,
+            state.input.back().unwrap().event_type(),
             InputEventType::SurfaceMetrics
         );
     }
