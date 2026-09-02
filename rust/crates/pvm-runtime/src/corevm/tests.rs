@@ -3,6 +3,44 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::*;
+use polkavm_common::program::{asm, InstructionSetKind};
+use polkavm_common::writer::ProgramBlobBuilder;
+
+#[test]
+fn corevm_accepts_the_motion_hostcall() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(b"host_motion_read");
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert_eq!(vm.import_motion_read, Some(0));
+    assert!(vm.uses_motion());
+}
+
+#[test]
+fn corevm_reports_when_motion_is_not_imported() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert!(!vm.uses_motion());
+}
+
+#[test]
+fn corevm_accepts_the_standard_input_hostcall() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(b"host_poll_input");
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert!(vm.uses_epoca_inputs());
+}
 
 #[test]
 fn open_files_enforce_the_descriptor_limit() {
@@ -98,6 +136,18 @@ fn epoca_mouse_backlog_keeps_only_the_latest_frame_delta() {
     queue_epoca_input_record(&mut events, latest.encode());
 
     assert_eq!(events.len(), 2);
-    assert_eq!(events.pop_front(), Some(key.encode().into_bytes()));
-    assert_eq!(events.pop_front(), Some(latest.encode().into_bytes()));
+    assert_eq!(events.pop_front(), Some(key.encode()));
+    assert_eq!(events.pop_front(), Some(latest.encode()));
+}
+
+#[test]
+fn epoca_input_queue_preserves_advanced_records() {
+    let mut events = VecDeque::new();
+    let text = [crate::INPUT_TEXT_COMMIT, 0xc1, b'a', 0, 0, 0, 0, 0];
+    let wheel = crate::wheel_record(-4, 12);
+
+    queue_epoca_input_record(&mut events, text);
+    queue_epoca_input_record(&mut events, wheel);
+
+    assert_eq!(events.into_iter().collect::<Vec<_>>(), [text, wheel]);
 }

@@ -79,14 +79,6 @@ input and audio. A Host call made outside its declared capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
 silently reinterpret a submission as another graphics profile.
 
-Device-input ABI v1 may gain additive Host imports behind declared feature
-names. Adding a feature does not change the existing input-record layout or the
-semantics of existing imports. A Host that does not recognize a requested
-feature MUST reject the manifest before instantiating the guest. A Host that
-recognizes an optional feature MUST still define its import when the current
-device cannot provide data; the import reports unavailability as specified
-below.
-
 ## Host imports
 
 ### Framebuffer presentation
@@ -246,7 +238,7 @@ and returns the number of bytes written. It never writes a partial record.
 Zero means that no event was available or that the capacity was smaller than
 one record.
 
-An input record is eight bytes. Event types 1–7 use the base layout:
+The legacy fixed record layout is:
 
 ```text
 offset  type  field
@@ -267,80 +259,100 @@ ABI v1 event types are:
 5   pointer position
 6   pointer delta
 7   surface metrics
-8   UTF-8 text chunk
+8   committed UTF-8 text chunk
 9   IME preedit UTF-8 chunk
 10  IME commit UTF-8 chunk
 11  IME enabled
-12  IME disabled
-13  window focus
-14  wheel delta
+12  IME disabled or cancelled
+13  focus (`code` is 0 or 1)
+14  wheel delta (`x` and `y` are signed i16)
 ```
 
-Text records use byte 1 as flags: bits 0–2 are the payload length (0–6),
-bit 6 starts a value, and bit 7 ends it. Bytes 2–7 carry UTF-8 and unused bytes
-are zero. A Host splits values only on UTF-8 code-point boundaries and an App
-buffers chunks until the end flag. IME lifecycle records have zero payload.
-Focus uses code 0/1 for unfocused/focused. Wheel uses signed little-endian i16
-horizontal and vertical point deltas at bytes 2–5, with all other bytes zero.
+Text and IME records use `code` bits 0–2 as a payload length from zero through
+six, bit 6 for the first chunk, and bit 7 for the last chunk. Bytes 2–7 contain
+the chunk and zero padding. A complete text event is at most 4 KiB. The Host
+MUST queue all chunks of one event atomically; the guest MUST reject malformed
+flag sequences or invalid UTF-8.
 
-The corresponding required feature names are `pointer`, `keyboard`, `text`,
-`ime`, `focus`, and `wheel`. Hosts deliver keyboard/text/IME/focus records only
-to the focused App and wheel records only while the App owns pointer or focus
-interaction. These ordinary UI inputs require no permission prompt.
+### UI semantics
 
-#### Optional motion tilt
-
-An App requests fused, display-relative tilt without making it a launch
-requirement by declaring:
-
-```json
-{
-  "deviceInput": {
-    "abiVersion": 1,
-    "requiredFeatures": ["pointer"],
-    "optionalFeatures": ["motion-tilt"]
-  }
-}
+```text
+host_ui_semantics_submit(pointer: u32, length: u32) -> u32
 ```
 
-The feature adds:
+The guest may submit one complete UTF-8 JSON semantic tree per `init` or
+`update` call. The tree is presentation output, not an instruction to invoke
+guest functions. Hosts use its roles, labels, values, actions, focus, and
+surface-relative bounds for accessibility and UI automation, then deliver
+actual pointer, keyboard, text, or IME records for every interaction.
+
+The version 1 object contains `version`, monotonic `generation`, and `nodes`.
+Each node contains a nonzero numeric `id`, nullable `parent`, `role`, `name`,
+`value`, `[x0,y0,x1,y1]` bounds, `actions`, `disabled`, and `focused`. Version 1
+allows at most 1,024 nodes, 1 KiB per name or value, and 256 KiB for the whole
+tree. It requires exactly one root, unique IDs, existing parents, finite ordered
+bounds, and no unknown object fields.
+
+Return values:
+
+```text
+0  accepted
+1  malformed, out-of-bounds, or over-limit tree
+2  a tree was already submitted during this call
+```
+
+### Motion
 
 ```text
 host_motion_read(pointer: u32, capacity: u32) -> i32
 ```
 
-The Host retains only the newest calibrated sample. The call returns `40` after
-writing one complete sample, `0` when motion is unavailable, inactive, stale,
-or not authorized, and `-40` when `capacity` is too small. It never writes a
-partial sample.
+The hostcall is part of the base ABI and MUST always resolve. A Host without a
+motion source returns an explicit status instead of leaving the import
+unresolved. One successful read consumes the latest sample; later reads return
+zero until a newer sample arrives.
 
-Every ABI v1 Host MUST resolve `host_motion_read`, including Hosts without a
-motion source. An unavailable Host returns `0`; it does not reject the import or
-trap the guest. This keeps pointer fallback deterministic across desktop and
-sensor-capable Hosts.
+```text
+ 48  one complete MotionSample v1 record written
+  0  no newer sample
+ -1  motion unavailable
+ -2  motion permission denied
+ -3  invalid guest output range
+ -4  output capacity is smaller than 48 bytes
+```
 
-The 40-byte `PMT1` sample is:
+MotionSample v1 is a fixed 48-byte little-endian record:
 
 ```text
 offset  type    field
-0       [u8;4] magic "PMT1"
-4       u16     version 1
-6       u16     flags
-8       u32     byte length 40
-12      u32     nonzero sequence
-16      u64     monotonic timestamp in microseconds
-24      f32     normalized horizontal tilt in [-1, 1]
-28      f32     normalized vertical tilt in [-1, 1]
-32      f32     azimuth in radians, or zero when unavailable
-36      u32     zero
+0       [u8;4] magic "PMO1"
+4       u16    version = 1
+6       u16    flags
+8       u32    byte length = 48
+12      u32    nonzero sequence
+16      f64    monotonic timestamp, milliseconds
+24      f32    acceleration including gravity X, m/s²
+28      f32    acceleration including gravity Y, m/s²
+32      f32    acceleration including gravity Z, m/s²
+36      f32    rotation rate alpha around Z, degrees/second
+40      f32    rotation rate beta around X, degrees/second
+44      f32    rotation rate gamma around Y, degrees/second
 ```
 
-Flag bit 0 means the sample is calibrated and MUST be set. Bit 1 means azimuth
-is valid. All other bits are zero. Float fields are finite. Motion tilt is
-lossy state, not an event stream: Hosts SHOULD sample near display cadence,
-coalesce updates, stop sampling when the App is not visible, and MUST NOT
-persist samples. Pointer input remains available as the fallback and MAY
-temporarily override tilt while a pointer gesture is active.
+Flags are:
+
+```text
+bit 0  acceleration fields are valid
+bit 1  rotation fields are valid
+bit 2  rotation is emulated from pointer movement
+```
+
+All numeric fields MUST be finite. Pointer emulation sets alpha and all
+acceleration fields to zero, fills beta and gamma, and sets bits 1 and 2.
+
+An application that cannot operate without motion lists `"motion"` in
+`deviceInput.requiredFeatures`. An application with pointer or keyboard
+fallback does not require motion and MUST handle `-1` and `-2`.
 
 ### Time
 

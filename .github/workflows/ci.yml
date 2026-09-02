@@ -48,7 +48,7 @@ jobs:
                 ;;
             esac
             case "$file" in
-              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-runtime-assets/*|conformance/*|js/*|scripts/*|.github/*)
+              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/crates/pvm-runtime/*|rust/crates/pvm-gpu-wire/*|rust/crates/pvm-motion-wire/*|rust/crates/pvm-runtime-assets/*|conformance/*|js/*|scripts/*|.github/*)
                 browser=true
                 ;;
             esac
@@ -99,6 +99,12 @@ jobs:
         run: npm ci
       - name: Build, test, and reproduce assets
         run: npm test
+      - name: Upload reproduced browser assets
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproduced-browser-assets
+          path: js/packages/pvm-browser-runtime/dist
       - name: Check browser package contents
         run: npm pack --workspace @parity/pvm-browser-runtime --dry-run --json
       - name: Check asset exporter

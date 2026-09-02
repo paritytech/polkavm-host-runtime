@@ -1,8 +1,8 @@
 [package]
-name = "pvm-gpu-wire"
+name = "pvm-motion-wire"
 version = "0.1.6"
 edition = "2021"
-description = "Bounded host-neutral WebGPU Raster wire protocol for PolkaVM applications"
+description = "Versioned host-neutral motion sample wire protocol for PolkaVM applications"
 license = "MPL-2.0"
 repository = "https://github.com/paritytech/pvm-host-runtime"
 publish = false

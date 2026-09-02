@@ -4,8 +4,8 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, InputRecord, MotionTiltSample,
-    PresentationProfile, Runtime, Tri2dFrame, MAX_FRAME_BYTES,
+    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile, Runtime,
+    TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -121,6 +121,13 @@ impl ApplicationRuntime {
             Self::CoreVm(runtime) => runtime.vm.backend(),
         }
     }
+
+    pub fn uses_motion(&self) -> bool {
+        match self {
+            Self::Cooperative(runtime) => runtime.uses_motion(),
+            Self::CoreVm(runtime) => runtime.vm.uses_motion(),
+        }
+    }
     pub fn last_gas_used(&self) -> u64 {
         match self {
             Self::Cooperative(runtime) => runtime.last_gas_used(),
@@ -137,19 +144,41 @@ impl ApplicationRuntime {
         }
     }
 
-    pub fn send_input_record(&mut self, record: InputRecord) {
+    pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_input_record(record),
             Self::CoreVm(runtime) => runtime.send_input_record(record),
         }
     }
 
-    pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
+    pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         match self {
-            Self::Cooperative(runtime) => runtime.set_motion_tilt(sample),
+            Self::Cooperative(runtime) => runtime.send_text_input(kind, text),
+            Self::CoreVm(runtime) => {
+                for record in crate::encode_text_input(kind, text)? {
+                    runtime.send_input_record(record)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn set_motion_availability(
+        &mut self,
+        availability: crate::motion_wire::MotionAvailability,
+    ) {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_motion_availability(availability),
+            Self::CoreVm(runtime) => runtime.vm.set_motion_availability(availability),
+        }
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_motion_sample(bytes),
             Self::CoreVm(runtime) => runtime
                 .vm
-                .set_motion_tilt(sample)
+                .send_motion_sample(bytes)
                 .map_err(anyhow::Error::msg),
         }
     }
@@ -216,6 +245,13 @@ impl ApplicationRuntime {
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_tri2d(),
+            Self::CoreVm(_) => None,
+        }
+    }
+
+    pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_ui_semantics(),
             Self::CoreVm(_) => None,
         }
     }
@@ -374,33 +410,17 @@ impl CoreVmRuntime {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
-            InputEventType::SurfaceMetrics
-            | InputEventType::Text
-            | InputEventType::ImePreedit
-            | InputEventType::ImeCommit
-            | InputEventType::ImeEnabled
-            | InputEventType::ImeDisabled
-            | InputEventType::Focus
-            | InputEventType::Wheel => {}
+            InputEventType::SurfaceMetrics => {}
         }
     }
 
-    fn send_input_record(&mut self, record: InputRecord) {
-        if self.vm.uses_epoca_inputs() {
-            self.vm.send_epoca_input_record(record);
-            return;
+    fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        crate::ui::validate_input_record(&record)?;
+        if !self.vm.uses_epoca_inputs() {
+            return Err(anyhow!("CoreVM does not support extended input records"));
         }
-        let event_type = record.event_type();
-        if (event_type as u8) > InputEventType::SurfaceMetrics as u8 {
-            return;
-        }
-        let bytes = record.as_bytes();
-        self.send_input(InputEvent {
-            event_type,
-            code: bytes[1],
-            x: u16::from_le_bytes([bytes[2], bytes[3]]),
-            y: u16::from_le_bytes([bytes[4], bytes[5]]),
-        });
+        self.vm.send_epoca_input_record(record);
+        Ok(())
     }
 }
 

@@ -3,9 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, InputRecord,
-    MotionTiltSample, PresentationProfile, Tri2dFrame, MAX_ASSET_BYTES, MAX_ASSET_FILES,
-    MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
+    PresentationProfile, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_ASSET_BYTES,
+    MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -35,6 +35,7 @@ struct BrowserHost {
     staging: Vec<u8>,
     frame: Option<Frame>,
     tri2d: Option<Tri2dFrame>,
+    ui_semantics: Option<UiSemanticsFrame>,
     gpu_batch: Option<GpuBatch>,
     audio: Option<AudioChunk>,
     truapi_request: Option<Vec<u8>>,
@@ -51,6 +52,7 @@ impl BrowserHost {
             staging: Vec::new(),
             frame: None,
             tri2d: None,
+            ui_semantics: None,
             gpu_batch: None,
             audio: None,
             truapi_request: None,
@@ -71,6 +73,7 @@ impl BrowserHost {
     fn clear_outputs(&mut self) {
         self.frame = None;
         self.tri2d = None;
+        self.ui_semantics = None;
         self.gpu_batch = None;
         self.truapi_request = None;
         self.audio = None;
@@ -251,6 +254,32 @@ pub extern "C" fn pvm_browser_launch_start() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn pvm_browser_uses_motion() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => u32::from(runtime.uses_motion()),
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 {
+    status(|host| {
+        let availability = crate::motion_wire::MotionAvailability::try_from(availability)
+            .map_err(|_| anyhow!("invalid motion availability"))?;
+        host.running()?.set_motion_availability(availability);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_send_motion_sample() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        host.running()?.send_motion_sample(&bytes)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn pvm_browser_set_gpu_capabilities() -> u32 {
     status(|host| {
         let bytes = std::mem::take(&mut host.staging);
@@ -320,27 +349,12 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_input_record() -> u32 {
     status(|host| {
-        let bytes: [u8; crate::INPUT_EVENT_BYTES] = std::mem::take(&mut host.staging)
-            .try_into()
-            .map_err(|_| anyhow!("input record must contain exactly 8 bytes"))?;
-        let record = InputRecord::new(bytes)?;
-        host.running()?.send_input_record(record);
-        Ok(())
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn pvm_browser_set_motion_tilt() -> u32 {
-    status(|host| {
         let bytes = std::mem::take(&mut host.staging);
-        let sample = MotionTiltSample::decode(&bytes)?;
-        host.running()?.set_motion_tilt(Some(sample))
+        let record: [u8; INPUT_EVENT_BYTES] = bytes
+            .try_into()
+            .map_err(|_| anyhow!("extended input record must contain {INPUT_EVENT_BYTES} bytes"))?;
+        host.running()?.send_input_record(record)
     })
-}
-
-#[no_mangle]
-pub extern "C" fn pvm_browser_clear_motion_tilt() -> u32 {
-    status(|host| host.running()?.set_motion_tilt(None))
 }
 
 #[no_mangle]
@@ -412,6 +426,38 @@ pub extern "C" fn pvm_browser_tri2d_length() -> u32 {
     HOST.with(|host| {
         host.borrow()
             .tri2d
+            .as_ref()
+            .map_or(0, |frame| frame.bytes.len() as u32)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_take_ui_semantics() -> u32 {
+    HOST.with(|host| {
+        let mut host = host.borrow_mut();
+        host.ui_semantics = match &mut host.phase {
+            Phase::Running(runtime) => runtime.take_ui_semantics(),
+            _ => None,
+        };
+        u32::from(host.ui_semantics.is_some())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_ui_semantics_pointer() -> u32 {
+    HOST.with(|host| {
+        host.borrow()
+            .ui_semantics
+            .as_ref()
+            .map_or(0, |frame| frame.bytes.as_ptr() as usize as u32)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_ui_semantics_length() -> u32 {
+    HOST.with(|host| {
+        host.borrow()
+            .ui_semantics
             .as_ref()
             .map_or(0, |frame| frame.bytes.len() as u32)
     })

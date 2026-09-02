@@ -2,13 +2,14 @@
 resolver = "2"
 members = [
     "rust/crates/pvm-gpu-wire",
+    "rust/crates/pvm-motion-wire",
     "rust/crates/pvm-runtime",
     "rust/crates/pvm-runtime-assets",
     "rust/crates/pvm-assets-export",
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MPL-2.0"
 repository = "https://github.com/paritytech/pvm-host-runtime"

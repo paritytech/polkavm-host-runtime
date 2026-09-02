@@ -65,7 +65,7 @@ pub struct Vm {
     input_events: VecDeque<InputEvent>,
     audio_channels: u32,
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
-    motion_tilt: Option<[u8; crate::MOTION_TILT_BYTES]>,
+    motion: crate::MotionState,
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
     #[cfg(target_arch = "wasm32")]
@@ -120,7 +120,7 @@ const EINVAL: u64 = 22;
 const EMFILE: u64 = 24;
 const AT_FDCWD: u64 = (-100_i64) as u64;
 const IOV_MAX: u64 = 1024;
-const MAX_QUEUED_INPUT_EVENTS: usize = 256;
+const MAX_QUEUED_INPUT_EVENTS: usize = 4_096;
 const MAX_GUEST_WRITE_BYTES: u64 = 4 * 1024;
 const MAX_OPEN_FILES: usize = 256;
 const O_WRONLY: u64 = 1;
@@ -143,15 +143,14 @@ fn queue_input_event(events: &mut VecDeque<InputEvent>, key: u8, value: u8) {
 
 fn queue_epoca_input_record(
     events: &mut VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
-    record: crate::InputRecord,
+    record: [u8; crate::INPUT_EVENT_BYTES],
 ) {
-    let bytes = record.into_bytes();
-    if record.event_type() == crate::InputEventType::PointerDelta {
+    if record[0] == crate::InputEventType::PointerDelta as u8 {
         if let Some(queued) = events
             .iter_mut()
             .find(|queued| queued[0] == crate::InputEventType::PointerDelta as u8)
         {
-            *queued = bytes;
+            *queued = record;
             return;
         }
     }
@@ -159,7 +158,7 @@ fn queue_epoca_input_record(
     if events.len() == MAX_QUEUED_INPUT_EVENTS {
         events.pop_front();
     }
-    events.push_back(bytes);
+    events.push_back(record);
 }
 
 fn errno(error: u64) -> u64 {
@@ -266,8 +265,8 @@ impl Vm {
         let mut import_log = None;
         let mut import_yield = None;
         let mut import_truapi_send = None;
-        let mut import_motion_read = None;
         let mut import_truapi_poll = None;
+        let mut import_motion_read = None;
 
         for (import_index, import) in module.imports().into_iter().enumerate() {
             let Some(import) = import else {
@@ -291,8 +290,8 @@ impl Vm {
                 b"host_log" => import_log = Some(import_index),
                 b"pvm_yield" => import_yield = Some(import_index),
                 b"host_truapi_send" => import_truapi_send = Some(import_index),
-                b"host_motion_read" => import_motion_read = Some(import_index),
                 b"host_truapi_poll" => import_truapi_poll = Some(import_index),
+                b"host_motion_read" => import_motion_read = Some(import_index),
                 _ => return Err(format!("unsupported import: {}", import).into()),
             }
         }
@@ -308,7 +307,7 @@ impl Vm {
             input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             audio_channels: 0,
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
-            motion_tilt: None,
+            motion: crate::MotionState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
@@ -330,8 +329,8 @@ impl Vm {
             import_log,
             import_yield,
             import_truapi_send,
-            import_motion_read,
             import_truapi_poll,
+            import_motion_read,
         })
     }
 
@@ -351,8 +350,25 @@ impl Vm {
         }
     }
 
+    pub fn set_motion_availability(
+        &mut self,
+        availability: crate::motion_wire::MotionAvailability,
+    ) {
+        self.motion.set_availability(availability);
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.motion
+            .set_sample(bytes)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn backend(&self) -> polkavm::BackendKind {
         self.backend
+    }
+
+    pub fn uses_motion(&self) -> bool {
+        self.import_motion_read.is_some()
     }
 
     pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
@@ -373,17 +389,6 @@ impl Vm {
         }
         self.truapi_response_bytes += bytes.len();
         self.truapi_responses.push_back(bytes);
-        Ok(())
-    }
-
-    pub fn set_motion_tilt(
-        &mut self,
-        sample: Option<crate::MotionTiltSample>,
-    ) -> Result<(), String> {
-        self.motion_tilt = sample
-            .map(crate::MotionTiltSample::encode)
-            .transpose()
-            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -419,7 +424,7 @@ impl Vm {
         queue_epoca_input_record(&mut self.epoca_input_events, event.encode());
     }
 
-    pub fn send_epoca_input_record(&mut self, record: crate::InputRecord) {
+    pub fn send_epoca_input_record(&mut self, record: [u8; crate::INPUT_EVENT_BYTES]) {
         queue_epoca_input_record(&mut self.epoca_input_events, record);
     }
 
@@ -678,24 +683,32 @@ impl Vm {
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_motion_read => {
-                    let Some(sample) = self.motion_tilt else {
-                        self.instance.set_reg(Reg::A0, 0);
-                        continue;
-                    };
+                    let address = u32::try_from(self.instance.reg(Reg::A0))
+                        .map_err(|_| "motion output address is out of range".to_owned())?;
                     let capacity =
                         usize::try_from(self.instance.reg(Reg::A1)).unwrap_or(usize::MAX);
-                    if capacity < crate::MOTION_TILT_BYTES {
+                    let sample = match self.motion.read(capacity) {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => {
+                            self.instance
+                                .set_reg(Reg::A0, crate::motion_wire::MOTION_READ_NO_SAMPLE as u64);
+                            continue;
+                        }
+                        Err(status) => {
+                            self.instance.set_reg(Reg::A0, status as i64 as u64);
+                            continue;
+                        }
+                    };
+                    if self.instance.write_memory(address, &sample).is_err() {
                         self.instance.set_reg(
                             Reg::A0,
-                            i64::from(-(crate::MOTION_TILT_BYTES as i32)) as u64,
+                            crate::motion_wire::MOTION_ERROR_INVALID_GUEST_RANGE as i64 as u64,
                         );
                         continue;
                     }
-                    let address = u32::try_from(self.instance.reg(Reg::A0))
-                        .map_err(|_| "motion-tilt address is out of range".to_owned())?;
-                    self.instance.write_memory(address, &sample)?;
+                    self.motion.consume();
                     self.instance
-                        .set_reg(Reg::A0, crate::MOTION_TILT_BYTES as u64);
+                        .set_reg(Reg::A0, crate::motion_wire::MOTION_SAMPLE_BYTES as u64);
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_truapi_send => {

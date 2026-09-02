@@ -26,20 +26,28 @@ test("browser runtime artifacts match their published checksums", async () => {
     "pvm-wasm-worker-entry.js",
   ]) {
     const bytes = await readFile(resolve(dist, file));
-    assert.equal(createHash("sha256").update(bytes).digest("hex"), expected.get(file));
+    assert.equal(
+      createHash("sha256").update(bytes).digest("hex"),
+      expected.get(file),
+    );
   }
 });
 
-test("Wasm runtime exports the neutral graphics profile ABI", async () => {
+test("Wasm runtime exports the neutral graphics and motion ABI", async () => {
   const bytes = await readFile(resolve(dist, "pvm-browser-runtime.wasm"));
   const module = await WebAssembly.compile(bytes);
-  const exports = new Set(WebAssembly.Module.exports(module).map(({ name }) => name));
+  const exports = new Set(
+    WebAssembly.Module.exports(module).map(({ name }) => name),
+  );
   for (const name of [
     "pvm_browser_launch_begin_v2",
     "pvm_browser_take_tri2d",
     "pvm_browser_set_gpu_capabilities",
     "pvm_browser_send_gpu_event",
     "pvm_browser_take_gpu_batch",
+    "pvm_browser_set_motion_availability",
+    "pvm_browser_send_motion_sample",
+    "pvm_browser_uses_motion",
   ]) {
     assert.ok(exports.has(name), `missing ${name}`);
   }

@@ -8,11 +8,15 @@ extern crate polkavm_wasm as polkavm;
 mod application;
 mod corevm;
 pub use pvm_gpu_wire as gpu_wire;
+pub use pvm_motion_wire as motion_wire;
 mod manifest;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
+mod native_gpu;
 mod quake_keys;
 mod tri2d;
+mod ui;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -20,6 +24,8 @@ mod wasm_codegen;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 pub use native_ffi::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
+pub use native_gpu::*;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 uniffi::setup_scaffolding!();
@@ -39,81 +45,15 @@ pub use tri2d::{
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
     MAX_TRI2D_VERTICES, TRI2D_HEADER_BYTES, TRI2D_MAGIC, TRI2D_VERSION,
 };
+pub use ui::{
+    encode_text_input, focus_record, ime_state_record, wheel_record, TextInputKind,
+    UiSemanticAction, UiSemanticNode, UiSemanticRole, UiSemanticSnapshot, UiSemanticsFrame,
+    INPUT_FOCUS, INPUT_IME_COMMIT, INPUT_IME_DISABLED, INPUT_IME_ENABLED, INPUT_IME_PREEDIT,
+    INPUT_TEXT_COMMIT, INPUT_WHEEL, MAX_UI_SEMANTICS_BYTES, MAX_UI_SEMANTIC_NODES,
+    MAX_UI_SEMANTIC_STRING_BYTES, MAX_UI_TEXT_BYTES,
+};
 
 pub const ABI_VERSION: u32 = 1;
-
-pub const MOTION_TILT_MAGIC: [u8; 4] = *b"PMT1";
-pub const MOTION_TILT_VERSION: u16 = 1;
-pub const MOTION_TILT_BYTES: usize = 40;
-pub const MOTION_TILT_FLAG_CALIBRATED: u16 = 1 << 0;
-pub const MOTION_TILT_FLAG_AZIMUTH_VALID: u16 = 1 << 1;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MotionTiltSample {
-    pub sequence: u32,
-    pub timestamp_us: u64,
-    pub tilt_x: f32,
-    pub tilt_y: f32,
-    pub azimuth: Option<f32>,
-}
-
-impl MotionTiltSample {
-    pub fn encode(self) -> Result<[u8; MOTION_TILT_BYTES]> {
-        if self.sequence == 0
-            || !self.tilt_x.is_finite()
-            || !self.tilt_y.is_finite()
-            || !(-1.0..=1.0).contains(&self.tilt_x)
-            || !(-1.0..=1.0).contains(&self.tilt_y)
-            || self.azimuth.is_some_and(|value| !value.is_finite())
-        {
-            return Err(anyhow!("invalid motion-tilt sample"));
-        }
-        let mut bytes = [0; MOTION_TILT_BYTES];
-        bytes[..4].copy_from_slice(&MOTION_TILT_MAGIC);
-        bytes[4..6].copy_from_slice(&MOTION_TILT_VERSION.to_le_bytes());
-        let flags = MOTION_TILT_FLAG_CALIBRATED
-            | if self.azimuth.is_some() {
-                MOTION_TILT_FLAG_AZIMUTH_VALID
-            } else {
-                0
-            };
-        bytes[6..8].copy_from_slice(&flags.to_le_bytes());
-        bytes[8..12].copy_from_slice(&(MOTION_TILT_BYTES as u32).to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.sequence.to_le_bytes());
-        bytes[16..24].copy_from_slice(&self.timestamp_us.to_le_bytes());
-        bytes[24..28].copy_from_slice(&self.tilt_x.to_le_bytes());
-        bytes[28..32].copy_from_slice(&self.tilt_y.to_le_bytes());
-        bytes[32..36].copy_from_slice(&self.azimuth.unwrap_or(0.0).to_le_bytes());
-        Ok(bytes)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != MOTION_TILT_BYTES
-            || bytes[..4] != MOTION_TILT_MAGIC
-            || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != MOTION_TILT_VERSION
-            || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != MOTION_TILT_BYTES
-            || bytes[36..40] != [0; 4]
-        {
-            return Err(anyhow!("invalid motion-tilt encoding"));
-        }
-        let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        if flags & !(MOTION_TILT_FLAG_CALIBRATED | MOTION_TILT_FLAG_AZIMUTH_VALID) != 0
-            || flags & MOTION_TILT_FLAG_CALIBRATED == 0
-        {
-            return Err(anyhow!("invalid motion-tilt flags"));
-        }
-        let sample = Self {
-            sequence: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            timestamp_us: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            tilt_x: f32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-            tilt_y: f32::from_le_bytes(bytes[28..32].try_into().unwrap()),
-            azimuth: (flags & MOTION_TILT_FLAG_AZIMUTH_VALID != 0)
-                .then(|| f32::from_le_bytes(bytes[32..36].try_into().unwrap())),
-        };
-        sample.encode()?;
-        Ok(sample)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
@@ -252,101 +192,6 @@ pub enum InputEventType {
     PointerMove = 5,
     PointerDelta = 6,
     SurfaceMetrics = 7,
-    Text = 8,
-    ImePreedit = 9,
-    ImeCommit = 10,
-    ImeEnabled = 11,
-    ImeDisabled = 12,
-    Focus = 13,
-    Wheel = 14,
-}
-
-impl TryFrom<u8> for InputEventType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::KeyDown),
-            2 => Ok(Self::KeyUp),
-            3 => Ok(Self::ButtonDown),
-            4 => Ok(Self::ButtonUp),
-            5 => Ok(Self::PointerMove),
-            6 => Ok(Self::PointerDelta),
-            7 => Ok(Self::SurfaceMetrics),
-            8 => Ok(Self::Text),
-            9 => Ok(Self::ImePreedit),
-            10 => Ok(Self::ImeCommit),
-            11 => Ok(Self::ImeEnabled),
-            12 => Ok(Self::ImeDisabled),
-            13 => Ok(Self::Focus),
-            14 => Ok(Self::Wheel),
-            _ => Err(anyhow!("unknown input event type {value}")),
-        }
-    }
-}
-
-pub const INPUT_TEXT_CHUNK_START: u8 = 1 << 6;
-pub const INPUT_TEXT_CHUNK_END: u8 = 1 << 7;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InputRecord {
-    bytes: [u8; INPUT_EVENT_BYTES],
-}
-
-impl InputRecord {
-    pub fn new(bytes: [u8; INPUT_EVENT_BYTES]) -> Result<Self> {
-        let event_type = InputEventType::try_from(bytes[0])?;
-        match event_type {
-            InputEventType::KeyDown
-            | InputEventType::KeyUp
-            | InputEventType::ButtonDown
-            | InputEventType::ButtonUp
-            | InputEventType::PointerMove
-            | InputEventType::PointerDelta
-            | InputEventType::SurfaceMetrics => {
-                if bytes[6..] != [0, 0] {
-                    bail!("base input record has nonzero reserved bytes");
-                }
-            }
-            InputEventType::Text | InputEventType::ImePreedit | InputEventType::ImeCommit => {
-                let length = usize::from(bytes[1] & 0x07);
-                if bytes[1] & !(0x07 | INPUT_TEXT_CHUNK_START | INPUT_TEXT_CHUNK_END) != 0
-                    || length > 6
-                    || bytes[2 + length..].iter().any(|byte| *byte != 0)
-                {
-                    bail!("invalid text input chunk");
-                }
-            }
-            InputEventType::ImeEnabled | InputEventType::ImeDisabled => {
-                if bytes[1..].iter().any(|byte| *byte != 0) {
-                    bail!("IME lifecycle record has nonzero payload");
-                }
-            }
-            InputEventType::Focus => {
-                if bytes[1] > 1 || bytes[2..].iter().any(|byte| *byte != 0) {
-                    bail!("invalid focus input record");
-                }
-            }
-            InputEventType::Wheel => {
-                if bytes[1] != 0 || bytes[6..] != [0, 0] {
-                    bail!("invalid wheel input record");
-                }
-            }
-        }
-        Ok(Self { bytes })
-    }
-
-    pub fn event_type(self) -> InputEventType {
-        InputEventType::try_from(self.bytes[0]).expect("validated input record")
-    }
-
-    pub fn as_bytes(&self) -> &[u8; INPUT_EVENT_BYTES] {
-        &self.bytes
-    }
-
-    pub fn into_bytes(self) -> [u8; INPUT_EVENT_BYTES] {
-        self.bytes
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,21 +203,19 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
-    fn encode(self) -> InputRecord {
+    fn encode(self) -> [u8; INPUT_EVENT_BYTES] {
         let x = self.x.to_le_bytes();
         let y = self.y.to_le_bytes();
-        InputRecord {
-            bytes: [
-                self.event_type as u8,
-                self.code,
-                x[0],
-                x[1],
-                y[0],
-                y[1],
-                0,
-                0,
-            ],
-        }
+        [
+            self.event_type as u8,
+            self.code,
+            x[0],
+            x[1],
+            y[0],
+            y[1],
+            0,
+            0,
+        ]
     }
 }
 
@@ -440,6 +283,64 @@ impl HostClock {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MotionState {
+    availability: motion_wire::MotionAvailability,
+    sample: Option<[u8; motion_wire::MOTION_SAMPLE_BYTES]>,
+}
+
+impl MotionState {
+    fn new() -> Self {
+        Self {
+            availability: motion_wire::MotionAvailability::Unavailable,
+            sample: None,
+        }
+    }
+
+    pub(crate) fn set_availability(&mut self, availability: motion_wire::MotionAvailability) {
+        self.availability = availability;
+        if availability != motion_wire::MotionAvailability::Available {
+            self.sample = None;
+        }
+    }
+
+    pub(crate) fn set_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        motion_wire::MotionSample::decode(bytes)
+            .map_err(|error| anyhow!("invalid motion sample: {error}"))?;
+        let sample: [u8; motion_wire::MOTION_SAMPLE_BYTES] = bytes
+            .try_into()
+            .map_err(|_| anyhow!("invalid motion sample length"))?;
+        self.availability = motion_wire::MotionAvailability::Available;
+        self.sample = Some(sample);
+        Ok(())
+    }
+
+    pub(crate) fn read(
+        &self,
+        capacity: usize,
+    ) -> core::result::Result<Option<[u8; motion_wire::MOTION_SAMPLE_BYTES]>, i32> {
+        match self.availability {
+            motion_wire::MotionAvailability::Unavailable => {
+                Err(motion_wire::MOTION_ERROR_UNAVAILABLE)
+            }
+            motion_wire::MotionAvailability::PermissionDenied => {
+                Err(motion_wire::MOTION_ERROR_PERMISSION_DENIED)
+            }
+            motion_wire::MotionAvailability::Available => {
+                if capacity < motion_wire::MOTION_SAMPLE_BYTES {
+                    Err(motion_wire::MOTION_ERROR_BUFFER_TOO_SMALL)
+                } else {
+                    Ok(self.sample)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn consume(&mut self) {
+        self.sample = None;
+    }
+}
+
 pub(crate) fn preferred_backend() -> BackendKind {
     #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
     {
@@ -458,10 +359,11 @@ struct HostState {
     audio_enabled: bool,
     presentation: PresentationProfile,
     tri2d_submitted: bool,
+    ui_semantics: Option<UiSemanticsFrame>,
+    ui_semantics_submitted: bool,
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
-    input: VecDeque<InputRecord>,
-    motion_tilt: Option<[u8; MOTION_TILT_BYTES]>,
+    input: VecDeque<[u8; INPUT_EVENT_BYTES]>,
     assets: HashMap<String, Vec<u8>>,
     clock: HostClock,
     logs: VecDeque<String>,
@@ -469,6 +371,8 @@ struct HostState {
     hostcall_bytes_remaining: usize,
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
+    motion: MotionState,
+    uses_motion: bool,
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
     gpu_events: VecDeque<Vec<u8>>,
@@ -486,6 +390,7 @@ impl HostState {
         assets: HashMap<String, Vec<u8>>,
         presentation: PresentationProfile,
         audio_enabled: bool,
+        uses_motion: bool,
     ) -> Self {
         Self {
             frame: None,
@@ -494,10 +399,11 @@ impl HostState {
             audio_enabled,
             tri2d_state: tri2d::Tri2dState::default(),
             tri2d_submitted: false,
+            ui_semantics: None,
+            ui_semantics_submitted: false,
             audio: VecDeque::new(),
             audio_samples: 0,
             input: VecDeque::new(),
-            motion_tilt: None,
             assets,
             clock: HostClock::new(),
             logs: VecDeque::new(),
@@ -505,6 +411,8 @@ impl HostState {
             hostcall_bytes_remaining: 0,
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
+            motion: MotionState::new(),
+            uses_motion,
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
             gpu_events: VecDeque::new(),
@@ -523,6 +431,7 @@ impl HostState {
         self.hostcalls_remaining = max_hostcalls;
         self.sleep_ms_remaining = max_sleep_ms;
         self.tri2d_submitted = false;
+        self.ui_semantics_submitted = false;
         self.gpu_submits_remaining = MAX_GPU_SUBMITS_PER_TICK;
         self.gpu_upload_bytes_remaining = MAX_GPU_UPLOAD_BYTES_PER_TICK;
     }
@@ -543,21 +452,25 @@ impl HostState {
         Ok(())
     }
 
-    fn queue_input(&mut self, record: InputRecord) {
-        let event_type = record.event_type();
-        if event_type == InputEventType::SurfaceMetrics {
+    fn queue_input(&mut self, event: InputEvent) {
+        let _ = self.queue_input_record(event.encode());
+    }
+
+    fn queue_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        ui::validate_input_record(&record)?;
+        if record[0] == InputEventType::SurfaceMetrics as u8 {
             if let Some(position) = self
                 .input
                 .iter()
-                .rposition(|queued| queued.event_type() == InputEventType::SurfaceMetrics)
+                .rposition(|queued| queued[0] == InputEventType::SurfaceMetrics as u8)
             {
                 self.input.remove(position);
             }
-        } else if event_type == InputEventType::PointerMove
+        } else if record[0] == InputEventType::PointerMove as u8
             && self
                 .input
                 .back()
-                .is_some_and(|queued| queued.event_type() == InputEventType::PointerMove)
+                .is_some_and(|queued| queued[0] == InputEventType::PointerMove as u8)
         {
             self.input.pop_back();
         }
@@ -565,19 +478,45 @@ impl HostState {
             let discardable = self
                 .input
                 .iter()
-                .position(|queued| queued.event_type() == InputEventType::PointerMove)
+                .position(|queued| queued[0] == InputEventType::PointerMove as u8)
                 .or_else(|| {
-                    self.input
-                        .iter()
-                        .position(|queued| queued.event_type() != InputEventType::SurfaceMetrics)
+                    self.input.iter().position(|queued| {
+                        matches!(
+                            queued[0],
+                            value if value == InputEventType::PointerDelta as u8
+                                || value == ui::INPUT_WHEEL
+                        )
+                    })
                 });
             if let Some(position) = discardable {
                 self.input.remove(position);
             } else {
-                self.input.pop_front();
+                bail!("input queue is full");
             }
         }
         self.input.push_back(record);
+        Ok(())
+    }
+
+    fn queue_input_records(&mut self, records: Vec<[u8; INPUT_EVENT_BYTES]>) -> Result<()> {
+        if self.input.len().saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
+            bail!("input queue cannot accept a complete text event");
+        }
+        for record in &records {
+            ui::validate_input_record(record)?;
+        }
+        self.input.extend(records);
+        Ok(())
+    }
+
+    fn queue_ui_semantics(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if self.ui_semantics_submitted {
+            bail!("UI semantics were already submitted during this call");
+        }
+        ui::validate_ui_semantics(&bytes)?;
+        self.ui_semantics = Some(UiSemanticsFrame { bytes });
+        self.ui_semantics_submitted = true;
+        Ok(())
     }
 
     fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
@@ -656,6 +595,11 @@ impl Runtime {
         max_gas_per_update: u64,
         backend: BackendKind,
     ) -> Result<Self> {
+        let uses_motion = blob
+            .imports()
+            .iter()
+            .flatten()
+            .any(|import| import.as_bytes() == motion_wire::MOTION_READ_IMPORT.as_bytes());
         let mut engine_config = Config::new();
         // macOS requires PolkaVM's experimental generic sandbox for native
         // recompilation. Keep sandboxing enabled while opting into that boundary.
@@ -755,6 +699,30 @@ impl Runtime {
                 },
             )
             .context("define host_tri2d_submit")?;
+
+        linker
+            .define_typed(
+                "host_ui_semantics_submit",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if length == 0 || length > MAX_UI_SEMANTICS_BYTES {
+                        return Ok(1);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    if caller.user_data.ui_semantics_submitted {
+                        return Ok(2);
+                    }
+                    let bytes = read_guest_memory(caller.instance, pointer, length)?;
+                    if caller.user_data.queue_ui_semantics(bytes).is_err() {
+                        return Ok(1);
+                    }
+                    Ok(0)
+                },
+            )
+            .context("define host_ui_semantics_submit")?;
 
         linker
             .define_typed(
@@ -926,30 +894,6 @@ impl Runtime {
 
         linker
             .define_typed(
-                "host_motion_read",
-                |caller: polkavm::Caller<'_, HostState>,
-                 pointer: u32,
-                 capacity: u32|
-                 -> Result<i32> {
-                    caller.user_data.charge_hostcall(0)?;
-                    let Some(sample) = caller.user_data.motion_tilt else {
-                        return Ok(0);
-                    };
-                    if (capacity as usize) < MOTION_TILT_BYTES {
-                        return Ok(-(MOTION_TILT_BYTES as i32));
-                    }
-                    caller.user_data.charge_hostcall_bytes(MOTION_TILT_BYTES)?;
-                    caller
-                        .instance
-                        .write_memory(pointer, &sample)
-                        .map_err(|error| anyhow!("write motion-tilt sample: {error:?}"))?;
-                    Ok(MOTION_TILT_BYTES as i32)
-                },
-            )
-            .context("define host_motion_read")?;
-
-        linker
-            .define_typed(
                 "host_poll_input",
                 |caller: polkavm::Caller<'_, HostState>,
                  pointer: u32,
@@ -971,7 +915,7 @@ impl Runtime {
                             .ok_or_else(|| anyhow!("guest input destination overflow"))?;
                         caller
                             .instance
-                            .write_memory(destination, event.as_bytes())
+                            .write_memory(destination, &event)
                             .map_err(|error| anyhow!("write guest input: {error:?}"))?;
                         written += INPUT_EVENT_BYTES as u32;
                     }
@@ -979,6 +923,31 @@ impl Runtime {
                 },
             )
             .context("define host_poll_input")?;
+
+        linker
+            .define_typed(
+                motion_wire::MOTION_READ_IMPORT,
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let sample = match caller.user_data.motion.read(capacity as usize) {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(motion_wire::MOTION_READ_NO_SAMPLE),
+                        Err(status) => return Ok(status),
+                    };
+                    caller
+                        .user_data
+                        .charge_hostcall_bytes(motion_wire::MOTION_SAMPLE_BYTES)?;
+                    if caller.instance.write_memory(pointer, &sample).is_err() {
+                        return Ok(motion_wire::MOTION_ERROR_INVALID_GUEST_RANGE);
+                    }
+                    caller.user_data.motion.consume();
+                    Ok(motion_wire::MOTION_SAMPLE_BYTES as i32)
+                },
+            )
+            .context("define host_motion_read")?;
 
         linker
             .define_typed(
@@ -1130,7 +1099,7 @@ impl Runtime {
 
         Ok(Self {
             instance,
-            state: HostState::new(assets, presentation, audio_enabled),
+            state: HostState::new(assets, presentation, audio_enabled, uses_motion),
             max_gas_per_update,
             last_gas_used: 0,
             backend,
@@ -1197,19 +1166,29 @@ impl Runtime {
         self.backend
     }
 
+    pub fn uses_motion(&self) -> bool {
+        self.state.uses_motion
+    }
+
     pub fn send_input(&mut self, event: InputEvent) {
-        if (event.event_type as u8) <= InputEventType::SurfaceMetrics as u8 {
-            self.state.queue_input(event.encode());
-        }
+        self.state.queue_input(event);
     }
 
-    pub fn send_input_record(&mut self, record: InputRecord) {
-        self.state.queue_input(record);
+    pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        self.state.queue_input_record(record)
     }
 
-    pub fn set_motion_tilt(&mut self, sample: Option<MotionTiltSample>) -> Result<()> {
-        self.state.motion_tilt = sample.map(MotionTiltSample::encode).transpose()?;
-        Ok(())
+    pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
+        self.state
+            .queue_input_records(ui::encode_text_input(kind, text)?)
+    }
+
+    pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
+        self.state.motion.set_availability(availability);
+    }
+
+    pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        self.state.motion.set_sample(bytes)
     }
 
     pub fn gpu_ready(&self) -> bool {
@@ -1261,6 +1240,10 @@ impl Runtime {
 
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         self.state.tri2d.take()
+    }
+
+    pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
+        self.state.ui_semantics.take()
     }
 
     pub fn take_audio(&mut self) -> Option<AudioChunk> {
@@ -1461,6 +1444,71 @@ fn map_call_result(result: Result<(), CallError<anyhow::Error>>, phase: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polkavm::Reg;
+    use polkavm_common::abi::MemoryMapBuilder;
+    use polkavm_common::program::{asm, InstructionSetKind};
+    use polkavm_common::writer::ProgramBlobBuilder;
+
+    fn motion_test_program() -> (Vec<u8>, u32) {
+        let rw_size = 64 * 1024;
+        let stack_size = 4 * 1024;
+        let memory = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(rw_size)
+            .stack_size(stack_size)
+            .build()
+            .unwrap();
+        let output = memory.rw_data_address();
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(rw_size);
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_motion_read");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, motion_wire::MOTION_SAMPLE_BYTES as i32),
+                asm::ecalli(0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        (builder.into_vec().unwrap(), output)
+    }
+    fn no_motion_test_program() -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4 * 1024);
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(&[asm::ret()], &[]);
+        builder.into_vec().unwrap()
+    }
+
+    #[test]
+    fn runtime_reports_motion_import_usage() {
+        let (motion_program, _) = motion_test_program();
+        let motion_runtime = Runtime::new_with_backend(
+            &motion_program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(motion_runtime.uses_motion());
+
+        let no_motion_runtime = Runtime::new_with_backend(
+            &no_motion_test_program(),
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(!no_motion_runtime.uses_motion());
+    }
 
     #[test]
     fn presentation_profile_uses_tri2d_without_legacy_alias() {
@@ -1475,163 +1523,191 @@ mod tests {
     }
 
     #[test]
-    fn motion_tilt_encoding_roundtrips_and_rejects_invalid_samples() {
-        let sample = MotionTiltSample {
-            sequence: 7,
-            timestamp_us: 123_456,
-            tilt_x: -0.25,
-            tilt_y: 0.75,
-            azimuth: Some(1.5),
-        };
-        let bytes = sample.encode().expect("valid sample should encode");
-        assert_eq!(bytes.len(), MOTION_TILT_BYTES);
-        assert_eq!(MotionTiltSample::decode(&bytes).unwrap(), sample);
-        assert!(MotionTiltSample {
-            sequence: 0,
-            ..sample
+    fn motion_state_reports_status_and_consumes_only_successful_reads() {
+        let mut motion = MotionState::new();
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Err(motion_wire::MOTION_ERROR_UNAVAILABLE)
+        );
+
+        motion.set_availability(motion_wire::MotionAvailability::Available);
+        assert_eq!(motion.read(motion_wire::MOTION_SAMPLE_BYTES), Ok(None));
+        let sample = motion_wire::MotionSample {
+            flags: motion_wire::MOTION_FLAG_ROTATION | motion_wire::MOTION_FLAG_POINTER_EMULATED,
+            sequence: 1,
+            timestamp_ms: 20.0,
+            acceleration_x: 0.0,
+            acceleration_y: 0.0,
+            acceleration_z: 0.0,
+            rotation_alpha: 0.0,
+            rotation_beta: -2.0,
+            rotation_gamma: 4.0,
         }
         .encode()
-        .is_err());
-        assert!(MotionTiltSample {
-            tilt_x: f32::NAN,
-            ..sample
-        }
-        .encode()
-        .is_err());
+        .unwrap();
+        motion.set_sample(&sample).unwrap();
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES - 1),
+            Err(motion_wire::MOTION_ERROR_BUFFER_TOO_SMALL)
+        );
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Ok(Some(sample))
+        );
+        motion.consume();
+        assert_eq!(motion.read(motion_wire::MOTION_SAMPLE_BYTES), Ok(None));
+
+        motion.set_availability(motion_wire::MotionAvailability::PermissionDenied);
+        assert_eq!(
+            motion.read(motion_wire::MOTION_SAMPLE_BYTES),
+            Err(motion_wire::MOTION_ERROR_PERMISSION_DENIED)
+        );
     }
 
     #[test]
-    fn advanced_input_records_validate_payloads_and_reserved_bytes() {
-        let text = InputRecord::new([
-            InputEventType::Text as u8,
-            INPUT_TEXT_CHUNK_START | INPUT_TEXT_CHUNK_END | 5,
-            b'h',
-            b'e',
-            b'l',
-            b'l',
-            b'o',
-            0,
-        ])
+    fn interpreter_motion_hostcall_reports_status_and_writes_one_sample() {
+        let (program, output) = motion_test_program();
+        let mut runtime = Runtime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
         .unwrap();
-        assert_eq!(text.event_type(), InputEventType::Text);
-        assert!(InputRecord::new([
-            InputEventType::Text as u8,
-            INPUT_TEXT_CHUNK_END | 1,
-            b'a',
-            1,
-            0,
-            0,
-            0,
-            0,
-        ])
-        .is_err());
-        assert!(InputRecord::new([InputEventType::ImeEnabled as u8, 0, 0, 0, 0, 0, 0, 0]).is_ok());
-        assert!(InputRecord::new([InputEventType::Focus as u8, 1, 0, 0, 0, 0, 0, 0]).is_ok());
-        assert!(InputRecord::new([InputEventType::Focus as u8, 2, 0, 0, 0, 0, 0, 0]).is_err());
-        assert!(InputRecord::new([InputEventType::Wheel as u8, 0, 1, 0, 255, 255, 0, 0]).is_ok());
-        assert!(
-            InputRecord::new([InputEventType::PointerMove as u8, 0, 1, 0, 1, 0, 1, 0,]).is_err()
+
+        runtime.init().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0) as u32 as i32,
+            motion_wire::MOTION_ERROR_UNAVAILABLE
+        );
+        runtime.set_motion_availability(motion_wire::MotionAvailability::Available);
+        runtime.update().unwrap();
+        assert_eq!(runtime.instance.reg(Reg::A0), 0);
+
+        let sample = motion_wire::MotionSample {
+            flags: motion_wire::MOTION_FLAG_ROTATION | motion_wire::MOTION_FLAG_POINTER_EMULATED,
+            sequence: 9,
+            timestamp_ms: 30.0,
+            acceleration_x: 0.0,
+            acceleration_y: 0.0,
+            acceleration_z: 0.0,
+            rotation_alpha: 0.0,
+            rotation_beta: 3.0,
+            rotation_gamma: -4.0,
+        }
+        .encode()
+        .unwrap();
+        runtime.send_motion_sample(&sample).unwrap();
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0),
+            motion_wire::MOTION_SAMPLE_BYTES as u64
+        );
+        assert_eq!(
+            runtime
+                .instance
+                .read_memory(output, motion_wire::MOTION_SAMPLE_BYTES as u32)
+                .unwrap(),
+            sample
+        );
+        runtime.update().unwrap();
+        assert_eq!(runtime.instance.reg(Reg::A0), 0);
+
+        runtime.set_motion_availability(motion_wire::MotionAvailability::PermissionDenied);
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.instance.reg(Reg::A0) as u32 as i32,
+            motion_wire::MOTION_ERROR_PERMISSION_DENIED
         );
     }
 
     #[test]
     fn input_queue_coalesces_pointer_motion_and_stays_bounded() {
-        let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
+        let mut state = HostState::new(
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            false,
+        );
         for coordinate in 0..10_000u16 {
-            state.queue_input(
-                InputEvent {
-                    event_type: InputEventType::PointerMove,
-                    code: 0,
-                    x: coordinate,
-                    y: coordinate,
-                }
-                .encode(),
-            );
+            state.queue_input(InputEvent {
+                event_type: InputEventType::PointerMove,
+                code: 0,
+                x: coordinate,
+                y: coordinate,
+            });
         }
         assert_eq!(state.input.len(), 1);
         assert_eq!(
-            u16::from_le_bytes(
-                state.input.back().unwrap().as_bytes()[2..4]
-                    .try_into()
-                    .unwrap()
-            ),
+            u16::from_le_bytes(state.input.back().unwrap()[2..4].try_into().unwrap()),
             9_999
         );
 
-        state.queue_input(
-            InputEvent {
-                event_type: InputEventType::SurfaceMetrics,
-                code: 32,
-                x: 1_280,
-                y: 800,
-            }
-            .encode(),
-        );
-        state.queue_input(
-            InputEvent {
-                event_type: InputEventType::SurfaceMetrics,
-                code: 64,
-                x: 2_560,
-                y: 1_600,
-            }
-            .encode(),
-        );
+        state.queue_input(InputEvent {
+            event_type: InputEventType::SurfaceMetrics,
+            code: 32,
+            x: 1_280,
+            y: 800,
+        });
+        state.queue_input(InputEvent {
+            event_type: InputEventType::SurfaceMetrics,
+            code: 64,
+            x: 2_560,
+            y: 1_600,
+        });
         assert_eq!(
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type() == InputEventType::SurfaceMetrics)
+                .filter(|event| event[0] == InputEventType::SurfaceMetrics as u8)
                 .count(),
             1
         );
         assert_eq!(
-            u16::from_le_bytes(
-                state.input.back().unwrap().as_bytes()[2..4]
-                    .try_into()
-                    .unwrap()
-            ),
+            u16::from_le_bytes(state.input.back().unwrap()[2..4].try_into().unwrap()),
             2_560
         );
 
         for index in 0..(MAX_QUEUED_INPUT_EVENTS + 100) {
-            state.queue_input(
-                InputEvent {
-                    event_type: InputEventType::KeyDown,
-                    code: index as u8,
-                    x: 0,
-                    y: 0,
-                }
-                .encode(),
-            );
+            state.queue_input(InputEvent {
+                event_type: InputEventType::KeyDown,
+                code: index as u8,
+                x: 0,
+                y: 0,
+            });
         }
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type() == InputEventType::SurfaceMetrics)
+                .filter(|event| event[0] == InputEventType::SurfaceMetrics as u8)
                 .count(),
             1
         );
-        state.queue_input(
-            InputEvent {
-                event_type: InputEventType::SurfaceMetrics,
-                code: 64,
-                x: 3_000,
-                y: 2_000,
-            }
-            .encode(),
-        );
+        state.queue_input(InputEvent {
+            event_type: InputEventType::SurfaceMetrics,
+            code: 64,
+            x: 3_000,
+            y: 2_000,
+        });
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
-            state.input.back().unwrap().event_type(),
-            InputEventType::SurfaceMetrics
+            state.input.back().unwrap()[0],
+            InputEventType::SurfaceMetrics as u8
         );
     }
 
     #[test]
     fn truapi_queues_enforce_frame_count_and_byte_limits() {
-        let mut state = HostState::new(HashMap::new(), PresentationProfile::Framebuffer, false);
+        let mut state = HostState::new(
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            false,
+        );
         assert!(state.queue_truapi_response(Vec::new()).is_err());
         assert!(state
             .queue_truapi_response(vec![0; MAX_TRUAPI_FRAME_BYTES + 1])
