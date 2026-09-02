@@ -384,7 +384,7 @@ impl CoreVmRuntime {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
-            InputEventType::SurfaceMetrics => {}
+            InputEventType::SurfaceMetrics | InputEventType::Text => {}
         }
     }
 }

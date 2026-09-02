@@ -259,11 +259,14 @@ ABI v1 event types are:
 5  pointer position
 6  pointer delta
 7  surface metrics
+8  committed Unicode scalar
 ```
 
 The device-input contract defines code values, coordinate interpretation, and
-surface-metric scaling. ABI v1 does not define touch, wheel, UTF-8 text, IME,
-or focus events.
+surface-metric scaling. For event type 8, `code` is zero and the Unicode scalar
+value is `x | (y << 16)`; hosts emit one record per committed scalar, including
+text committed by an IME. ABI v1 does not define touch, wheel, pre-edit IME, or
+focus events.
 
 ### Motion
 
@@ -411,7 +414,7 @@ all assets                            128 MiB
 one asset read                        16 MiB
 Host-call bytes per init/update       32 MiB
 Host calls during init                131,072
-Host calls during update              8,192
+Host calls during update              65,536
 sleep during init                     100 ms
 sleep during update                   50 ms
 audio samples per submission          96,000

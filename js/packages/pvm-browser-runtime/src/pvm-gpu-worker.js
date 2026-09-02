@@ -34,6 +34,7 @@ const resourceLimits = new Map([
 ]);
 const bindGroupResourceKinds = new Map([
   [1, "buffer"],
+  [4, "buffer"],
   [2, "sampler"],
   [3, "textureView"],
 ]);
@@ -47,6 +48,7 @@ const formats = new Map([
   [4, "bgra8unorm-srgb"],
   [5, "depth24plus"],
   [6, "depth32float"],
+  [7, "r8unorm"],
 ]);
 const formatIds = new Map([...formats].map(([id, format]) => [format, id]));
 const vertexFormats = new Map([
@@ -522,7 +524,7 @@ function parseCommand(command) {
         const parameter0 = reader.u32();
         const parameter1 = reader.u32();
         let entry;
-        if (kind === 1) {
+        if (kind === 1 || kind === 4) {
           if (parameter0 || parameter1 || flags & ~1) {
             throw new ProtocolError(
               "invalid buffer binding layout",
@@ -533,7 +535,7 @@ function parseCommand(command) {
             binding,
             visibility,
             buffer: {
-              type: "uniform",
+              type: kind === 1 ? "uniform" : "read-only-storage",
               hasDynamicOffset: Boolean(flags & 1),
               minBindingSize,
             },
@@ -609,7 +611,7 @@ function parseCommand(command) {
         const binding = reader.u32();
         const resourceId = reader.u32();
         const kind = reader.u16();
-        if (kind !== 1 && kind !== 2 && kind !== 3) {
+        if (kind !== 1 && kind !== 2 && kind !== 3 && kind !== 4) {
           throw new ProtocolError(
             "unsupported bind group entry kind",
             command.index
@@ -1374,6 +1376,7 @@ class GpuEngine {
     let surfaceView = null;
     let surfaceTexture = null;
     let readback = null;
+    let submitted = false;
     const removed = [];
     const shaders = [];
     const created = [];
@@ -1465,7 +1468,7 @@ class GpuEngine {
               entries: command.entries.map(item => ({
                 binding: item.binding,
                 resource:
-                  item.kind === 1
+                  item.kind === 1 || item.kind === 4
                     ? {
                         buffer: resource(
                           next,
@@ -1676,6 +1679,7 @@ class GpuEngine {
       }
       if (encoder) {
         this.device.queue.submit([encoder.finish()]);
+        submitted = true;
       }
     } catch (error) {
       created.forEach(entry => entry.value?.destroy?.());
@@ -1684,8 +1688,28 @@ class GpuEngine {
       void this.device.popErrorScope();
       throw error;
     }
-    const outOfMemory = await this.device.popErrorScope();
-    const validation = await this.device.popErrorScope();
+    const outOfMemoryPromise = this.device.popErrorScope();
+    const validationPromise = this.device.popErrorScope();
+    let outOfMemory = null;
+    let validation = null;
+    if (submitted) {
+      [outOfMemory, validation] = await Promise.all([
+        outOfMemoryPromise,
+        validationPromise,
+      ]);
+    } else {
+      void Promise.all([outOfMemoryPromise, validationPromise]).then(
+        ([outOfMemory, validation]) => {
+          const error = outOfMemory || validation;
+          if (error) {
+            postMessage({
+              type: "error",
+              message: `WebGPU resource validation failed: ${error.message}`,
+            });
+          }
+        }
+      );
+    }
     const gpuError = outOfMemory || validation;
     if (gpuError) {
       readback?.destroy();
@@ -1705,7 +1729,9 @@ class GpuEngine {
     shaders.forEach(([entry, handle]) =>
       this.watchShader(entry, handle, batch.sequence)
     );
-    await this.device.queue.onSubmittedWorkDone();
+    if (submitted) {
+      await this.device.queue.onSubmittedWorkDone();
+    }
     if (readback) {
       await readback.mapAsync(GPUMapMode.READ);
       const readbackBytes = new Uint8Array(readback.getMappedRange());

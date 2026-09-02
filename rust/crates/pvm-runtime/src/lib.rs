@@ -73,7 +73,7 @@ impl PresentationProfile {
     }
 }
 pub const BYTES_PER_PIXEL: usize = 4;
-pub const MAX_PROGRAM_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GUEST_READ: usize = MAX_FRAME_BYTES;
 pub const MAX_GUEST_RW_DATA_BYTES: u32 = 64 * 1024 * 1024;
@@ -90,7 +90,7 @@ const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_ASSET_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HOSTCALL_BYTES_PER_TICK: usize = 32 * 1024 * 1024;
 const MAX_HOSTCALLS_PER_INIT: u32 = 131_072;
-const MAX_HOSTCALLS_PER_UPDATE: u32 = 8_192;
+const MAX_HOSTCALLS_PER_UPDATE: u32 = 65_536;
 const MAX_SLEEP_MS_PER_INIT: u32 = 100;
 const MAX_SLEEP_MS_PER_UPDATE: u32 = 50;
 const MAX_QUEUED_AUDIO_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS as usize * 2;
@@ -184,6 +184,7 @@ pub enum InputEventType {
     PointerMove = 5,
     PointerDelta = 6,
     SurfaceMetrics = 7,
+    Text = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

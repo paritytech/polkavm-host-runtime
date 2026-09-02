@@ -328,6 +328,7 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
             5 => InputEventType::PointerMove,
             6 => InputEventType::PointerDelta,
             7 => InputEventType::SurfaceMetrics,
+            8 => InputEventType::Text,
             _ => return Err(anyhow!("invalid PolkaVM browser input event type")),
         };
         let code = u8::try_from(code).map_err(|_| anyhow!("input code exceeds u8"))?;
