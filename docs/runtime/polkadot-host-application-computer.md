@@ -330,15 +330,50 @@ SplitHorizontal
     +-- ssh.pvm
 ```
 
-Later workspace operations are:
+### Draft `host.workspace` surface ABI (unimplemented)
+
+Design draft; binary signatures follow the conventions above and must be
+pinned by conformance fixtures before any Host advertises them.
+
+A surface is an opaque handle owned by the Host, like every other resource.
+Two surface kinds exist initially, and both deliberately avoid a fixed bitmap
+geometry:
+
+- `text`: a column/row cell grid. The Host renders cells natively, so
+  terminals stay DPI-independent on every platform (this removes the current
+  640x400 presentation ceiling rather than generalizing it).
+- `frame`: an RGBA framebuffer presented whole. This is the phase-7 graphics
+  contract and is not required for the tiling milestone.
 
 ```text
-workspace.spawn_child()
-workspace.child_surface()
-workspace.resize_child()
-workspace.focus_child()
-workspace.close_child()
+polkadot_host_0_1_workspace_spawn(package, argv, environment)
+    -> (child_handle, surface_handle) | error
+polkadot_host_0_1_workspace_run(child_handle) -> status
+polkadot_host_0_1_workspace_send_input(child_handle, record_pointer, length)
+    -> written | WOULD_BLOCK | error
+polkadot_host_0_1_workspace_resize(child_handle, columns, rows) -> status
+polkadot_host_0_1_workspace_surface_read(surface_handle, pointer, capacity)
+    -> length | WOULD_BLOCK | error
+polkadot_host_0_1_workspace_close(child_handle) -> status
 ```
+
+Invariants carried over from the terminal-computer supervisor:
+
+- The Host owns every child VM, its gas budget, its capability grants, and its
+  fault containment. `workspace_run` returns the same status codes as
+  `process_run`; a faulted child is reported and reaped, never resurrected.
+- The workspace guest sees only surface output records and child exit status.
+  It never reads child memory, files, or capability state.
+- Input is routed, not shared: the Host delivers input records exclusively to
+  the workspace, which forwards bytes to at most one focused child per call.
+  Host-authority cancellation (the Ctrl-] equivalent) always targets the
+  workspace itself and cannot be intercepted by it.
+- `workspace_resize` obeys the existing 1..=1000 column/row clamp, and surface
+  reads are bounded by the same queue limits as terminal output.
+
+A workspace application therefore composes existing contracts: it is an
+ordinary computer guest whose extra capability is holding child and surface
+handles. Layout, focus, and keybindings are guest policy.
 
 A first tiling workspace may implement bindings such as:
 
@@ -395,6 +430,13 @@ Presentation: the `computer-serve` Host mode (application repository: Epoca)
 renders the supervisor's ANSI stream host-side through the shared terminal
 emulator and speaks the framebuffer-app wire protocol, so browser surfaces
 can present the computer without new message types.
+
+Browser Host: `js/packages/pvm-browser-runtime/src/pvm-computer.js` implements
+the same contract in JavaScript over the wasm-translated guest - context,
+tty/fs devices, supervisor, pipes, spawn gating, and network denial - and runs
+the identical `.polkavm` conformance fixtures in the browser test suite.
+Translated shell and Vim guests run unmodified under it, so the computer is a
+client-side web product, not a native-only CLI.
 
 ### Targeted POSIX compatibility
 

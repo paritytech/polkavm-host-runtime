@@ -21,7 +21,7 @@ pub fn browser_assets() -> &'static [BrowserAsset] {
     &ASSETS
 }
 
-const ASSETS: [BrowserAsset; 7] = [
+const ASSETS: [BrowserAsset; 8] = [
     BrowserAsset {
         path: "pvm-browser-runtime.wasm",
         content_type: "application/wasm",
@@ -59,10 +59,16 @@ const ASSETS: [BrowserAsset; 7] = [
         sha256: "9c929f5d5c64a1b75e7e48485d7c3944ed6838112177ea778827a2c407c2d820",
     },
     BrowserAsset {
+        path: "pvm-computer.js",
+        content_type: "text/javascript",
+        bytes: include_bytes!("../assets/pvm-computer.js"),
+        sha256: "a98cfc2ab6aacb3729fd566712a961ed45e32425675161d8cf10fe6674cd5150",
+    },
+    BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "14beb5407a931f27a483a567c69becd7b2ddddf6e47a7fa809fa30c0f2a25579",
+        sha256: "e61e0a011eda328e8537b330332e29449b7ae57302fbc15c68a0018b2ccb6a23",
     },
 ];
 
