@@ -12,6 +12,7 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 - `rust/crates/pvm-assets-export`: exports those assets for Android, iOS, and browser packaging.
 - `js/packages/pvm-browser-runtime`: source-built `@parity/pvm-browser-runtime` package.
 - `docs/runtime/polkavm-app-abi-v1.md`: application ABI contract.
+- `docs/runtime/tri2d-v1.md`: Tri2D frame, command, retained-resource, and limit contract.
 
 ## Host boundary
 
