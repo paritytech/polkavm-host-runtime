@@ -1,0 +1,1441 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use crate::corevm::{Interruption, Vm};
+use anyhow::{anyhow, bail, Context, Result};
+use polkavm::ProgramBlob;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+/// Version of the experimental Polkadot Host application-computer contract.
+pub const COMPUTER_ABI_VERSION: (u16, u16) = (0, 1);
+
+/// Maximum encoded argument or environment record accepted at launch.
+pub const MAX_COMPUTER_CONTEXT_BYTES: usize = 64 * 1024;
+
+/// Maximum number of arguments or environment entries accepted at launch.
+pub const MAX_COMPUTER_CONTEXT_ENTRIES: usize = 1_024;
+
+/// Terminal handle granted to every computer guest.
+pub const COMPUTER_TTY_HANDLE: u32 = 1;
+/// Raw (non-canonical) terminal input mode flag.
+pub const TTY_MODE_RAW: u32 = 1;
+/// Terminal echo mode flag.
+pub const TTY_MODE_ECHO: u32 = 2;
+/// Open flag granting read access.
+pub const FS_OPEN_READ: u32 = 1;
+/// Open flag granting write access.
+pub const FS_OPEN_WRITE: u32 = 2;
+/// Open flag creating a missing file when writable.
+pub const FS_OPEN_CREATE: u32 = 4;
+/// Open flag truncating an existing writable file.
+pub const FS_OPEN_TRUNCATE: u32 = 8;
+
+/// Maximum bytes queued toward the guest terminal.
+pub const MAX_TTY_INPUT_BYTES: usize = 64 * 1024;
+/// Maximum guest terminal output retained per run.
+pub const MAX_TTY_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Maximum files in the mounted computer filesystem.
+pub const MAX_COMPUTER_FILES: usize = 64;
+/// Maximum size of one mounted file.
+pub const MAX_COMPUTER_FILE_BYTES: usize = 1024 * 1024;
+/// Maximum simultaneously open computer file handles.
+pub const MAX_OPEN_COMPUTER_FILES: usize = 16;
+/// Maximum accepted file path length in bytes.
+pub const MAX_COMPUTER_PATH_BYTES: usize = 200;
+/// Maximum simultaneously open outbound TCP sockets.
+pub const MAX_OPEN_SOCKETS: usize = 4;
+/// First handle value assigned to network sockets.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
+/// First handle value assigned to open files.
+pub(crate) const FIRST_FILE_HANDLE: u32 = 16;
+/// Maximum accepted network address length in bytes.
+pub const MAX_NET_ADDRESS_BYTES: usize = 256;
+
+pub(crate) const STATUS_WOULD_BLOCK: i32 = -1;
+pub(crate) const STATUS_BAD_HANDLE: i32 = -2;
+pub(crate) const STATUS_INVALID: i32 = -3;
+pub(crate) const STATUS_NOT_FOUND: i32 = -4;
+pub(crate) const STATUS_DENIED: i32 = -5;
+pub(crate) const STATUS_LIMIT: i32 = -6;
+
+/// Launch context exposed through `polkadot-host-computer/0.1/core`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputerContext {
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: Vec<(String, String)>,
+    pub(crate) encoded_arguments: Vec<u8>,
+    pub(crate) encoded_environment: Vec<u8>,
+}
+
+impl ComputerContext {
+    /// Validates and encodes an application-computer launch context.
+    pub fn new(arguments: Vec<String>, environment: Vec<(String, String)>) -> Result<Self> {
+        if arguments.len() > MAX_COMPUTER_CONTEXT_ENTRIES {
+            bail!("computer argument count exceeds the host limit");
+        }
+        if environment.len() > MAX_COMPUTER_CONTEXT_ENTRIES {
+            bail!("computer environment count exceeds the host limit");
+        }
+
+        for argument in &arguments {
+            if argument.as_bytes().contains(&0) {
+                bail!("computer arguments must not contain NUL bytes");
+            }
+        }
+
+        let mut keys = BTreeSet::new();
+        for (key, value) in &environment {
+            if key.is_empty() || key.contains('=') || key.as_bytes().contains(&0) {
+                bail!(
+                    "computer environment keys must be non-empty and contain neither '=' nor NUL"
+                );
+            }
+            if value.as_bytes().contains(&0) {
+                bail!("computer environment values must not contain NUL bytes");
+            }
+            if !keys.insert(key.as_str()) {
+                bail!("computer environment contains duplicate key {key:?}");
+            }
+        }
+
+        let encoded_arguments = encode_arguments(&arguments)?;
+        let encoded_environment = encode_environment(&environment)?;
+        Ok(Self {
+            arguments,
+            environment,
+            encoded_arguments,
+            encoded_environment,
+        })
+    }
+
+    /// Returns launch arguments in guest-visible order.
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    /// Returns launch environment entries in guest-visible order.
+    pub fn environment(&self) -> &[(String, String)] {
+        &self.environment
+    }
+}
+
+impl Default for ComputerContext {
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new()).expect("an empty computer context is valid")
+    }
+}
+
+/// Observable state after running an application-computer guest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputerStatus {
+    /// The guest yielded control and may be resumed.
+    Yielded,
+    /// The guest exited with the supplied application status.
+    Exited(i32),
+    /// The guest requested a child process; the supervisor must resolve it.
+    SpawnRequested,
+    /// The guest issued a spawn/wait/pipe call; the supervisor must resolve it.
+    ChildRequest,
+}
+
+struct OpenComputerFile {
+    path: String,
+    position: usize,
+    readable: bool,
+    writable: bool,
+}
+
+/// Terminal, filesystem, and network devices granted to one computer guest.
+pub(crate) struct ComputerDevices {
+    tty_input: VecDeque<u8>,
+    tty_input_closed: bool,
+    tty_output: Vec<u8>,
+    tty_columns: u32,
+    tty_rows: u32,
+    tty_mode: u32,
+    files: BTreeMap<String, Vec<u8>>,
+    modified: BTreeSet<String>,
+    open_files: BTreeMap<u32, OpenComputerFile>,
+    network_enabled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    sockets: BTreeMap<u32, std::net::TcpStream>,
+    #[cfg(not(target_arch = "wasm32"))]
+    next_socket: u32,
+}
+
+impl ComputerDevices {
+    pub(crate) fn new() -> Self {
+        Self {
+            tty_input: VecDeque::new(),
+            tty_input_closed: false,
+            tty_output: Vec::new(),
+            tty_columns: 80,
+            tty_rows: 24,
+            tty_mode: TTY_MODE_ECHO,
+            files: BTreeMap::new(),
+            modified: BTreeSet::new(),
+            open_files: BTreeMap::new(),
+            network_enabled: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            sockets: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            next_socket: FIRST_SOCKET_HANDLE,
+        }
+    }
+
+    /* ── Network boundary (host.net v0: outbound TCP only) ─────────── */
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_tcp_connect(&mut self, address: &str) -> i32 {
+        use std::net::ToSocketAddrs;
+        if !self.network_enabled {
+            return STATUS_DENIED;
+        }
+        if self.sockets.len() >= MAX_OPEN_SOCKETS {
+            return STATUS_LIMIT;
+        }
+        let Ok(mut resolved) = address.to_socket_addrs() else {
+            return STATUS_NOT_FOUND;
+        };
+        let Some(target) = resolved.next() else {
+            return STATUS_NOT_FOUND;
+        };
+        let Ok(stream) =
+            std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_secs(5))
+        else {
+            return STATUS_INVALID;
+        };
+        if stream.set_nonblocking(true).is_err() {
+            return STATUS_INVALID;
+        }
+        let handle = self.next_socket;
+        self.next_socket += 1;
+        self.sockets.insert(handle, stream);
+        handle as i32
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_read(&mut self, handle: u32, buffer: &mut [u8]) -> i32 {
+        use std::io::Read;
+        let Some(stream) = self.sockets.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        match stream.read(buffer) {
+            Ok(count) => count as i32,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => STATUS_WOULD_BLOCK,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_write(&mut self, handle: u32, bytes: &[u8]) -> i32 {
+        use std::io::Write;
+        let Some(stream) = self.sockets.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        match stream.write(bytes) {
+            Ok(count) => count as i32,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => STATUS_WOULD_BLOCK,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_close(&mut self, handle: u32) -> i32 {
+        if self.sockets.remove(&handle).is_none() {
+            return STATUS_BAD_HANDLE;
+        }
+        0
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_tcp_connect(&mut self, _address: &str) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_read(&mut self, _handle: u32, _buffer: &mut [u8]) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_write(&mut self, _handle: u32, _bytes: &[u8]) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_close(&mut self, _handle: u32) -> i32 {
+        STATUS_DENIED
+    }
+
+    fn push_terminal_input(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.tty_input_closed {
+            bail!("terminal input is closed");
+        }
+        if self.tty_input.len().saturating_add(bytes.len()) > MAX_TTY_INPUT_BYTES {
+            bail!("terminal input queue limit exceeded");
+        }
+        self.tty_input.extend(bytes.iter().copied());
+        Ok(())
+    }
+
+    /// Marks the input stream as ended; reads on an empty queue return 0.
+    fn close_input(&mut self) {
+        self.tty_input_closed = true;
+    }
+
+    fn input_space(&self) -> usize {
+        if self.tty_input_closed {
+            return 0;
+        }
+        MAX_TTY_INPUT_BYTES.saturating_sub(self.tty_input.len())
+    }
+
+    fn take_terminal_output(&mut self) -> Option<Vec<u8>> {
+        if self.tty_output.is_empty() {
+            return None;
+        }
+        Some(core::mem::take(&mut self.tty_output))
+    }
+
+    fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        if validate_computer_path(path).is_none() {
+            bail!("invalid computer file path {path:?}");
+        }
+        if bytes.len() > MAX_COMPUTER_FILE_BYTES {
+            bail!("mounted file {path:?} exceeds {MAX_COMPUTER_FILE_BYTES} bytes");
+        }
+        if !self.files.contains_key(path) && self.files.len() == MAX_COMPUTER_FILES {
+            bail!("computer filesystem file limit exceeded");
+        }
+        self.files.insert(path.to_owned(), bytes);
+        Ok(())
+    }
+
+    fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
+        let modified = core::mem::take(&mut self.modified);
+        modified
+            .into_iter()
+            .filter_map(|path| {
+                let bytes = self.files.get(&path)?.clone();
+                Some((path, bytes))
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_terminal_input(&self) -> bool {
+        !self.tty_input.is_empty()
+    }
+
+    pub(crate) fn terminal_mode(&self) -> u32 {
+        self.tty_mode
+    }
+
+    pub(crate) fn terminal_size(&self) -> (u32, u32) {
+        (self.tty_columns, self.tty_rows)
+    }
+
+    pub(crate) fn tty_read_into(&mut self, handle: u32, buffer: &mut [u8]) -> i32 {
+        if handle != COMPUTER_TTY_HANDLE {
+            return STATUS_BAD_HANDLE;
+        }
+        if buffer.is_empty() {
+            return STATUS_INVALID;
+        }
+        if self.tty_input.is_empty() {
+            if self.tty_input_closed {
+                return 0;
+            }
+            return STATUS_WOULD_BLOCK;
+        }
+        let mut written = 0usize;
+        while written < buffer.len() {
+            let Some(byte) = self.tty_input.pop_front() else {
+                break;
+            };
+            buffer[written] = byte;
+            written += 1;
+        }
+        written as i32
+    }
+
+    pub(crate) fn tty_write(&mut self, handle: u32, bytes: &[u8]) -> i32 {
+        if handle != COMPUTER_TTY_HANDLE {
+            return STATUS_BAD_HANDLE;
+        }
+        let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.tty_output.len());
+        let written = bytes.len().min(available);
+        self.tty_output.extend_from_slice(&bytes[..written]);
+        written as i32
+    }
+
+    pub(crate) fn tty_set_mode(&mut self, handle: u32, flags: u32) -> i32 {
+        if handle != COMPUTER_TTY_HANDLE {
+            return STATUS_BAD_HANDLE;
+        }
+        if flags & !(TTY_MODE_RAW | TTY_MODE_ECHO) != 0 {
+            return STATUS_INVALID;
+        }
+        self.tty_mode = flags;
+        0
+    }
+
+    pub(crate) fn fs_open(&mut self, path: &str, flags: u32) -> i32 {
+        let Some(path) = validate_computer_path(path) else {
+            return STATUS_INVALID;
+        };
+        let readable = flags & FS_OPEN_READ != 0;
+        let writable = flags & FS_OPEN_WRITE != 0;
+        if !readable && !writable {
+            return STATUS_INVALID;
+        }
+        if self.open_files.len() == MAX_OPEN_COMPUTER_FILES {
+            return STATUS_LIMIT;
+        }
+        if !self.files.contains_key(path) {
+            if !(writable && flags & FS_OPEN_CREATE != 0) {
+                return STATUS_NOT_FOUND;
+            }
+            if self.files.len() == MAX_COMPUTER_FILES {
+                return STATUS_LIMIT;
+            }
+        }
+        // Recycle the lowest free handle. Because at most
+        // MAX_OPEN_COMPUTER_FILES handles are live, this always terminates
+        // far below FIRST_SOCKET_HANDLE, keeping the spaces disjoint.
+        let handle = (FIRST_FILE_HANDLE..)
+            .find(|handle| !self.open_files.contains_key(handle))
+            .expect("a free file handle always exists below the open-file cap");
+        // Mutations happen only after every failure path has been ruled out.
+        if !self.files.contains_key(path) || (writable && flags & FS_OPEN_TRUNCATE != 0) {
+            self.files.insert(path.to_owned(), Vec::new());
+            self.modified.insert(path.to_owned());
+        }
+        self.open_files.insert(
+            handle,
+            OpenComputerFile {
+                path: path.to_owned(),
+                position: 0,
+                readable,
+                writable,
+            },
+        );
+        handle as i32
+    }
+
+    pub(crate) fn fs_read(&mut self, handle: u32, buffer: &mut [u8]) -> i32 {
+        let Some(open) = self.open_files.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        if !open.readable {
+            return STATUS_DENIED;
+        }
+        let Some(file) = self.files.get(&open.path) else {
+            return STATUS_NOT_FOUND;
+        };
+        let start = open.position.min(file.len());
+        let length = buffer.len().min(file.len() - start);
+        buffer[..length].copy_from_slice(&file[start..start + length]);
+        open.position = start + length;
+        length as i32
+    }
+
+    pub(crate) fn fs_write(&mut self, handle: u32, bytes: &[u8]) -> i32 {
+        let Some(open) = self.open_files.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        if !open.writable {
+            return STATUS_DENIED;
+        }
+        let Some(file) = self.files.get_mut(&open.path) else {
+            return STATUS_NOT_FOUND;
+        };
+        let end = open.position.saturating_add(bytes.len());
+        if end > MAX_COMPUTER_FILE_BYTES {
+            return STATUS_LIMIT;
+        }
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[open.position..end].copy_from_slice(bytes);
+        open.position = end;
+        self.modified.insert(open.path.clone());
+        bytes.len() as i32
+    }
+
+    pub(crate) fn fs_seek(&mut self, handle: u32, offset: i32, whence: u32) -> i32 {
+        let Some(open) = self.open_files.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        let Some(file) = self.files.get(&open.path) else {
+            return STATUS_NOT_FOUND;
+        };
+        let base = match whence {
+            0 => 0i64,
+            1 => open.position as i64,
+            2 => file.len() as i64,
+            _ => return STATUS_INVALID,
+        };
+        let position = base + i64::from(offset);
+        if !(0..=MAX_COMPUTER_FILE_BYTES as i64).contains(&position) {
+            return STATUS_INVALID;
+        }
+        open.position = position as usize;
+        position as i32
+    }
+
+    pub(crate) fn fs_truncate(&mut self, handle: u32, length: u32) -> i32 {
+        let length = length as usize;
+        if length > MAX_COMPUTER_FILE_BYTES {
+            return STATUS_LIMIT;
+        }
+        let Some(open) = self.open_files.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        if !open.writable {
+            return STATUS_DENIED;
+        }
+        let Some(file) = self.files.get_mut(&open.path) else {
+            return STATUS_NOT_FOUND;
+        };
+        file.resize(length, 0);
+        self.modified.insert(open.path.clone());
+        0
+    }
+
+    pub(crate) fn fs_stat(&self, path: &str) -> Option<u32> {
+        let path = validate_computer_path(path)?;
+        self.files.get(path).map(|file| file.len() as u32)
+    }
+
+    pub(crate) fn fs_sync(&mut self, handle: u32) -> i32 {
+        if self.open_files.contains_key(&handle) {
+            0
+        } else {
+            STATUS_BAD_HANDLE
+        }
+    }
+
+    pub(crate) fn fs_close(&mut self, handle: u32) -> i32 {
+        if self.open_files.remove(&handle).is_some() {
+            0
+        } else {
+            STATUS_BAD_HANDLE
+        }
+    }
+
+    /// Encodes the mounted file paths as a length-delimited record.
+    pub(crate) fn fs_list_record(&self) -> Vec<u8> {
+        let mut record = Vec::with_capacity(64);
+        record.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
+        for path in self.files.keys() {
+            record.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            record.extend_from_slice(path.as_bytes());
+        }
+        record
+    }
+}
+
+fn validate_computer_path(path: &str) -> Option<&str> {
+    if path.len() > MAX_COMPUTER_PATH_BYTES
+        || !path.starts_with("/home/")
+        || path.ends_with('/')
+        || path.bytes().any(|byte| byte == 0)
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// A spawn/wait/pipe operation awaiting supervisor resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildProcessRequest {
+    Spawn {
+        package: String,
+        arguments: Vec<String>,
+    },
+    Wait {
+        pid: u32,
+    },
+    PipeRead {
+        pid: u32,
+        destination: u32,
+        capacity: usize,
+    },
+    PipeWrite {
+        pid: u32,
+        bytes: Vec<u8>,
+    },
+    PipeClose {
+        pid: u32,
+    },
+}
+
+/// Experimental host-neutral runtime for `polkadot-host-computer/0.1` guests.
+pub struct ComputerRuntime {
+    vm: Vm,
+    max_gas_per_run: u64,
+    exit_status: Option<i32>,
+    pending_spawn: Option<(String, Vec<String>)>,
+    pending_child_request: Option<ChildProcessRequest>,
+}
+
+impl ComputerRuntime {
+    /// Creates a runtime using the preferred backend for this platform.
+    pub fn new(program: &[u8], context: ComputerContext, max_gas_per_run: u64) -> Result<Self> {
+        Self::new_with_backend(
+            program,
+            context,
+            max_gas_per_run,
+            crate::preferred_backend(),
+        )
+    }
+
+    /// Creates a runtime using an explicitly selected PolkaVM backend.
+    pub fn new_with_backend(
+        program: &[u8],
+        context: ComputerContext,
+        max_gas_per_run: u64,
+        backend: polkavm::BackendKind,
+    ) -> Result<Self> {
+        crate::validate_launch_inputs(program, &HashMap::new(), max_gas_per_run)?;
+        let blob = ProgramBlob::parse(program.into()).context("parse PolkaVM computer program")?;
+        crate::validate_blob(&blob)?;
+        if !blob.exports().any(|export| export.symbol() == "_pvm_start") {
+            bail!("computer guests must export '_pvm_start'");
+        }
+
+        let mut vm = Vm::from_blob(blob, backend).context("create PolkaVM computer guest")?;
+        vm.setup(context).map_err(|error| anyhow!(error))?;
+        Ok(Self {
+            vm,
+            max_gas_per_run,
+            exit_status: None,
+            pending_spawn: None,
+            pending_child_request: None,
+        })
+    }
+
+    /// Runs until the guest yields, exits, or fails.
+    pub fn run(&mut self) -> Result<ComputerStatus> {
+        if let Some(status) = self.exit_status {
+            return Ok(ComputerStatus::Exited(status));
+        }
+
+        self.vm.set_gas(self.max_gas_per_run);
+        match self.vm.run().map_err(|error| anyhow!(error))? {
+            Interruption::Exit(status) => {
+                self.exit_status = Some(status);
+                Ok(ComputerStatus::Exited(status))
+            }
+            Interruption::Yield => Ok(ComputerStatus::Yielded),
+            Interruption::ProcessRun { package, arguments } => {
+                self.pending_spawn = Some((package, arguments));
+                Ok(ComputerStatus::SpawnRequested)
+            }
+            Interruption::ProcessSpawn { package, arguments } => {
+                self.pending_child_request =
+                    Some(ChildProcessRequest::Spawn { package, arguments });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::ProcessWait { pid } => {
+                self.pending_child_request = Some(ChildProcessRequest::Wait { pid });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeRead {
+                pid,
+                destination,
+                capacity,
+            } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeRead {
+                    pid,
+                    destination,
+                    capacity,
+                });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeWrite { pid, bytes } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeWrite { pid, bytes });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeClose { pid } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeClose { pid });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::SetPalette { .. }
+            | Interruption::Display { .. }
+            | Interruption::AudioInit { .. }
+            | Interruption::AudioFrame { .. } => {
+                bail!("computer guest requested an application-presentation operation")
+            }
+        }
+    }
+
+    /// Returns the selected execution backend.
+    pub fn backend(&self) -> polkavm::BackendKind {
+        self.vm.backend()
+    }
+
+    /// Takes the pending spawn request after `SpawnRequested`.
+    pub fn take_spawn_request(&mut self) -> Option<(String, Vec<String>)> {
+        self.pending_spawn.take()
+    }
+
+    /// Takes the pending spawn/wait/pipe request after `ChildRequest`.
+    pub fn take_child_request(&mut self) -> Option<ChildProcessRequest> {
+        self.pending_child_request.take()
+    }
+
+    /// Completes a pending `pipe_read` by copying `bytes` into guest memory.
+    pub fn resolve_read(&mut self, destination: u32, bytes: &[u8]) -> Result<()> {
+        self.vm
+            .resolve_pipe_read(destination, bytes)
+            .map_err(|error| anyhow!(error))
+    }
+
+    /// Marks the guest input stream as ended; reads then report EOF.
+    pub fn close_terminal_input(&mut self) {
+        self.vm.computer.close_input();
+    }
+
+    /// Returns remaining space in the guest input queue.
+    pub fn terminal_input_space(&self) -> usize {
+        self.vm.computer.input_space()
+    }
+
+    /// Completes a pending spawn with the child's exit status or an error.
+    pub fn resolve_spawn(&mut self, result: i32) {
+        self.vm.resolve_process_run(result);
+    }
+
+    /// Queues keyboard bytes toward the guest terminal.
+    pub fn send_terminal_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.vm.computer.push_terminal_input(bytes)
+    }
+
+    /// Drains ANSI output produced by the guest terminal.
+    pub fn take_terminal_output(&mut self) -> Option<Vec<u8>> {
+        self.vm.computer.take_terminal_output()
+    }
+
+    /// Returns whether undelivered terminal input remains queued.
+    pub fn has_terminal_input(&self) -> bool {
+        self.vm.computer.has_terminal_input()
+    }
+
+    /// Sets the terminal dimensions observed by the guest.
+    pub fn set_terminal_size(&mut self, columns: u32, rows: u32) -> Result<()> {
+        if columns == 0 || rows == 0 || columns > 1_000 || rows > 1_000 {
+            bail!("invalid terminal size {columns}x{rows}");
+        }
+        self.vm.computer.tty_columns = columns;
+        self.vm.computer.tty_rows = rows;
+        Ok(())
+    }
+
+    /// Grants or revokes the outbound TCP capability. Revocation also
+    /// closes every socket opened while the capability was held.
+    pub fn set_network_enabled(&mut self, enabled: bool) {
+        self.vm.computer.network_enabled = enabled;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !enabled {
+            self.vm.computer.sockets.clear();
+        }
+    }
+
+    /// Returns whether the guest's terminal input stream has been closed.
+    pub fn terminal_input_closed(&self) -> bool {
+        self.vm.computer.tty_input_closed
+    }
+
+    /// Returns the current guest terminal mode flags.
+    pub fn terminal_mode(&self) -> u32 {
+        self.vm.computer.terminal_mode()
+    }
+
+    /// Mounts one file into the guest `/home` filesystem.
+    pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.vm.computer.mount_file(path, bytes)
+    }
+
+    /// Drains files modified by the guest since the previous call.
+    pub fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.vm.computer.take_modified_files()
+    }
+
+    /// Returns the recorded exit status, when the guest has exited.
+    pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status
+    }
+}
+
+/// Maximum depth of the foreground process stack.
+pub const MAX_COMPUTER_PROCESSES: usize = 4;
+
+/// Maximum simultaneously live piped background processes.
+pub const MAX_BACKGROUND_PROCESSES: usize = 4;
+
+/// A piped background process: no terminal ownership; the parent exchanges
+/// bytes with it through the pipe hostcalls.
+struct BackgroundChild {
+    pid: u32,
+    /// Stack depth of the spawning process; only that process may address
+    /// this child, and it is reaped when the owner departs.
+    owner: usize,
+    runtime: ComputerRuntime,
+    output: Vec<u8>,
+    exit: Option<i32>,
+}
+
+/// Supervises computer processes sharing one terminal and `/home`.
+///
+/// The Host owns every child VM: guests request packages by name, and only
+/// packages registered by the Host can be launched. The foreground process
+/// (top of the stack) owns terminal input; a parent stays suspended inside
+/// its `process_run` hostcall until the child exits. Piped children spawned
+/// through `process_spawn` run cooperatively while the parent is suspended
+/// inside a pipe or wait hostcall.
+pub struct ComputerSupervisor {
+    packages: BTreeMap<String, Vec<u8>>,
+    stack: Vec<ComputerRuntime>,
+    background: Vec<BackgroundChild>,
+    environment: Vec<(String, String)>,
+    next_pid: u32,
+    pending_output: Vec<u8>,
+    files: BTreeMap<String, Vec<u8>>,
+    modified: BTreeMap<String, Vec<u8>>,
+    backend: polkavm::BackendKind,
+    max_gas_per_run: u64,
+    columns: u32,
+    rows: u32,
+    network: bool,
+}
+
+impl ComputerSupervisor {
+    /// Creates a supervisor whose root process runs `program`.
+    pub fn new(program: &[u8], context: ComputerContext, max_gas_per_run: u64) -> Result<Self> {
+        Self::new_with_backend(
+            program,
+            context,
+            max_gas_per_run,
+            crate::preferred_backend(),
+        )
+    }
+
+    /// Creates a supervisor using an explicitly selected PolkaVM backend.
+    pub fn new_with_backend(
+        program: &[u8],
+        context: ComputerContext,
+        max_gas_per_run: u64,
+        backend: polkavm::BackendKind,
+    ) -> Result<Self> {
+        let environment = context.environment.clone();
+        let root = ComputerRuntime::new_with_backend(program, context, max_gas_per_run, backend)?;
+        Ok(Self {
+            packages: BTreeMap::new(),
+            stack: vec![root],
+            background: Vec::new(),
+            next_pid: 2,
+            pending_output: Vec::new(),
+            environment,
+            files: BTreeMap::new(),
+            modified: BTreeMap::new(),
+            backend,
+            max_gas_per_run,
+            columns: 80,
+            rows: 24,
+            network: false,
+        })
+    }
+
+    /// Registers a launchable package under a Host-authorized name.
+    pub fn register_package(&mut self, name: &str, program: Vec<u8>) -> Result<()> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("invalid package name {name:?}");
+        }
+        self.packages.insert(name.to_owned(), program);
+        Ok(())
+    }
+
+    /// Returns the selected execution backend.
+    pub fn backend(&self) -> polkavm::BackendKind {
+        self.backend
+    }
+
+    /// Mounts one persistent file into the shared `/home` store.
+    pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.foreground().mount_file(path, bytes.clone())?;
+        self.files.insert(path.to_owned(), bytes);
+        Ok(())
+    }
+
+    /// Sets the terminal size observed by every process.
+    pub fn set_terminal_size(&mut self, columns: u32, rows: u32) -> Result<()> {
+        for process in &mut self.stack {
+            process.set_terminal_size(columns, rows)?;
+        }
+        for child in &mut self.background {
+            child.runtime.set_terminal_size(columns, rows)?;
+        }
+        self.columns = columns;
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// Grants or revokes outbound TCP for every current and future process.
+    pub fn set_network_enabled(&mut self, enabled: bool) {
+        for process in &mut self.stack {
+            process.set_network_enabled(enabled);
+        }
+        for child in &mut self.background {
+            child.runtime.set_network_enabled(enabled);
+        }
+        self.network = enabled;
+    }
+
+    /// Queues keyboard bytes toward the foreground process.
+    pub fn send_terminal_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.foreground().send_terminal_input(bytes)
+    }
+
+    /// Returns remaining space in the foreground process's input queue.
+    pub fn terminal_input_space(&self) -> usize {
+        self.stack
+            .last()
+            .map_or(0, ComputerRuntime::terminal_input_space)
+    }
+    /// Drains ANSI output: first any output a departed child left behind,
+    /// then the foreground process's buffer.
+    pub fn take_terminal_output(&mut self) -> Option<Vec<u8>> {
+        if !self.pending_output.is_empty() {
+            return Some(core::mem::take(&mut self.pending_output));
+        }
+        self.foreground().take_terminal_output()
+    }
+
+    /// Returns whether undelivered terminal input remains queued.
+    pub fn has_terminal_input(&self) -> bool {
+        self.stack
+            .last()
+            .is_some_and(ComputerRuntime::has_terminal_input)
+    }
+
+    /// Drains files modified by any process since the previous call.
+    pub fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
+        core::mem::take(&mut self.modified).into_iter().collect()
+    }
+
+    /// Exit status reported for a child that faulted (trap, gas, segfault).
+    const FAULTED_CHILD_STATUS: i32 = 139;
+
+    /// Maximum contained child faults per `run()` before erroring out.
+    const MAX_FAULT_POPS_PER_RUN: usize = 32;
+
+    /// Runs the foreground process until the system yields or the root exits.
+    ///
+    /// A fault in a child process (trap, out of gas) fails only that child:
+    /// it is discarded and its parent resumes with status 139. Only a root
+    /// fault propagates as an error.
+    pub fn run(&mut self) -> Result<ComputerStatus> {
+        // Bound the fault-containment path so a root that spawns
+        // immediately-faulting children in a loop cannot keep run() from
+        // returning control to the Host.
+        let mut fault_pops = 0usize;
+        loop {
+            let status = match self.foreground().run() {
+                Ok(status) => status,
+                Err(error) => {
+                    if self.stack.len() == 1 {
+                        return Err(error);
+                    }
+                    fault_pops += 1;
+                    if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
+                        return Err(error.context("children faulted repeatedly"));
+                    }
+                    self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
+                    continue;
+                }
+            };
+            self.collect_modified();
+            match status {
+                ComputerStatus::Yielded => return Ok(ComputerStatus::Yielded),
+                ComputerStatus::SpawnRequested => {
+                    let request = self.foreground().take_spawn_request();
+                    let Some((package, arguments)) = request else {
+                        bail!("spawn status without a pending request");
+                    };
+                    match self.spawn_child(&package, arguments) {
+                        Ok(child) => self.stack.push(child),
+                        Err(status) => self.foreground().resolve_spawn(status),
+                    }
+                }
+                ComputerStatus::ChildRequest => {
+                    let request = self.foreground().take_child_request();
+                    let Some(request) = request else {
+                        bail!("child-request status without a pending request");
+                    };
+                    self.handle_child_request(request)?;
+                }
+                ComputerStatus::Exited(code) => {
+                    // The exited root stays resident so terminal accessors
+                    // remain valid; rerunning it reports the same status.
+                    if self.stack.len() == 1 {
+                        return Ok(ComputerStatus::Exited(code));
+                    }
+                    // Mask to the POSIX exit-code byte: negative statuses
+                    // stay failures (e.g. -1 -> 255) and cannot alias the
+                    // negative hostcall error space.
+                    self.pop_foreground(code & 0xff)?;
+                }
+            }
+        }
+    }
+
+    /// Discards the foreground child: forwards its remaining terminal
+    /// output, reaps its orphaned background children, resolves the parent
+    /// with `status`, and rebases the shared `/home` view.
+    fn pop_foreground(&mut self, status: i32) -> Result<()> {
+        debug_assert!(
+            self.stack.len() >= 2,
+            "pop_foreground requires a child on the stack"
+        );
+        let child = self.stack.pop();
+        // Preserve terminal write order: the parent's bytes written before
+        // the spawn precede the child's remaining output.
+        if let Some(bytes) = self.foreground().take_terminal_output() {
+            let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.pending_output.len());
+            self.pending_output
+                .extend_from_slice(&bytes[..bytes.len().min(available)]);
+        }
+        if let Some(mut child) = child {
+            if let Some(bytes) = child.take_terminal_output() {
+                let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.pending_output.len());
+                self.pending_output
+                    .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            }
+        }
+        // Background children spawned by the departed process (or anything
+        // deeper) are unreachable now; reap them so their slots, memory,
+        // and sockets do not leak.
+        let depth = self.stack.len();
+        self.background.retain(|child| child.owner <= depth);
+        self.foreground().resolve_spawn(status);
+        let files = self.files.clone();
+        for (path, bytes) in files {
+            self.foreground().mount_file(&path, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Host-authority cancellation of the foreground process.
+    ///
+    /// A child is discarded and its parent resumes with status 130
+    /// (interrupted). Terminating the root ends the whole computer.
+    pub fn terminate_foreground(&mut self) -> Result<ComputerStatus> {
+        self.collect_modified();
+        if self.stack.len() == 1 {
+            // Record the exit so subsequent run() calls stay terminated; a
+            // root that already exited keeps its genuine status.
+            let status = *self.foreground().exit_status.get_or_insert(130);
+            self.background.clear();
+            return Ok(ComputerStatus::Exited(status));
+        }
+        self.pop_foreground(130)?;
+        Ok(ComputerStatus::Yielded)
+    }
+
+    fn foreground(&mut self) -> &mut ComputerRuntime {
+        self.stack
+            .last_mut()
+            .expect("supervisor stack is never empty")
+    }
+
+    fn collect_modified(&mut self) {
+        let changed = self.foreground().take_modified_files();
+        for (path, bytes) in changed {
+            self.files.insert(path.clone(), bytes.clone());
+            self.modified.insert(path, bytes);
+        }
+    }
+
+    /// Executes one spawn/wait/pipe request and resolves it into the caller.
+    fn handle_child_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+        match request {
+            ChildProcessRequest::Spawn { package, arguments } => {
+                if self.background.len() >= MAX_BACKGROUND_PROCESSES {
+                    self.foreground().resolve_spawn(STATUS_LIMIT);
+                    return Ok(());
+                }
+                match self.spawn_piped(&package, arguments) {
+                    Ok(pid) => self.foreground().resolve_spawn(pid as i32),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            ChildProcessRequest::Wait { pid } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                self.drive_background(index)?;
+                match self.background[index].exit {
+                    Some(status) => {
+                        self.reap_background(index)?;
+                        self.foreground().resolve_spawn(status & 0xff);
+                    }
+                    None => self.foreground().resolve_spawn(STATUS_WOULD_BLOCK),
+                }
+            }
+            ChildProcessRequest::PipeWrite { pid, bytes } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                let child = &mut self.background[index];
+                if child.exit.is_some() || child.runtime.terminal_input_closed() {
+                    self.foreground().resolve_spawn(STATUS_INVALID);
+                    return Ok(());
+                }
+                let space = child.runtime.terminal_input_space();
+                let written = bytes.len().min(space);
+                if written > 0 {
+                    child.runtime.send_terminal_input(&bytes[..written])?;
+                }
+                self.drive_background(index)?;
+                self.foreground().resolve_spawn(written as i32);
+            }
+            ChildProcessRequest::PipeRead {
+                pid,
+                destination,
+                capacity,
+            } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                if self.background[index].output.is_empty() {
+                    self.drive_background(index)?;
+                }
+                let child = &mut self.background[index];
+                if !child.output.is_empty() {
+                    let count = child.output.len().min(capacity);
+                    let bytes: Vec<u8> = child.output.drain(..count).collect();
+                    self.foreground().resolve_read(destination, &bytes)?;
+                } else if child.exit.is_some() {
+                    self.foreground().resolve_spawn(0);
+                } else {
+                    self.foreground().resolve_spawn(STATUS_WOULD_BLOCK);
+                }
+            }
+            ChildProcessRequest::PipeClose { pid } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                self.background[index].runtime.close_terminal_input();
+                self.drive_background(index)?;
+                self.foreground().resolve_spawn(0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves a pid to a background slot, enforcing ownership: only the
+    /// process that spawned a child may address it.
+    fn background_index(&self, pid: u32) -> Option<usize> {
+        let depth = self.stack.len();
+        self.background
+            .iter()
+            .position(|child| child.pid == pid && child.owner == depth)
+    }
+
+    /// Runs a background child until it exits or blocks awaiting input.
+    ///
+    /// Cooperative scheduling: background children only execute while the
+    /// foreground process is suspended inside a pipe or wait hostcall.
+    fn drive_background(&mut self, index: usize) -> Result<()> {
+        const MAX_DRIVE_STEPS: usize = 1_024;
+        for _ in 0..MAX_DRIVE_STEPS {
+            let child = &mut self.background[index];
+            if child.exit.is_some() {
+                return Ok(());
+            }
+            // A faulted piped child fails alone; the parent observes the
+            // fault status through wait. Its final output and file writes
+            // are still collected below.
+            let outcome = child.runtime.run().ok();
+            if let Some(bytes) = child.runtime.take_terminal_output() {
+                let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
+                child
+                    .output
+                    .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            }
+            for (path, bytes) in child.runtime.take_modified_files() {
+                self.files.insert(path.clone(), bytes.clone());
+                self.modified.insert(path, bytes);
+            }
+            let child = &mut self.background[index];
+            let Some(status) = outcome else {
+                child.exit = Some(Self::FAULTED_CHILD_STATUS);
+                return Ok(());
+            };
+            match status {
+                ComputerStatus::Exited(code) => {
+                    child.exit = Some(code & 0xff);
+                    return Ok(());
+                }
+                ComputerStatus::Yielded => {
+                    if !child.runtime.has_terminal_input() {
+                        return Ok(());
+                    }
+                }
+                ComputerStatus::SpawnRequested => {
+                    // Background children cannot own the terminal.
+                    let _ = child.runtime.take_spawn_request();
+                    child.runtime.resolve_spawn(STATUS_DENIED);
+                }
+                ComputerStatus::ChildRequest => {
+                    // No nested background trees in the experimental contract.
+                    let _ = child.runtime.take_child_request();
+                    child.runtime.resolve_spawn(STATUS_DENIED);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reclaims an exited background child, publishing its file changes.
+    fn reap_background(&mut self, index: usize) -> Result<()> {
+        self.background.remove(index);
+        let files = self.files.clone();
+        let foreground = self.foreground();
+        for (path, bytes) in files {
+            foreground.mount_file(&path, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Launches a piped background child and returns its pid.
+    fn spawn_piped(&mut self, package: &str, arguments: Vec<String>) -> Result<u32, i32> {
+        let child = self.spawn_child(package, arguments)?;
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        self.background.push(BackgroundChild {
+            pid,
+            owner: self.stack.len(),
+            runtime: child,
+            output: Vec::new(),
+            exit: None,
+        });
+        Ok(pid)
+    }
+
+    fn spawn_child(
+        &mut self,
+        package: &str,
+        arguments: Vec<String>,
+    ) -> Result<ComputerRuntime, i32> {
+        if self.stack.len() >= MAX_COMPUTER_PROCESSES {
+            return Err(STATUS_LIMIT);
+        }
+        let Some(program) = self.packages.get(package) else {
+            return Err(STATUS_NOT_FOUND);
+        };
+        let mut argv = Vec::with_capacity(arguments.len() + 1);
+        argv.push(package.to_owned());
+        argv.extend(arguments);
+        // Children inherit the computer's launch environment.
+        let context =
+            ComputerContext::new(argv, self.environment.clone()).map_err(|_| STATUS_INVALID)?;
+        let mut child =
+            ComputerRuntime::new_with_backend(program, context, self.max_gas_per_run, self.backend)
+                .map_err(|_| STATUS_INVALID)?;
+        child
+            .set_terminal_size(self.columns, self.rows)
+            .map_err(|_| STATUS_INVALID)?;
+        child.set_network_enabled(self.network);
+        for (path, bytes) in &self.files {
+            child
+                .mount_file(path, bytes.clone())
+                .map_err(|_| STATUS_LIMIT)?;
+        }
+        Ok(child)
+    }
+}
+
+fn encode_arguments(arguments: &[String]) -> Result<Vec<u8>> {
+    let mut output = encoded_record(arguments.len())?;
+    for argument in arguments {
+        push_bytes(&mut output, argument.as_bytes())?;
+    }
+    Ok(output)
+}
+
+fn encode_environment(environment: &[(String, String)]) -> Result<Vec<u8>> {
+    let mut output = encoded_record(environment.len())?;
+    for (key, value) in environment {
+        push_bytes(&mut output, key.as_bytes())?;
+        push_bytes(&mut output, value.as_bytes())?;
+    }
+    Ok(output)
+}
+
+fn encoded_record(count: usize) -> Result<Vec<u8>> {
+    let count = u32::try_from(count).context("computer context entry count overflow")?;
+    Ok(count.to_le_bytes().to_vec())
+}
+
+fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let length = u32::try_from(bytes.len()).context("computer context field length overflow")?;
+    let required = output
+        .len()
+        .checked_add(4)
+        .and_then(|length| length.checked_add(bytes.len()))
+        .ok_or_else(|| anyhow!("computer context length overflow"))?;
+    if required > MAX_COMPUTER_CONTEXT_BYTES {
+        bail!("encoded computer context exceeds the host limit");
+    }
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_encoding_is_length_delimited_and_ordered() {
+        let context = ComputerContext::new(
+            vec!["shell.polkavm".into(), "--login".into()],
+            vec![
+                ("HOME".into(), "/home".into()),
+                ("TERM".into(), "pvm-tty".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.encoded_arguments,
+            b"\x02\0\0\0\x0d\0\0\0shell.polkavm\x07\0\0\0--login"
+        );
+        assert_eq!(
+            context.encoded_environment,
+            b"\x02\0\0\0\x04\0\0\0HOME\x05\0\0\0/home\x04\0\0\0TERM\x07\0\0\0pvm-tty"
+        );
+    }
+
+    #[test]
+    fn context_rejects_ambiguous_environment() {
+        assert!(ComputerContext::new(Vec::new(), vec![("".into(), "value".into())]).is_err());
+        assert!(ComputerContext::new(Vec::new(), vec![("A=B".into(), "value".into())]).is_err());
+        assert!(ComputerContext::new(
+            Vec::new(),
+            vec![("HOME".into(), "one".into()), ("HOME".into(), "two".into())]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_reads_block_until_input_arrives() {
+        let mut devices = ComputerDevices::new();
+        let mut buffer = [0u8; 4];
+        assert_eq!(
+            devices.tty_read_into(COMPUTER_TTY_HANDLE, &mut buffer),
+            STATUS_WOULD_BLOCK
+        );
+        devices.push_terminal_input(b"hi").unwrap();
+        assert_eq!(devices.tty_read_into(COMPUTER_TTY_HANDLE, &mut buffer), 2);
+        assert_eq!(&buffer[..2], b"hi");
+        assert_eq!(devices.tty_read_into(2, &mut buffer), STATUS_BAD_HANDLE);
+    }
+
+    #[test]
+    fn terminal_output_is_drained_by_the_host() {
+        let mut devices = ComputerDevices::new();
+        assert_eq!(devices.tty_write(COMPUTER_TTY_HANDLE, b"\x1b[2J"), 4);
+        assert_eq!(
+            devices.take_terminal_output().as_deref(),
+            Some(b"\x1b[2J".as_slice())
+        );
+        assert!(devices.take_terminal_output().is_none());
+    }
+
+    #[test]
+    fn files_create_write_seek_read_and_track_modification() {
+        let mut devices = ComputerDevices::new();
+        assert_eq!(
+            devices.fs_open("/home/hello.c", FS_OPEN_READ),
+            STATUS_NOT_FOUND
+        );
+        let handle = devices.fs_open(
+            "/home/hello.c",
+            FS_OPEN_READ | FS_OPEN_WRITE | FS_OPEN_CREATE,
+        );
+        assert!(handle > 0);
+        let handle = handle as u32;
+        assert_eq!(devices.fs_write(handle, b"hello world"), 11);
+        assert_eq!(devices.fs_truncate(handle, 5), 0);
+        assert_eq!(devices.fs_seek(handle, 0, 0), 0);
+        let mut buffer = [0u8; 16];
+        assert_eq!(devices.fs_read(handle, &mut buffer), 5);
+        assert_eq!(&buffer[..5], b"hello");
+        assert_eq!(devices.fs_stat("/home/hello.c"), Some(5));
+        assert_eq!(devices.fs_sync(handle), 0);
+        assert_eq!(devices.fs_close(handle), 0);
+        assert_eq!(devices.fs_close(handle), STATUS_BAD_HANDLE);
+
+        let modified = devices.take_modified_files();
+        assert_eq!(
+            modified,
+            vec![("/home/hello.c".to_owned(), b"hello".to_vec())]
+        );
+        assert!(devices.take_modified_files().is_empty());
+    }
+
+    #[test]
+    fn file_paths_are_confined_to_home() {
+        let mut devices = ComputerDevices::new();
+        for path in ["/etc/passwd", "/home/", "/home/../etc", "home/x", ""] {
+            assert_eq!(
+                devices.fs_open(path, FS_OPEN_READ | FS_OPEN_WRITE | FS_OPEN_CREATE),
+                STATUS_INVALID,
+                "path {path:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_files_are_readable_without_modification_tracking() {
+        let mut devices = ComputerDevices::new();
+        devices
+            .mount_file("/home/hello.c", b"seed".to_vec())
+            .unwrap();
+        assert!(devices.take_modified_files().is_empty());
+        let handle = devices.fs_open("/home/hello.c", FS_OPEN_READ) as u32;
+        let mut buffer = [0u8; 8];
+        assert_eq!(devices.fs_read(handle, &mut buffer), 4);
+        assert_eq!(&buffer[..4], b"seed");
+        assert_eq!(devices.fs_write(handle, b"x"), STATUS_DENIED);
+    }
+
+    #[test]
+    fn listing_record_is_length_delimited_and_sorted() {
+        let mut devices = ComputerDevices::new();
+        devices.mount_file("/home/b.txt", b"b".to_vec()).unwrap();
+        devices.mount_file("/home/a.txt", b"a".to_vec()).unwrap();
+        assert_eq!(
+            devices.fs_list_record(),
+            b"\x02\0\0\0\x0b\0\0\0/home/a.txt\x0b\0\0\0/home/b.txt"
+        );
+    }
+}
