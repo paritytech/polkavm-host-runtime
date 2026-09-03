@@ -125,6 +125,15 @@ enum ComputerCall {
     FsClose,
     FsList,
     ProcessRun,
+    ProcessSpawn,
+    ProcessWait,
+    PipeRead,
+    PipeWrite,
+    PipeClose,
+    NetTcpConnect,
+    NetRead,
+    NetWrite,
+    NetClose,
 }
 
 fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
@@ -145,6 +154,15 @@ fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
         b"polkadot_host_0_1_fs_close" => ComputerCall::FsClose,
         b"polkadot_host_0_1_fs_list" => ComputerCall::FsList,
         b"polkadot_host_0_1_process_run" => ComputerCall::ProcessRun,
+        b"polkadot_host_0_1_process_spawn" => ComputerCall::ProcessSpawn,
+        b"polkadot_host_0_1_process_wait" => ComputerCall::ProcessWait,
+        b"polkadot_host_0_1_pipe_read" => ComputerCall::PipeRead,
+        b"polkadot_host_0_1_pipe_write" => ComputerCall::PipeWrite,
+        b"polkadot_host_0_1_pipe_close" => ComputerCall::PipeClose,
+        b"polkadot_host_0_1_net_tcp_connect" => ComputerCall::NetTcpConnect,
+        b"polkadot_host_0_1_net_read" => ComputerCall::NetRead,
+        b"polkadot_host_0_1_net_write" => ComputerCall::NetWrite,
+        b"polkadot_host_0_1_net_close" => ComputerCall::NetClose,
         _ => return None,
     })
 }
@@ -284,6 +302,25 @@ pub enum Interruption {
     ProcessRun {
         package: String,
         arguments: Vec<String>,
+    },
+    ProcessSpawn {
+        package: String,
+        arguments: Vec<String>,
+    },
+    ProcessWait {
+        pid: u32,
+    },
+    PipeRead {
+        pid: u32,
+        destination: u32,
+        capacity: usize,
+    },
+    PipeWrite {
+        pid: u32,
+        bytes: Vec<u8>,
+    },
+    PipeClose {
+        pid: u32,
     },
     SetPalette {
         palette: Vec<u8>,
@@ -1321,6 +1358,95 @@ impl Vm {
                 };
                 return Ok(Some(Interruption::ProcessRun { package, arguments }));
             }
+            ComputerCall::ProcessSpawn => {
+                let a3 = self.instance.reg(Reg::A3);
+                let Some(package) = self.read_computer_string(a0, a1, 64)? else {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_INVALID));
+                    return Ok(None);
+                };
+                let Some(arguments) = self.read_string_record(a2, a3)? else {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_INVALID));
+                    return Ok(None);
+                };
+                return Ok(Some(Interruption::ProcessSpawn { package, arguments }));
+            }
+            ComputerCall::ProcessWait => {
+                return Ok(Some(Interruption::ProcessWait { pid: a0 as u32 }));
+            }
+            ComputerCall::PipeRead => {
+                let destination = guest_pointer(a1, "pipe read destination")?;
+                let capacity = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_TTY_TRANSFER);
+                if capacity == 0 {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_INVALID));
+                    return Ok(None);
+                }
+                return Ok(Some(Interruption::PipeRead {
+                    pid: a0 as u32,
+                    destination,
+                    capacity,
+                }));
+            }
+            ComputerCall::PipeWrite => {
+                let source = guest_pointer(a1, "pipe write source")?;
+                let length = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_TTY_TRANSFER);
+                let bytes = self.instance.read_memory(source, length as u32)?;
+                return Ok(Some(Interruption::PipeWrite {
+                    pid: a0 as u32,
+                    bytes,
+                }));
+            }
+            ComputerCall::PipeClose => {
+                return Ok(Some(Interruption::PipeClose { pid: a0 as u32 }));
+            }
+            ComputerCall::NetTcpConnect => {
+                let address =
+                    self.read_computer_string(a0, a1, crate::computer::MAX_NET_ADDRESS_BYTES)?;
+                let result = match address {
+                    Some(address) => self.computer.net_tcp_connect(&address),
+                    None => crate::computer::STATUS_INVALID,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::NetRead => {
+                let handle = a0 as u32;
+                let destination = guest_pointer(a1, "net read destination")?;
+                let capacity = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_TTY_TRANSFER);
+                let result = if capacity == 0 {
+                    crate::computer::STATUS_INVALID
+                } else {
+                    let mut buffer = vec![0u8; capacity];
+                    let received = self.computer.net_read(handle, &mut buffer);
+                    if received > 0 {
+                        self.instance
+                            .write_memory(destination, &buffer[..received as usize])?;
+                    }
+                    received
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::NetWrite => {
+                let handle = a0 as u32;
+                let source = guest_pointer(a1, "net write source")?;
+                let length = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_TTY_TRANSFER);
+                let bytes = self.instance.read_memory(source, length as u32)?;
+                let result = self.computer.net_write(handle, &bytes);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::NetClose => {
+                let result = self.computer.net_close(a0 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
         }
         Ok(None)
     }
@@ -1388,9 +1514,22 @@ impl Vm {
         Ok(Some(entries))
     }
 
-    /// Completes a pending `process_run` hostcall with the child's status.
+    /// Completes a pending `process_run`-family hostcall with a status value.
     pub(crate) fn resolve_process_run(&mut self, result: i32) {
         self.instance.set_reg(Reg::A0, i64::from(result) as u64);
+    }
+
+    /// Completes a pending `pipe_read` hostcall by delivering `bytes`.
+    pub(crate) fn resolve_pipe_read(
+        &mut self,
+        destination: u32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.instance
+            .write_memory(destination, bytes)
+            .map_err(|error| error.to_string())?;
+        self.instance.set_reg(Reg::A0, bytes.len() as u64);
+        Ok(())
     }
     fn read_computer_path(&mut self, pointer: u64, length: u64) -> Result<Option<String>, String> {
         let length = usize::try_from(length).unwrap_or(usize::MAX);

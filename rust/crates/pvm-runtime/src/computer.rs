@@ -43,6 +43,12 @@ pub const MAX_COMPUTER_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_OPEN_COMPUTER_FILES: usize = 16;
 /// Maximum accepted file path length in bytes.
 pub const MAX_COMPUTER_PATH_BYTES: usize = 200;
+/// Maximum simultaneously open outbound TCP sockets.
+pub const MAX_OPEN_SOCKETS: usize = 4;
+/// First handle value assigned to network sockets.
+pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
+/// Maximum accepted network address length in bytes.
+pub const MAX_NET_ADDRESS_BYTES: usize = 256;
 
 pub(crate) const STATUS_WOULD_BLOCK: i32 = -1;
 pub(crate) const STATUS_BAD_HANDLE: i32 = -2;
@@ -127,6 +133,8 @@ pub enum ComputerStatus {
     Exited(i32),
     /// The guest requested a child process; the supervisor must resolve it.
     SpawnRequested,
+    /// The guest issued a spawn/wait/pipe call; the supervisor must resolve it.
+    ChildRequest,
 }
 
 struct OpenComputerFile {
@@ -136,9 +144,10 @@ struct OpenComputerFile {
     writable: bool,
 }
 
-/// Terminal and filesystem devices granted to one computer guest.
+/// Terminal, filesystem, and network devices granted to one computer guest.
 pub(crate) struct ComputerDevices {
     tty_input: VecDeque<u8>,
+    tty_input_closed: bool,
     tty_output: Vec<u8>,
     tty_columns: u32,
     tty_rows: u32,
@@ -147,12 +156,17 @@ pub(crate) struct ComputerDevices {
     modified: BTreeSet<String>,
     open_files: BTreeMap<u32, OpenComputerFile>,
     next_handle: u32,
+    network_enabled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    sockets: BTreeMap<u32, std::net::TcpStream>,
+    next_socket: u32,
 }
 
 impl ComputerDevices {
     pub(crate) fn new() -> Self {
         Self {
             tty_input: VecDeque::new(),
+            tty_input_closed: false,
             tty_output: Vec::new(),
             tty_columns: 80,
             tty_rows: 24,
@@ -161,15 +175,119 @@ impl ComputerDevices {
             modified: BTreeSet::new(),
             open_files: BTreeMap::new(),
             next_handle: 16,
+            network_enabled: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            sockets: BTreeMap::new(),
+            next_socket: FIRST_SOCKET_HANDLE,
         }
     }
 
+    /* ── Network boundary (host.net v0: outbound TCP only) ─────────── */
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_tcp_connect(&mut self, address: &str) -> i32 {
+        use std::net::ToSocketAddrs;
+        if !self.network_enabled {
+            return STATUS_DENIED;
+        }
+        if self.sockets.len() >= MAX_OPEN_SOCKETS {
+            return STATUS_LIMIT;
+        }
+        let Ok(mut resolved) = address.to_socket_addrs() else {
+            return STATUS_NOT_FOUND;
+        };
+        let Some(target) = resolved.next() else {
+            return STATUS_NOT_FOUND;
+        };
+        let Ok(stream) =
+            std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_secs(5))
+        else {
+            return STATUS_INVALID;
+        };
+        if stream.set_nonblocking(true).is_err() {
+            return STATUS_INVALID;
+        }
+        let handle = self.next_socket;
+        self.next_socket += 1;
+        self.sockets.insert(handle, stream);
+        handle as i32
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_read(&mut self, handle: u32, buffer: &mut [u8]) -> i32 {
+        use std::io::Read;
+        let Some(stream) = self.sockets.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        match stream.read(buffer) {
+            Ok(count) => count as i32,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => STATUS_WOULD_BLOCK,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_write(&mut self, handle: u32, bytes: &[u8]) -> i32 {
+        use std::io::Write;
+        let Some(stream) = self.sockets.get_mut(&handle) else {
+            return STATUS_BAD_HANDLE;
+        };
+        match stream.write(bytes) {
+            Ok(count) => count as i32,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => STATUS_WOULD_BLOCK,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn net_close(&mut self, handle: u32) -> i32 {
+        if self.sockets.remove(&handle).is_none() {
+            return STATUS_BAD_HANDLE;
+        }
+        0
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_tcp_connect(&mut self, _address: &str) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_read(&mut self, _handle: u32, _buffer: &mut [u8]) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_write(&mut self, _handle: u32, _bytes: &[u8]) -> i32 {
+        STATUS_DENIED
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn net_close(&mut self, _handle: u32) -> i32 {
+        STATUS_DENIED
+    }
+
     fn push_terminal_input(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.tty_input_closed {
+            bail!("terminal input is closed");
+        }
         if self.tty_input.len().saturating_add(bytes.len()) > MAX_TTY_INPUT_BYTES {
             bail!("terminal input queue limit exceeded");
         }
         self.tty_input.extend(bytes.iter().copied());
         Ok(())
+    }
+
+    /// Marks the input stream as ended; reads on an empty queue return 0.
+    fn close_input(&mut self) {
+        self.tty_input_closed = true;
+    }
+
+    fn input_space(&self) -> usize {
+        if self.tty_input_closed {
+            return 0;
+        }
+        MAX_TTY_INPUT_BYTES.saturating_sub(self.tty_input.len())
     }
 
     fn take_terminal_output(&mut self) -> Option<Vec<u8>> {
@@ -224,6 +342,9 @@ impl ComputerDevices {
             return STATUS_INVALID;
         }
         if self.tty_input.is_empty() {
+            if self.tty_input_closed {
+                return 0;
+            }
             return STATUS_WOULD_BLOCK;
         }
         let mut written = 0usize;
@@ -427,12 +548,37 @@ fn validate_computer_path(path: &str) -> Option<&str> {
     Some(path)
 }
 
+/// A spawn/wait/pipe operation awaiting supervisor resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildProcessRequest {
+    Spawn {
+        package: String,
+        arguments: Vec<String>,
+    },
+    Wait {
+        pid: u32,
+    },
+    PipeRead {
+        pid: u32,
+        destination: u32,
+        capacity: usize,
+    },
+    PipeWrite {
+        pid: u32,
+        bytes: Vec<u8>,
+    },
+    PipeClose {
+        pid: u32,
+    },
+}
+
 /// Experimental host-neutral runtime for `polkadot-host-computer/0.1` guests.
 pub struct ComputerRuntime {
     vm: Vm,
     max_gas_per_run: u64,
     exit_status: Option<i32>,
     pending_spawn: Option<(String, Vec<String>)>,
+    pending_child_request: Option<ChildProcessRequest>,
 }
 
 impl ComputerRuntime {
@@ -467,6 +613,7 @@ impl ComputerRuntime {
             max_gas_per_run,
             exit_status: None,
             pending_spawn: None,
+            pending_child_request: None,
         })
     }
 
@@ -487,6 +634,35 @@ impl ComputerRuntime {
                 self.pending_spawn = Some((package, arguments));
                 Ok(ComputerStatus::SpawnRequested)
             }
+            Interruption::ProcessSpawn { package, arguments } => {
+                self.pending_child_request =
+                    Some(ChildProcessRequest::Spawn { package, arguments });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::ProcessWait { pid } => {
+                self.pending_child_request = Some(ChildProcessRequest::Wait { pid });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeRead {
+                pid,
+                destination,
+                capacity,
+            } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeRead {
+                    pid,
+                    destination,
+                    capacity,
+                });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeWrite { pid, bytes } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeWrite { pid, bytes });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::PipeClose { pid } => {
+                self.pending_child_request = Some(ChildProcessRequest::PipeClose { pid });
+                Ok(ComputerStatus::ChildRequest)
+            }
             Interruption::SetPalette { .. }
             | Interruption::Display { .. }
             | Interruption::AudioInit { .. }
@@ -504,6 +680,28 @@ impl ComputerRuntime {
     /// Takes the pending spawn request after `SpawnRequested`.
     pub fn take_spawn_request(&mut self) -> Option<(String, Vec<String>)> {
         self.pending_spawn.take()
+    }
+
+    /// Takes the pending spawn/wait/pipe request after `ChildRequest`.
+    pub fn take_child_request(&mut self) -> Option<ChildProcessRequest> {
+        self.pending_child_request.take()
+    }
+
+    /// Completes a pending `pipe_read` by copying `bytes` into guest memory.
+    pub fn resolve_read(&mut self, destination: u32, bytes: &[u8]) -> Result<()> {
+        self.vm
+            .resolve_pipe_read(destination, bytes)
+            .map_err(|error| anyhow!(error))
+    }
+
+    /// Marks the guest input stream as ended; reads then report EOF.
+    pub fn close_terminal_input(&mut self) {
+        self.vm.computer.close_input();
+    }
+
+    /// Returns remaining space in the guest input queue.
+    pub fn terminal_input_space(&self) -> usize {
+        self.vm.computer.input_space()
     }
 
     /// Completes a pending spawn with the child's exit status or an error.
@@ -536,6 +734,11 @@ impl ComputerRuntime {
         Ok(())
     }
 
+    /// Grants or revokes the outbound TCP capability.
+    pub fn set_network_enabled(&mut self, enabled: bool) {
+        self.vm.computer.network_enabled = enabled;
+    }
+
     /// Returns the current guest terminal mode flags.
     pub fn terminal_mode(&self) -> u32 {
         self.vm.computer.terminal_mode()
@@ -560,21 +763,39 @@ impl ComputerRuntime {
 /// Maximum depth of the foreground process stack.
 pub const MAX_COMPUTER_PROCESSES: usize = 4;
 
-/// Supervises a stack of computer processes sharing one terminal and `/home`.
+/// Maximum simultaneously live piped background processes.
+pub const MAX_BACKGROUND_PROCESSES: usize = 4;
+
+/// A piped background process: no terminal ownership; the parent exchanges
+/// bytes with it through the pipe hostcalls.
+struct BackgroundChild {
+    pid: u32,
+    runtime: ComputerRuntime,
+    output: Vec<u8>,
+    exit: Option<i32>,
+}
+
+/// Supervises computer processes sharing one terminal and `/home`.
 ///
-/// The Host owns every child VM: guests request packages by name through
-/// `process_run`, and only packages registered by the Host can be launched.
-/// The foreground process (top of the stack) owns terminal input; a parent
-/// stays suspended inside its `process_run` hostcall until the child exits.
+/// The Host owns every child VM: guests request packages by name, and only
+/// packages registered by the Host can be launched. The foreground process
+/// (top of the stack) owns terminal input; a parent stays suspended inside
+/// its `process_run` hostcall until the child exits. Piped children spawned
+/// through `process_spawn` run cooperatively while the parent is suspended
+/// inside a pipe or wait hostcall.
 pub struct ComputerSupervisor {
     packages: BTreeMap<String, Vec<u8>>,
     stack: Vec<ComputerRuntime>,
+    background: Vec<BackgroundChild>,
+    environment: Vec<(String, String)>,
+    next_pid: u32,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeMap<String, Vec<u8>>,
     backend: polkavm::BackendKind,
     max_gas_per_run: u64,
     columns: u32,
     rows: u32,
+    network: bool,
 }
 
 impl ComputerSupervisor {
@@ -595,16 +816,21 @@ impl ComputerSupervisor {
         max_gas_per_run: u64,
         backend: polkavm::BackendKind,
     ) -> Result<Self> {
+        let environment = context.environment.clone();
         let root = ComputerRuntime::new_with_backend(program, context, max_gas_per_run, backend)?;
         Ok(Self {
             packages: BTreeMap::new(),
             stack: vec![root],
+            background: Vec::new(),
+            next_pid: 2,
+            environment,
             files: BTreeMap::new(),
             modified: BTreeMap::new(),
             backend,
             max_gas_per_run,
             columns: 80,
             rows: 24,
+            network: false,
         })
     }
 
@@ -637,6 +863,17 @@ impl ComputerSupervisor {
         self.columns = columns;
         self.rows = rows;
         Ok(())
+    }
+
+    /// Grants or revokes outbound TCP for every current and future process.
+    pub fn set_network_enabled(&mut self, enabled: bool) {
+        for process in &mut self.stack {
+            process.set_network_enabled(enabled);
+        }
+        for child in &mut self.background {
+            child.runtime.set_network_enabled(enabled);
+        }
+        self.network = enabled;
     }
 
     /// Queues keyboard bytes toward the foreground process.
@@ -677,6 +914,13 @@ impl ComputerSupervisor {
                         Ok(child) => self.stack.push(child),
                         Err(status) => self.foreground().resolve_spawn(status),
                     }
+                }
+                ComputerStatus::ChildRequest => {
+                    let request = self.foreground().take_child_request();
+                    let Some(request) = request else {
+                        bail!("child-request status without a pending request");
+                    };
+                    self.handle_child_request(request)?;
                 }
                 ComputerStatus::Exited(code) => {
                     // The exited root stays resident so terminal accessors
@@ -730,6 +974,164 @@ impl ComputerSupervisor {
         }
     }
 
+    /// Executes one spawn/wait/pipe request and resolves it into the caller.
+    fn handle_child_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+        match request {
+            ChildProcessRequest::Spawn { package, arguments } => {
+                if self.background.len() >= MAX_BACKGROUND_PROCESSES {
+                    self.foreground().resolve_spawn(STATUS_LIMIT);
+                    return Ok(());
+                }
+                match self.spawn_piped(&package, arguments) {
+                    Ok(pid) => self.foreground().resolve_spawn(pid as i32),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            ChildProcessRequest::Wait { pid } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                self.drive_background(index)?;
+                match self.background[index].exit {
+                    Some(status) => {
+                        self.reap_background(index)?;
+                        self.foreground().resolve_spawn(status.clamp(0, 255));
+                    }
+                    None => self.foreground().resolve_spawn(STATUS_WOULD_BLOCK),
+                }
+            }
+            ChildProcessRequest::PipeWrite { pid, bytes } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                let child = &mut self.background[index];
+                if child.exit.is_some() {
+                    self.foreground().resolve_spawn(STATUS_INVALID);
+                    return Ok(());
+                }
+                let space = child.runtime.terminal_input_space();
+                let written = bytes.len().min(space);
+                if written > 0 {
+                    child.runtime.send_terminal_input(&bytes[..written])?;
+                }
+                self.drive_background(index)?;
+                self.foreground().resolve_spawn(written as i32);
+            }
+            ChildProcessRequest::PipeRead {
+                pid,
+                destination,
+                capacity,
+            } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                if self.background[index].output.is_empty() {
+                    self.drive_background(index)?;
+                }
+                let child = &mut self.background[index];
+                if !child.output.is_empty() {
+                    let count = child.output.len().min(capacity);
+                    let bytes: Vec<u8> = child.output.drain(..count).collect();
+                    self.foreground().resolve_read(destination, &bytes)?;
+                } else if child.exit.is_some() {
+                    self.foreground().resolve_spawn(0);
+                } else {
+                    self.foreground().resolve_spawn(STATUS_WOULD_BLOCK);
+                }
+            }
+            ChildProcessRequest::PipeClose { pid } => {
+                let Some(index) = self.background_index(pid) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                self.background[index].runtime.close_terminal_input();
+                self.drive_background(index)?;
+                self.foreground().resolve_spawn(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn background_index(&self, pid: u32) -> Option<usize> {
+        self.background.iter().position(|child| child.pid == pid)
+    }
+
+    /// Runs a background child until it exits or blocks awaiting input.
+    ///
+    /// Cooperative scheduling: background children only execute while the
+    /// foreground process is suspended inside a pipe or wait hostcall.
+    fn drive_background(&mut self, index: usize) -> Result<()> {
+        const MAX_DRIVE_STEPS: usize = 1_024;
+        for _ in 0..MAX_DRIVE_STEPS {
+            let child = &mut self.background[index];
+            if child.exit.is_some() {
+                return Ok(());
+            }
+            let status = child.runtime.run()?;
+            if let Some(bytes) = child.runtime.take_terminal_output() {
+                let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
+                child
+                    .output
+                    .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            }
+            for (path, bytes) in child.runtime.take_modified_files() {
+                self.files.insert(path.clone(), bytes.clone());
+                self.modified.insert(path, bytes);
+            }
+            let child = &mut self.background[index];
+            match status {
+                ComputerStatus::Exited(code) => {
+                    child.exit = Some(code.clamp(-128, 255));
+                    return Ok(());
+                }
+                ComputerStatus::Yielded => {
+                    if !child.runtime.has_terminal_input() {
+                        return Ok(());
+                    }
+                }
+                ComputerStatus::SpawnRequested => {
+                    // Background children cannot own the terminal.
+                    let _ = child.runtime.take_spawn_request();
+                    child.runtime.resolve_spawn(STATUS_DENIED);
+                }
+                ComputerStatus::ChildRequest => {
+                    // No nested background trees in the experimental contract.
+                    let _ = child.runtime.take_child_request();
+                    child.runtime.resolve_spawn(STATUS_DENIED);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reclaims an exited background child, publishing its file changes.
+    fn reap_background(&mut self, index: usize) -> Result<()> {
+        self.background.remove(index);
+        let files = self.files.clone();
+        let foreground = self.foreground();
+        for (path, bytes) in files {
+            foreground.mount_file(&path, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Launches a piped background child and returns its pid.
+    fn spawn_piped(&mut self, package: &str, arguments: Vec<String>) -> Result<u32, i32> {
+        let child = self.spawn_child(package, arguments)?;
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        self.background.push(BackgroundChild {
+            pid,
+            runtime: child,
+            output: Vec::new(),
+            exit: None,
+        });
+        Ok(pid)
+    }
+
     fn spawn_child(
         &mut self,
         package: &str,
@@ -744,13 +1146,16 @@ impl ComputerSupervisor {
         let mut argv = Vec::with_capacity(arguments.len() + 1);
         argv.push(package.to_owned());
         argv.extend(arguments);
-        let context = ComputerContext::new(argv, Vec::new()).map_err(|_| STATUS_INVALID)?;
+        // Children inherit the computer's launch environment.
+        let context =
+            ComputerContext::new(argv, self.environment.clone()).map_err(|_| STATUS_INVALID)?;
         let mut child =
             ComputerRuntime::new_with_backend(program, context, self.max_gas_per_run, self.backend)
                 .map_err(|_| STATUS_INVALID)?;
         child
             .set_terminal_size(self.columns, self.rows)
             .map_err(|_| STATUS_INVALID)?;
+        child.set_network_enabled(self.network);
         for (path, bytes) in &self.files {
             child
                 .mount_file(path, bytes.clone())

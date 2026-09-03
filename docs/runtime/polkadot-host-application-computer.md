@@ -254,6 +254,23 @@ polkadot_host_0_1_fs_list(destination, capacity) -> record bytes | error
 The supervisor owns the process stack (max depth 4), grants the foreground
 process the terminal, and rebases the shared `/home` store when a child exits.
 
+Piped background children implement pipes and `:!` filters without `fork`:
+
+```text
+polkadot_host_0_1_process_spawn(pkg_ptr, pkg_len, args_ptr, args_len) -> pid | error
+polkadot_host_0_1_pipe_write(pid, src, len)  -> written | error
+polkadot_host_0_1_pipe_read(pid, dst, cap)   -> bytes | 0 on EOF | WOULD_BLOCK
+polkadot_host_0_1_pipe_close(pid)            -> 0 | error
+polkadot_host_0_1_process_wait(pid)          -> exit status | WOULD_BLOCK
+```
+
+A spawned child has no terminal: its tty handle is a pipe pair owned by the
+parent. Scheduling is cooperative — the child executes only while its parent
+is suspended inside a pipe or wait hostcall, so a `write -> close -> read to
+EOF -> wait` sequence always terminates. Pids are pid-scoped pipe handles for
+now; generic transferable handles remain an open question. Background
+children cannot spawn (max 4 live per computer).
+
 ### `host.net`
 
 ```text
@@ -264,7 +281,19 @@ tcp_accept(listener)
 udp_bind(address)
 ```
 
-Networking is capability-gated.
+Networking is capability-gated and denied by default. The first implemented
+slice is outbound TCP only; resolution happens inside connect:
+
+```text
+polkadot_host_0_1_net_tcp_connect(address_ptr, address_len) -> handle | error
+polkadot_host_0_1_net_read(handle, dst, cap)  -> bytes | 0 on EOF | WOULD_BLOCK
+polkadot_host_0_1_net_write(handle, src, len) -> written | WOULD_BLOCK | error
+polkadot_host_0_1_net_close(handle)           -> 0 | error
+```
+
+The Host grants the capability per computer (`set_network_enabled`); at most
+4 sockets, nonblocking, 64 KiB per transfer. Listen, accept, and UDP remain
+unimplemented. Wasm hosts currently report DENIED.
 
 ### `host.tty`
 
@@ -344,10 +373,17 @@ compatibility.
 Success means editing a persistent file, exiting, and reopening the same bytes.
 
 Status: neatvi (ISC, vendored unmodified in the application repository as
-`apps/vi-tty`) runs against pvm-posix with the fork/exec pipe filters and
-LSP client stubbed out. It required adding `poll`, `getchar`, `memchr`,
-file-descriptor reads, and ICRNL emulation to the layer. Vim is the next
-editor target once `:!` filters can map onto host process capabilities.
+`apps/vi-tty`) runs against pvm-posix with the LSP client stubbed out; its
+`:%!` filters and `:make` map onto the piped `process_spawn` capability. The
+layer grew `poll`, `getchar`, `memchr`, `getenv`, file-descriptor reads, and
+ICRNL emulation along the way.
+
+Vim (feature-tiny, patch 9.2.1036) has been assessed against the same
+freestanding toolchain: all 129 sources compile with zero source edits, and
+link-level analysis finds 46 libc gaps — roughly 30 one-line stubs plus one
+real work item (a small in-memory FILE layer over `fs_*`). **No blocker
+exists for a terminal-only tiny Vim.** Full matrix:
+[vim-tiny-compatibility.md](vim-tiny-compatibility.md).
 
 ### Targeted POSIX compatibility
 

@@ -293,10 +293,17 @@ impl CoreVmRuntime {
                     self.exited = true;
                     return Ok(());
                 }
-                Interruption::ProcessRun { package, .. } => {
+                Interruption::ProcessRun { package, .. }
+                | Interruption::ProcessSpawn { package, .. } => {
                     return Err(anyhow!(
                         "CoreVM guest requested process spawn of {package:?}"
                     ));
+                }
+                Interruption::ProcessWait { .. }
+                | Interruption::PipeRead { .. }
+                | Interruption::PipeWrite { .. }
+                | Interruption::PipeClose { .. } => {
+                    return Err(anyhow!("CoreVM guest requested a pipe operation"));
                 }
                 Interruption::Yield => return Ok(()),
                 Interruption::SetPalette { palette } => {
