@@ -114,11 +114,21 @@ hosts that predate this RFC.
    from versioned ids, not from ignoring requests.
 4. **Children clamp to parents.** A spawned child's effective grant is
    at most its own declaration intersected with its parent's grant.
+5. **Every resource is host-provided and virtual.** A declaration never
+   names host-side resources. "Filesystem" means the virtual namespace
+   the host mounts into the process (`/home` in 0.1) — a host-owned map
+   behind opaque handles, never the host's real filesystem; the backing
+   (IndexedDB record, host-chosen directory, memory) is host policy the
+   guest cannot observe, choose, or escape. The same holds for every
+   interface: sockets, terminals, and children are host-mediated objects,
+   not operating-system resources.
 
 ## Open questions for the RFC
 
 - Section id assignment and a registry for interface namespaces.
 - Canonical JSON rules (key order, whitespace) so byte-compares work.
-- Per-interface parameter shapes (filesystem scopes, network targets).
+- Per-interface parameter shapes: which additional *host-provided virtual
+  mounts or targets* a host may offer a process (never guest-named host
+  paths), and how apps request persistence.
 - Whether the metadata-hash section (131) should commit to the
   declaration bytes.
