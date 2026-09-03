@@ -47,6 +47,8 @@ pub const MAX_COMPUTER_PATH_BYTES: usize = 200;
 pub const MAX_OPEN_SOCKETS: usize = 4;
 /// First handle value assigned to network sockets.
 pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
+/// First handle value assigned to open files.
+pub(crate) const FIRST_FILE_HANDLE: u32 = 16;
 /// Maximum accepted network address length in bytes.
 pub const MAX_NET_ADDRESS_BYTES: usize = 256;
 
@@ -155,10 +157,10 @@ pub(crate) struct ComputerDevices {
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeSet<String>,
     open_files: BTreeMap<u32, OpenComputerFile>,
-    next_handle: u32,
     network_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
     sockets: BTreeMap<u32, std::net::TcpStream>,
+    #[cfg(not(target_arch = "wasm32"))]
     next_socket: u32,
 }
 
@@ -174,10 +176,10 @@ impl ComputerDevices {
             files: BTreeMap::new(),
             modified: BTreeSet::new(),
             open_files: BTreeMap::new(),
-            next_handle: 16,
             network_enabled: false,
             #[cfg(not(target_arch = "wasm32"))]
             sockets: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             next_socket: FIRST_SOCKET_HANDLE,
         }
     }
@@ -398,21 +400,18 @@ impl ComputerDevices {
             if self.files.len() == MAX_COMPUTER_FILES {
                 return STATUS_LIMIT;
             }
-            self.files.insert(path.to_owned(), Vec::new());
-            self.modified.insert(path.to_owned());
-        } else if writable && flags & FS_OPEN_TRUNCATE != 0 {
+        }
+        // Recycle the lowest free handle. Because at most
+        // MAX_OPEN_COMPUTER_FILES handles are live, this always terminates
+        // far below FIRST_SOCKET_HANDLE, keeping the spaces disjoint.
+        let handle = (FIRST_FILE_HANDLE..)
+            .find(|handle| !self.open_files.contains_key(handle))
+            .expect("a free file handle always exists below the open-file cap");
+        // Mutations happen only after every failure path has been ruled out.
+        if !self.files.contains_key(path) || (writable && flags & FS_OPEN_TRUNCATE != 0) {
             self.files.insert(path.to_owned(), Vec::new());
             self.modified.insert(path.to_owned());
         }
-        let handle = self.next_handle;
-        let Some(next) = handle.checked_add(1) else {
-            return STATUS_LIMIT;
-        };
-        // Keep the file handle space disjoint from socket handles.
-        if next >= FIRST_SOCKET_HANDLE {
-            return STATUS_LIMIT;
-        }
-        self.next_handle = next;
         self.open_files.insert(
             handle,
             OpenComputerFile {
@@ -938,18 +937,29 @@ impl ComputerSupervisor {
     /// Exit status reported for a child that faulted (trap, gas, segfault).
     const FAULTED_CHILD_STATUS: i32 = 139;
 
+    /// Maximum contained child faults per `run()` before erroring out.
+    const MAX_FAULT_POPS_PER_RUN: usize = 32;
+
     /// Runs the foreground process until the system yields or the root exits.
     ///
     /// A fault in a child process (trap, out of gas) fails only that child:
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
     pub fn run(&mut self) -> Result<ComputerStatus> {
+        // Bound the fault-containment path so a root that spawns
+        // immediately-faulting children in a loop cannot keep run() from
+        // returning control to the Host.
+        let mut fault_pops = 0usize;
         loop {
             let status = match self.foreground().run() {
                 Ok(status) => status,
                 Err(error) => {
                     if self.stack.len() == 1 {
                         return Err(error);
+                    }
+                    fault_pops += 1;
+                    if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
+                        return Err(error.context("children faulted repeatedly"));
                     }
                     self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
                     continue;
@@ -981,7 +991,10 @@ impl ComputerSupervisor {
                     if self.stack.len() == 1 {
                         return Ok(ComputerStatus::Exited(code));
                     }
-                    self.pop_foreground(code.clamp(0, 255))?;
+                    // Mask to the POSIX exit-code byte: negative statuses
+                    // stay failures (e.g. -1 -> 255) and cannot alias the
+                    // negative hostcall error space.
+                    self.pop_foreground(code & 0xff)?;
                 }
             }
         }
@@ -991,7 +1004,19 @@ impl ComputerSupervisor {
     /// output, reaps its orphaned background children, resolves the parent
     /// with `status`, and rebases the shared `/home` view.
     fn pop_foreground(&mut self, status: i32) -> Result<()> {
-        if let Some(mut child) = self.stack.pop() {
+        debug_assert!(
+            self.stack.len() >= 2,
+            "pop_foreground requires a child on the stack"
+        );
+        let child = self.stack.pop();
+        // Preserve terminal write order: the parent's bytes written before
+        // the spawn precede the child's remaining output.
+        if let Some(bytes) = self.foreground().take_terminal_output() {
+            let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.pending_output.len());
+            self.pending_output
+                .extend_from_slice(&bytes[..bytes.len().min(available)]);
+        }
+        if let Some(mut child) = child {
             if let Some(bytes) = child.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.pending_output.len());
                 self.pending_output
@@ -1018,10 +1043,11 @@ impl ComputerSupervisor {
     pub fn terminate_foreground(&mut self) -> Result<ComputerStatus> {
         self.collect_modified();
         if self.stack.len() == 1 {
-            // Record the exit so subsequent run() calls stay terminated.
-            self.foreground().exit_status = Some(130);
+            // Record the exit so subsequent run() calls stay terminated; a
+            // root that already exited keeps its genuine status.
+            let status = *self.foreground().exit_status.get_or_insert(130);
             self.background.clear();
-            return Ok(ComputerStatus::Exited(130));
+            return Ok(ComputerStatus::Exited(status));
         }
         self.pop_foreground(130)?;
         Ok(ComputerStatus::Yielded)
@@ -1063,7 +1089,7 @@ impl ComputerSupervisor {
                 match self.background[index].exit {
                     Some(status) => {
                         self.reap_background(index)?;
-                        self.foreground().resolve_spawn(status.clamp(0, 255));
+                        self.foreground().resolve_spawn(status & 0xff);
                     }
                     None => self.foreground().resolve_spawn(STATUS_WOULD_BLOCK),
                 }
@@ -1142,14 +1168,14 @@ impl ComputerSupervisor {
             if child.exit.is_some() {
                 return Ok(());
             }
-            let status = match child.runtime.run() {
-                Ok(status) => status,
-                Err(_) => {
+            let outcome = match child.runtime.run() {
+                Ok(status) => {
                     // A faulted piped child fails alone; the parent observes
-                    // the fault status through wait.
-                    child.exit = Some(Self::FAULTED_CHILD_STATUS);
-                    return Ok(());
+                    // the fault status through wait. Its final output and
+                    // file writes are still collected below.
+                    Some(status)
                 }
+                Err(_) => None,
             };
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
@@ -1162,9 +1188,13 @@ impl ComputerSupervisor {
                 self.modified.insert(path, bytes);
             }
             let child = &mut self.background[index];
+            let Some(status) = outcome else {
+                child.exit = Some(Self::FAULTED_CHILD_STATUS);
+                return Ok(());
+            };
             match status {
                 ComputerStatus::Exited(code) => {
-                    child.exit = Some(code.clamp(0, 255));
+                    child.exit = Some(code & 0xff);
                     return Ok(());
                 }
                 ComputerStatus::Yielded => {
