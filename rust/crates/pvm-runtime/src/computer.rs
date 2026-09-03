@@ -46,6 +46,7 @@ pub const MAX_COMPUTER_PATH_BYTES: usize = 200;
 /// Maximum simultaneously open outbound TCP sockets.
 pub const MAX_OPEN_SOCKETS: usize = 4;
 /// First handle value assigned to network sockets.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
 /// First handle value assigned to open files.
 pub(crate) const FIRST_FILE_HANDLE: u32 = 16;
@@ -1168,15 +1169,10 @@ impl ComputerSupervisor {
             if child.exit.is_some() {
                 return Ok(());
             }
-            let outcome = match child.runtime.run() {
-                Ok(status) => {
-                    // A faulted piped child fails alone; the parent observes
-                    // the fault status through wait. Its final output and
-                    // file writes are still collected below.
-                    Some(status)
-                }
-                Err(_) => None,
-            };
+            // A faulted piped child fails alone; the parent observes the
+            // fault status through wait. Its final output and file writes
+            // are still collected below.
+            let outcome = child.runtime.run().ok();
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
                 child
