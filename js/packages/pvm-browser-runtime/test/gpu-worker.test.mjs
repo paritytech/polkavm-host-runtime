@@ -20,10 +20,10 @@ const context = vm.createContext({
   postMessage() {},
 });
 vm.runInContext(
-  `${source}\nglobalThis.gpuWorkerTest = { parseCommand };`,
+  `${source}\nglobalThis.gpuWorkerTest = { GpuEngine, parseCommand };`,
   context,
 );
-const { parseCommand } = context.gpuWorkerTest;
+const { GpuEngine, parseCommand } = context.gpuWorkerTest;
 
 function parse(opcode, payload) {
   return parseCommand({ opcode, payload, index: 0 });
@@ -61,4 +61,41 @@ test("parses read-only storage buffer layouts", () => {
 
   view.setUint16(18, 2, true);
   assert.throws(() => parse(7, payload), /invalid buffer binding layout/);
+});
+
+test("completes a validated batch without render commands", async () => {
+  let completions = 0;
+  const engine = Object.create(GpuEngine.prototype);
+  Object.assign(engine, {
+    stopped: false,
+    resources: new Map(),
+    handleSlots: new Map(),
+    lastSequence: 0n,
+    testReadbacksRemaining: 0,
+    testDeviceLossPending: false,
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      queue: {
+        onSubmittedWorkDone: async () => {
+          completions++;
+        },
+      },
+    },
+  });
+  engine.validate = () => ({
+    commands: [],
+    slots: new Map(),
+  });
+  const batch = new Uint8Array(24);
+  const view = new DataView(batch.buffer);
+  batch.set(new TextEncoder().encode("EPG1"));
+  view.setUint16(4, 1, true);
+  view.setUint32(8, batch.byteLength, true);
+  view.setBigUint64(16, 1n, true);
+
+  await engine.execute(batch);
+
+  assert.equal(completions, 1);
+  assert.equal(engine.lastSequence, 1);
 });
