@@ -16,6 +16,7 @@ mod native_ffi;
 mod native_gpu;
 mod quake_keys;
 mod tri2d;
+mod ui;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -43,6 +44,13 @@ pub use tri2d::{
     Tri2dFrame, MAX_TRI2D_BYTES, MAX_TRI2D_COMMANDS, MAX_TRI2D_DRAWS, MAX_TRI2D_INDICES,
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
     MAX_TRI2D_VERTICES, TRI2D_HEADER_BYTES, TRI2D_MAGIC, TRI2D_VERSION,
+};
+pub use ui::{
+    encode_text_input, focus_record, ime_state_record, wheel_record, TextInputKind,
+    UiSemanticAction, UiSemanticNode, UiSemanticRole, UiSemanticSnapshot, UiSemanticsFrame,
+    INPUT_FOCUS, INPUT_IME_COMMIT, INPUT_IME_DISABLED, INPUT_IME_ENABLED, INPUT_IME_PREEDIT,
+    INPUT_TEXT_COMMIT, INPUT_WHEEL, MAX_UI_SEMANTICS_BYTES, MAX_UI_SEMANTIC_NODES,
+    MAX_UI_SEMANTIC_STRING_BYTES, MAX_UI_TEXT_BYTES,
 };
 
 pub const ABI_VERSION: u32 = 1;
@@ -184,7 +192,6 @@ pub enum InputEventType {
     PointerMove = 5,
     PointerDelta = 6,
     SurfaceMetrics = 7,
-    Text = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -352,9 +359,11 @@ struct HostState {
     audio_enabled: bool,
     presentation: PresentationProfile,
     tri2d_submitted: bool,
+    ui_semantics: Option<UiSemanticsFrame>,
+    ui_semantics_submitted: bool,
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
-    input: VecDeque<InputEvent>,
+    input: VecDeque<[u8; INPUT_EVENT_BYTES]>,
     assets: HashMap<String, Vec<u8>>,
     clock: HostClock,
     logs: VecDeque<String>,
@@ -390,6 +399,8 @@ impl HostState {
             audio_enabled,
             tri2d_state: tri2d::Tri2dState::default(),
             tri2d_submitted: false,
+            ui_semantics: None,
+            ui_semantics_submitted: false,
             audio: VecDeque::new(),
             audio_samples: 0,
             input: VecDeque::new(),
@@ -420,6 +431,7 @@ impl HostState {
         self.hostcalls_remaining = max_hostcalls;
         self.sleep_ms_remaining = max_sleep_ms;
         self.tri2d_submitted = false;
+        self.ui_semantics_submitted = false;
         self.gpu_submits_remaining = MAX_GPU_SUBMITS_PER_TICK;
         self.gpu_upload_bytes_remaining = MAX_GPU_UPLOAD_BYTES_PER_TICK;
     }
@@ -441,19 +453,24 @@ impl HostState {
     }
 
     fn queue_input(&mut self, event: InputEvent) {
-        if event.event_type == InputEventType::SurfaceMetrics {
+        let _ = self.queue_input_record(event.encode());
+    }
+
+    fn queue_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        ui::validate_input_record(&record)?;
+        if record[0] == InputEventType::SurfaceMetrics as u8 {
             if let Some(position) = self
                 .input
                 .iter()
-                .rposition(|queued| queued.event_type == InputEventType::SurfaceMetrics)
+                .rposition(|queued| queued[0] == InputEventType::SurfaceMetrics as u8)
             {
                 self.input.remove(position);
             }
-        } else if event.event_type == InputEventType::PointerMove
+        } else if record[0] == InputEventType::PointerMove as u8
             && self
                 .input
                 .back()
-                .is_some_and(|queued| queued.event_type == InputEventType::PointerMove)
+                .is_some_and(|queued| queued[0] == InputEventType::PointerMove as u8)
         {
             self.input.pop_back();
         }
@@ -461,19 +478,45 @@ impl HostState {
             let discardable = self
                 .input
                 .iter()
-                .position(|queued| queued.event_type == InputEventType::PointerMove)
+                .position(|queued| queued[0] == InputEventType::PointerMove as u8)
                 .or_else(|| {
-                    self.input
-                        .iter()
-                        .position(|queued| queued.event_type != InputEventType::SurfaceMetrics)
+                    self.input.iter().position(|queued| {
+                        matches!(
+                            queued[0],
+                            value if value == InputEventType::PointerDelta as u8
+                                || value == ui::INPUT_WHEEL
+                        )
+                    })
                 });
             if let Some(position) = discardable {
                 self.input.remove(position);
             } else {
-                self.input.pop_front();
+                bail!("input queue is full");
             }
         }
-        self.input.push_back(event);
+        self.input.push_back(record);
+        Ok(())
+    }
+
+    fn queue_input_records(&mut self, records: Vec<[u8; INPUT_EVENT_BYTES]>) -> Result<()> {
+        if self.input.len().saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
+            bail!("input queue cannot accept a complete text event");
+        }
+        for record in &records {
+            ui::validate_input_record(record)?;
+        }
+        self.input.extend(records);
+        Ok(())
+    }
+
+    fn queue_ui_semantics(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if self.ui_semantics_submitted {
+            bail!("UI semantics were already submitted during this call");
+        }
+        ui::validate_ui_semantics(&bytes)?;
+        self.ui_semantics = Some(UiSemanticsFrame { bytes });
+        self.ui_semantics_submitted = true;
+        Ok(())
     }
 
     fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
@@ -656,6 +699,30 @@ impl Runtime {
                 },
             )
             .context("define host_tri2d_submit")?;
+
+        linker
+            .define_typed(
+                "host_ui_semantics_submit",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if length == 0 || length > MAX_UI_SEMANTICS_BYTES {
+                        return Ok(1);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    if caller.user_data.ui_semantics_submitted {
+                        return Ok(2);
+                    }
+                    let bytes = read_guest_memory(caller.instance, pointer, length)?;
+                    if caller.user_data.queue_ui_semantics(bytes).is_err() {
+                        return Ok(1);
+                    }
+                    Ok(0)
+                },
+            )
+            .context("define host_ui_semantics_submit")?;
 
         linker
             .define_typed(
@@ -848,7 +915,7 @@ impl Runtime {
                             .ok_or_else(|| anyhow!("guest input destination overflow"))?;
                         caller
                             .instance
-                            .write_memory(destination, &event.encode())
+                            .write_memory(destination, &event)
                             .map_err(|error| anyhow!("write guest input: {error:?}"))?;
                         written += INPUT_EVENT_BYTES as u32;
                     }
@@ -1107,6 +1174,15 @@ impl Runtime {
         self.state.queue_input(event);
     }
 
+    pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        self.state.queue_input_record(record)
+    }
+
+    pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
+        self.state
+            .queue_input_records(ui::encode_text_input(kind, text)?)
+    }
+
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
         self.state.motion.set_availability(availability);
     }
@@ -1164,6 +1240,10 @@ impl Runtime {
 
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         self.state.tri2d.take()
+    }
+
+    pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
+        self.state.ui_semantics.take()
     }
 
     pub fn take_audio(&mut self) -> Option<AudioChunk> {
@@ -1560,7 +1640,10 @@ mod tests {
             });
         }
         assert_eq!(state.input.len(), 1);
-        assert_eq!(state.input.back().unwrap().x, 9_999);
+        assert_eq!(
+            u16::from_le_bytes(state.input.back().unwrap()[2..4].try_into().unwrap()),
+            9_999
+        );
 
         state.queue_input(InputEvent {
             event_type: InputEventType::SurfaceMetrics,
@@ -1578,11 +1661,14 @@ mod tests {
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type == InputEventType::SurfaceMetrics)
+                .filter(|event| event[0] == InputEventType::SurfaceMetrics as u8)
                 .count(),
             1
         );
-        assert_eq!(state.input.back().unwrap().x, 2_560);
+        assert_eq!(
+            u16::from_le_bytes(state.input.back().unwrap()[2..4].try_into().unwrap()),
+            2_560
+        );
 
         for index in 0..(MAX_QUEUED_INPUT_EVENTS + 100) {
             state.queue_input(InputEvent {
@@ -1597,7 +1683,7 @@ mod tests {
             state
                 .input
                 .iter()
-                .filter(|event| event.event_type == InputEventType::SurfaceMetrics)
+                .filter(|event| event[0] == InputEventType::SurfaceMetrics as u8)
                 .count(),
             1
         );
@@ -1609,8 +1695,8 @@ mod tests {
         });
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
-            state.input.back().unwrap().event_type,
-            InputEventType::SurfaceMetrics
+            state.input.back().unwrap()[0],
+            InputEventType::SurfaceMetrics as u8
         );
     }
 

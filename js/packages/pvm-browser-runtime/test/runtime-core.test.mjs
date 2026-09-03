@@ -117,6 +117,23 @@ function motionResult(bytes) {
   };
 }
 
+function gpuCapabilities(surfaceGeneration) {
+  const bytes = new Uint8Array(56);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x45, 0x47, 0x43, 0x31]);
+  view.setUint16(4, 1, true);
+  view.setUint32(8, bytes.byteLength, true);
+  view.setUint16(12, 1, true);
+  view.setUint32(16, 640, true);
+  view.setUint32(20, 480, true);
+  view.setUint32(24, 640, true);
+  view.setUint32(28, 480, true);
+  view.setFloat32(32, 1, true);
+  view.setUint32(36, surfaceGeneration, true);
+  view.setUint32(40, 1, true);
+  return bytes;
+}
+
 test("browser runtime rejects unbounded launch inputs before compilation", async () => {
   for (const [message, expected] of [
     [invalidStart({ program: new Uint8Array() }), /program must contain/],
@@ -187,6 +204,61 @@ test("compiler backend enforces the declared graphics profile", async () => {
   );
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
+});
+
+test("compiler startup keeps the newest GPU capabilities", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const Runtime = globalThis.TranslatedPvmRuntime;
+  let observedCapabilities;
+  globalThis.TranslatedPvmRuntime = class extends Runtime {
+    constructor(...args) {
+      observedCapabilities = new Uint8Array(args[6]);
+      super(...args);
+    }
+  };
+  try {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "webgpu-raster",
+        gpuCapabilities: gpuCapabilities(1).buffer,
+        audioEnabled: false,
+        cacheKey: "gpu-capabilities-startup",
+      },
+    });
+    receiver.onmessage({
+      data: {
+        type: "gpu-capabilities",
+        bytes: gpuCapabilities(2).buffer,
+      },
+    });
+    const ready = await waitForMessage(messages, "ready");
+    assert.equal(ready.backend, "compiler");
+    assert.equal(
+      new DataView(
+        observedCapabilities.buffer,
+        observedCapabilities.byteOffset,
+        observedCapabilities.byteLength,
+      ).getUint32(36, true),
+      2,
+    );
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  } finally {
+    globalThis.TranslatedPvmRuntime = Runtime;
+  }
 });
 
 test("native-Wasm and translated backends round-trip opaque TrUAPI frames", async () => {

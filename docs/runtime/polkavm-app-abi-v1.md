@@ -238,7 +238,7 @@ and returns the number of bytes written. It never writes a partial record.
 Zero means that no event was available or that the capacity was smaller than
 one record.
 
-An input record is:
+The legacy fixed record layout is:
 
 ```text
 offset  type  field
@@ -252,21 +252,54 @@ offset  type  field
 ABI v1 event types are:
 
 ```text
-1  key down
-2  key up
-3  pointer button down
-4  pointer button up
-5  pointer position
-6  pointer delta
-7  surface metrics
-8  committed Unicode scalar
+1   key down
+2   key up
+3   pointer button down
+4   pointer button up
+5   pointer position
+6   pointer delta
+7   surface metrics
+8   committed UTF-8 text chunk
+9   IME preedit UTF-8 chunk
+10  IME commit UTF-8 chunk
+11  IME enabled
+12  IME disabled or cancelled
+13  focus (`code` is 0 or 1)
+14  wheel delta (`x` and `y` are signed i16)
 ```
 
-The device-input contract defines code values, coordinate interpretation, and
-surface-metric scaling. For event type 8, `code` is zero and the Unicode scalar
-value is `x | (y << 16)`; hosts emit one record per committed scalar, including
-text committed by an IME. ABI v1 does not define touch, wheel, pre-edit IME, or
-focus events.
+Text and IME records use `code` bits 0–2 as a payload length from zero through
+six, bit 6 for the first chunk, and bit 7 for the last chunk. Bytes 2–7 contain
+the chunk and zero padding. A complete text event is at most 4 KiB. The Host
+MUST queue all chunks of one event atomically; the guest MUST reject malformed
+flag sequences or invalid UTF-8.
+
+### UI semantics
+
+```text
+host_ui_semantics_submit(pointer: u32, length: u32) -> u32
+```
+
+The guest may submit one complete UTF-8 JSON semantic tree per `init` or
+`update` call. The tree is presentation output, not an instruction to invoke
+guest functions. Hosts use its roles, labels, values, actions, focus, and
+surface-relative bounds for accessibility and UI automation, then deliver
+actual pointer, keyboard, text, or IME records for every interaction.
+
+The version 1 object contains `version`, monotonic `generation`, and `nodes`.
+Each node contains a nonzero numeric `id`, nullable `parent`, `role`, `name`,
+`value`, `[x0,y0,x1,y1]` bounds, `actions`, `disabled`, and `focused`. Version 1
+allows at most 1,024 nodes, 1 KiB per name or value, and 256 KiB for the whole
+tree. It requires exactly one root, unique IDs, existing parents, finite ordered
+bounds, and no unknown object fields.
+
+Return values:
+
+```text
+0  accepted
+1  malformed, out-of-bounds, or over-limit tree
+2  a tree was already submitted during this call
+```
 
 ### Motion
 
@@ -404,7 +437,7 @@ application behavior.
 The initial v1 implementation applies the following ceilings:
 
 ```text
-program bytes                         16 MiB
+program bytes                         64 MiB
 read-write data                       64 MiB
 stack                                 16 MiB
 heap                                  128 MiB

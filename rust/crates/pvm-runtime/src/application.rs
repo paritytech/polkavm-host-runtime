@@ -5,7 +5,7 @@
 use crate::corevm::{Interruption, Vm};
 use crate::{
     AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile, Runtime,
-    Tri2dFrame, MAX_FRAME_BYTES,
+    TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -144,6 +144,20 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_input_record(record),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support extended input records")),
+        }
+    }
+
+    pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_text_input(kind, text),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support text input")),
+        }
+    }
+
     pub fn set_motion_availability(
         &mut self,
         availability: crate::motion_wire::MotionAvailability,
@@ -226,6 +240,13 @@ impl ApplicationRuntime {
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_tri2d(),
+            Self::CoreVm(_) => None,
+        }
+    }
+
+    pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_ui_semantics(),
             Self::CoreVm(_) => None,
         }
     }
@@ -384,7 +405,7 @@ impl CoreVmRuntime {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
-            InputEventType::SurfaceMetrics | InputEventType::Text => {}
+            InputEventType::SurfaceMetrics => {}
         }
     }
 }

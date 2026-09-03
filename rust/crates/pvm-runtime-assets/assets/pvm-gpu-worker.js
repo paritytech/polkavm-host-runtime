@@ -1376,7 +1376,6 @@ class GpuEngine {
     let surfaceView = null;
     let surfaceTexture = null;
     let readback = null;
-    let submitted = false;
     const removed = [];
     const shaders = [];
     const created = [];
@@ -1679,7 +1678,6 @@ class GpuEngine {
       }
       if (encoder) {
         this.device.queue.submit([encoder.finish()]);
-        submitted = true;
       }
     } catch (error) {
       created.forEach(entry => entry.value?.destroy?.());
@@ -1690,26 +1688,10 @@ class GpuEngine {
     }
     const outOfMemoryPromise = this.device.popErrorScope();
     const validationPromise = this.device.popErrorScope();
-    let outOfMemory = null;
-    let validation = null;
-    if (submitted) {
-      [outOfMemory, validation] = await Promise.all([
-        outOfMemoryPromise,
-        validationPromise,
-      ]);
-    } else {
-      void Promise.all([outOfMemoryPromise, validationPromise]).then(
-        ([outOfMemory, validation]) => {
-          const error = outOfMemory || validation;
-          if (error) {
-            postMessage({
-              type: "error",
-              message: `WebGPU resource validation failed: ${error.message}`,
-            });
-          }
-        }
-      );
-    }
+    const [outOfMemory, validation] = await Promise.all([
+      outOfMemoryPromise,
+      validationPromise,
+    ]);
     const gpuError = outOfMemory || validation;
     if (gpuError) {
       readback?.destroy();

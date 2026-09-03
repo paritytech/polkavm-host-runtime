@@ -37,7 +37,6 @@ pub enum NativePvmInputEventType {
     PointerMove,
     PointerDelta,
     SurfaceMetrics,
-    Text,
 }
 
 impl From<NativePvmInputEventType> for InputEventType {
@@ -50,7 +49,6 @@ impl From<NativePvmInputEventType> for InputEventType {
             NativePvmInputEventType::PointerMove => Self::PointerMove,
             NativePvmInputEventType::PointerDelta => Self::PointerDelta,
             NativePvmInputEventType::SurfaceMetrics => Self::SurfaceMetrics,
-            NativePvmInputEventType::Text => Self::Text,
         }
     }
 }

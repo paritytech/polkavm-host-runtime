@@ -20,13 +20,16 @@
   const MOTION_ERROR_BUFFER_TOO_SMALL = -4;
   const MAX_INPUT_EVENTS = 4096;
   const MAX_HOSTCALLS_PER_INIT = 1024 * 1024;
-  const MAX_HOSTCALLS_PER_UPDATE = 8192;
+  const MAX_HOSTCALLS_PER_UPDATE = 65536;
   const MAX_HOSTCALL_BYTES = 32 * 1024 * 1024;
   const MAX_LOG_BYTES = 4 * 1024;
   const MAX_SAVE_BYTES = 1024 * 1024;
   const MAX_AUDIO_SAMPLES = 48000 * 2;
   const MAX_FRAME_BYTES = 16 * 1024 * 1024;
   const MAX_TRI2D_BYTES = 8 * 1024 * 1024;
+  const MAX_UI_SEMANTICS_BYTES = 256 * 1024;
+  const MAX_UI_SEMANTIC_NODES = 1024;
+  const MAX_UI_SEMANTIC_STRING_BYTES = 1024;
   const MAX_GPU_BATCH_BYTES = 4 * 1024 * 1024;
   const MAX_GPU_EVENT_BYTES = 64 * 1024;
   const MAX_GPU_EVENTS = 256;
@@ -55,6 +58,55 @@
   const SYS_EXIT = 93n;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+
+  function validUiSemantics(bytes) {
+    let snapshot;
+    try {
+      snapshot = JSON.parse(decoder.decode(bytes));
+    } catch {
+      return false;
+    }
+    if (
+      snapshot?.version !== 1 ||
+      !Number.isSafeInteger(snapshot.generation) ||
+      snapshot.generation < 0 ||
+      !Array.isArray(snapshot.nodes) ||
+      !snapshot.nodes.length ||
+      snapshot.nodes.length > MAX_UI_SEMANTIC_NODES
+    ) {
+      return false;
+    }
+    const ids = new Set();
+    let roots = 0;
+    for (const node of snapshot.nodes) {
+      if (
+        typeof node?.id !== "string" ||
+        !/^[0-9a-f]{1,16}$/.test(node.id) ||
+        ids.has(node.id) ||
+        !Array.isArray(node.bounds) ||
+        node.bounds.length !== 4 ||
+        !node.bounds.every(Number.isFinite) ||
+        node.bounds[2] < node.bounds[0] ||
+        node.bounds[3] < node.bounds[1] ||
+        typeof node.name !== "string" ||
+        encoder.encode(node.name).byteLength > MAX_UI_SEMANTIC_STRING_BYTES ||
+        typeof node.value !== "string" ||
+        encoder.encode(node.value).byteLength > MAX_UI_SEMANTIC_STRING_BYTES
+      ) {
+        return false;
+      }
+      ids.add(node.id);
+      if (node.parent === null) {
+        roots++;
+      }
+    }
+    return (
+      roots === 1 &&
+      snapshot.nodes.every(
+        (node) => node.parent === null || ids.has(node.parent),
+      )
+    );
+  }
 
   function readMetadata(module) {
     const sections = WebAssembly.Module.customSections(
@@ -300,6 +352,7 @@
       this.truapiResponses = [];
       this.truapiResponseBytes = 0;
       this.tri2dSubmitted = false;
+      this.uiSemanticsSubmitted = false;
       this.maxGas = BigInt(maxGas);
       this.input = [];
       this.coreInput = [];
@@ -358,6 +411,7 @@
       this.timeMs = timeMs;
       this.gpuSubmits = 0;
       this.truapiRequests = 0;
+      this.uiSemanticsSubmitted = false;
       this.truapiRequestBytes = 0;
       this.#resetBudget(
         this.coreVm && !this.coreVmStarted
@@ -749,6 +803,26 @@
           const bytes = this.#read(this.#u32(a0), length);
           this.emit({ type: "tri2d", bytes }, [bytes.buffer]);
           this.tri2dSubmitted = true;
+          this.#setReg(7, 0n);
+          return false;
+        }
+        case "host_ui_semantics_submit": {
+          const length = this.#u32(a1);
+          if (!length || length > MAX_UI_SEMANTICS_BYTES) {
+            this.#setReg(7, 1n);
+            return false;
+          }
+          if (this.uiSemanticsSubmitted) {
+            this.#setReg(7, 2n);
+            return false;
+          }
+          const bytes = this.#read(this.#u32(a0), length);
+          if (!validUiSemantics(bytes)) {
+            this.#setReg(7, 1n);
+            return false;
+          }
+          this.emit({ type: "ui-semantics", bytes }, [bytes.buffer]);
+          this.uiSemanticsSubmitted = true;
           this.#setReg(7, 0n);
           return false;
         }
@@ -1479,6 +1553,7 @@ globalThis.createPvmRuntime = (endpoint) => {
   let disposed = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
+  let pendingGpuCapabilities = null;
   let timer;
   let startedAt = 0;
   let updateCount = 0;
@@ -1572,6 +1647,19 @@ globalThis.createPvmRuntime = (endpoint) => {
     postMessage({ type: "tri2d", bytes }, [bytes.buffer]);
   }
 
+  function drainUiSemantics() {
+    if (!pvm.pvm_browser_take_ui_semantics?.()) {
+      return;
+    }
+    const length = pvm.pvm_browser_ui_semantics_length();
+    const bytes = new Uint8Array(
+      pvm.memory.buffer,
+      pvm.pvm_browser_ui_semantics_pointer(),
+      length,
+    ).slice();
+    postMessage({ type: "ui-semantics", bytes }, [bytes.buffer]);
+  }
+
   function drainGpuBatches() {
     while (pvm.pvm_browser_take_gpu_batch?.()) {
       const length = pvm.pvm_browser_gpu_batch_length();
@@ -1654,6 +1742,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         );
         drainFrame();
         drainTri2d();
+        drainUiSemantics();
         drainGpuBatches();
         drainTruapiRequests();
         drainAudio();
@@ -1809,6 +1898,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     }
     const program = validateStartMessage(message);
     motionAvailability = message.motionAvailability ?? 0;
+    pendingGpuCapabilities =
+      message.gpuCapabilities instanceof ArrayBuffer
+        ? new Uint8Array(message.gpuCapabilities).slice()
+        : null;
     const bootStarted = performance.now();
     let translationMs = 0;
     let compilationMs = 0;
@@ -1875,15 +1968,14 @@ globalThis.createPvmRuntime = (endpoint) => {
         MAX_TRANSLATED_LOOPS_PER_UPDATE,
         message.audioEnabled,
         message.graphicsProfile,
-        message.gpuCapabilities instanceof ArrayBuffer
-          ? new Uint8Array(message.gpuCapabilities)
-          : null,
+        pendingGpuCapabilities,
         motionAvailability,
       );
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
       }
       translated.initialize();
+      pendingGpuCapabilities = null;
       pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
@@ -1934,16 +2026,17 @@ globalThis.createPvmRuntime = (endpoint) => {
         pendingMotionSample = null;
       }
       if (message.graphicsProfile === "webgpu-raster") {
-        if (!(message.gpuCapabilities instanceof ArrayBuffer)) {
+        if (pendingGpuCapabilities === null) {
           throw new Error(
             "WebGPU capabilities are required before PVM initialization",
           );
         }
-        stage(new Uint8Array(message.gpuCapabilities));
+        stage(pendingGpuCapabilities);
         check(
           pvm.pvm_browser_set_gpu_capabilities(),
           "set PolkaVM browser GPU capabilities",
         );
+        pendingGpuCapabilities = null;
       }
       postMessage({ type: "startup", stage: "interpreter-initializing" });
       try {
@@ -1987,15 +2080,23 @@ globalThis.createPvmRuntime = (endpoint) => {
       translated.sendInput(bytes);
       return;
     }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes[0] <= 7) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      check(
+        pvm.pvm_browser_send_input(
+          bytes[0],
+          bytes[1],
+          view.getUint16(2, true),
+          view.getUint16(4, true),
+        ),
+        "send PolkaVM browser input",
+      );
+      return;
+    }
+    stage(bytes);
     check(
-      pvm.pvm_browser_send_input(
-        bytes[0],
-        bytes[1],
-        view.getUint16(2, true),
-        view.getUint16(4, true),
-      ),
-      "send PolkaVM browser input",
+      pvm.pvm_browser_send_input_record(),
+      "send PolkaVM browser extended input",
     );
   }
 
@@ -2045,7 +2146,11 @@ globalThis.createPvmRuntime = (endpoint) => {
   }
 
   function sendGpuCapabilities(bytes) {
-    if (!running || bytes.byteLength < 56 || bytes.byteLength > 4096) {
+    if (bytes.byteLength < 56 || bytes.byteLength > 4096) {
+      throw new Error("invalid PolkaVM browser GPU capabilities");
+    }
+    if (!running || !pvm) {
+      pendingGpuCapabilities = bytes.slice();
       return;
     }
     if (translated) {
@@ -2055,7 +2160,7 @@ globalThis.createPvmRuntime = (endpoint) => {
     stage(bytes);
     check(
       pvm.pvm_browser_set_gpu_capabilities(),
-      "update PolkaVM browser GPU capabilities"
+      "update PolkaVM browser GPU capabilities",
     );
   }
 

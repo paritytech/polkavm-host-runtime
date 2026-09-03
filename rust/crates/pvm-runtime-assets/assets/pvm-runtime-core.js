@@ -38,6 +38,7 @@ globalThis.createPvmRuntime = (endpoint) => {
   let disposed = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
+  let pendingGpuCapabilities = null;
   let timer;
   let startedAt = 0;
   let updateCount = 0;
@@ -131,6 +132,19 @@ globalThis.createPvmRuntime = (endpoint) => {
     postMessage({ type: "tri2d", bytes }, [bytes.buffer]);
   }
 
+  function drainUiSemantics() {
+    if (!pvm.pvm_browser_take_ui_semantics?.()) {
+      return;
+    }
+    const length = pvm.pvm_browser_ui_semantics_length();
+    const bytes = new Uint8Array(
+      pvm.memory.buffer,
+      pvm.pvm_browser_ui_semantics_pointer(),
+      length,
+    ).slice();
+    postMessage({ type: "ui-semantics", bytes }, [bytes.buffer]);
+  }
+
   function drainGpuBatches() {
     while (pvm.pvm_browser_take_gpu_batch?.()) {
       const length = pvm.pvm_browser_gpu_batch_length();
@@ -213,6 +227,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         );
         drainFrame();
         drainTri2d();
+        drainUiSemantics();
         drainGpuBatches();
         drainTruapiRequests();
         drainAudio();
@@ -368,6 +383,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     }
     const program = validateStartMessage(message);
     motionAvailability = message.motionAvailability ?? 0;
+    pendingGpuCapabilities =
+      message.gpuCapabilities instanceof ArrayBuffer
+        ? new Uint8Array(message.gpuCapabilities).slice()
+        : null;
     const bootStarted = performance.now();
     let translationMs = 0;
     let compilationMs = 0;
@@ -434,15 +453,14 @@ globalThis.createPvmRuntime = (endpoint) => {
         MAX_TRANSLATED_LOOPS_PER_UPDATE,
         message.audioEnabled,
         message.graphicsProfile,
-        message.gpuCapabilities instanceof ArrayBuffer
-          ? new Uint8Array(message.gpuCapabilities)
-          : null,
+        pendingGpuCapabilities,
         motionAvailability,
       );
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
       }
       translated.initialize();
+      pendingGpuCapabilities = null;
       pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
@@ -493,16 +511,17 @@ globalThis.createPvmRuntime = (endpoint) => {
         pendingMotionSample = null;
       }
       if (message.graphicsProfile === "webgpu-raster") {
-        if (!(message.gpuCapabilities instanceof ArrayBuffer)) {
+        if (pendingGpuCapabilities === null) {
           throw new Error(
             "WebGPU capabilities are required before PVM initialization",
           );
         }
-        stage(new Uint8Array(message.gpuCapabilities));
+        stage(pendingGpuCapabilities);
         check(
           pvm.pvm_browser_set_gpu_capabilities(),
           "set PolkaVM browser GPU capabilities",
         );
+        pendingGpuCapabilities = null;
       }
       postMessage({ type: "startup", stage: "interpreter-initializing" });
       try {
@@ -546,15 +565,23 @@ globalThis.createPvmRuntime = (endpoint) => {
       translated.sendInput(bytes);
       return;
     }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes[0] <= 7) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      check(
+        pvm.pvm_browser_send_input(
+          bytes[0],
+          bytes[1],
+          view.getUint16(2, true),
+          view.getUint16(4, true),
+        ),
+        "send PolkaVM browser input",
+      );
+      return;
+    }
+    stage(bytes);
     check(
-      pvm.pvm_browser_send_input(
-        bytes[0],
-        bytes[1],
-        view.getUint16(2, true),
-        view.getUint16(4, true),
-      ),
-      "send PolkaVM browser input",
+      pvm.pvm_browser_send_input_record(),
+      "send PolkaVM browser extended input",
     );
   }
 
@@ -604,7 +631,11 @@ globalThis.createPvmRuntime = (endpoint) => {
   }
 
   function sendGpuCapabilities(bytes) {
-    if (!running || bytes.byteLength < 56 || bytes.byteLength > 4096) {
+    if (bytes.byteLength < 56 || bytes.byteLength > 4096) {
+      throw new Error("invalid PolkaVM browser GPU capabilities");
+    }
+    if (!running || !pvm) {
+      pendingGpuCapabilities = bytes.slice();
       return;
     }
     if (translated) {
@@ -614,7 +645,7 @@ globalThis.createPvmRuntime = (endpoint) => {
     stage(bytes);
     check(
       pvm.pvm_browser_set_gpu_capabilities(),
-      "update PolkaVM browser GPU capabilities"
+      "update PolkaVM browser GPU capabilities",
     );
   }
 

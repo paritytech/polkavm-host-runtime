@@ -1,4 +1,4 @@
-* @paritytech/host-sdk-team
+* @replghost
 
-/rust/crates/pvm-gpu-wire/ @paritytech/host-sdk-team
-/docs/runtime/ @paritytech/host-sdk-team
+/rust/crates/pvm-gpu-wire/ @replghost
+/docs/runtime/ @replghost
