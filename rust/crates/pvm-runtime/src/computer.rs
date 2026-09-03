@@ -408,6 +408,10 @@ impl ComputerDevices {
         let Some(next) = handle.checked_add(1) else {
             return STATUS_LIMIT;
         };
+        // Keep the file handle space disjoint from socket handles.
+        if next >= FIRST_SOCKET_HANDLE {
+            return STATUS_LIMIT;
+        }
         self.next_handle = next;
         self.open_files.insert(
             handle,
@@ -734,9 +738,19 @@ impl ComputerRuntime {
         Ok(())
     }
 
-    /// Grants or revokes the outbound TCP capability.
+    /// Grants or revokes the outbound TCP capability. Revocation also
+    /// closes every socket opened while the capability was held.
     pub fn set_network_enabled(&mut self, enabled: bool) {
         self.vm.computer.network_enabled = enabled;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !enabled {
+            self.vm.computer.sockets.clear();
+        }
+    }
+
+    /// Returns whether the guest's terminal input stream has been closed.
+    pub fn terminal_input_closed(&self) -> bool {
+        self.vm.computer.tty_input_closed
     }
 
     /// Returns the current guest terminal mode flags.
@@ -770,6 +784,9 @@ pub const MAX_BACKGROUND_PROCESSES: usize = 4;
 /// bytes with it through the pipe hostcalls.
 struct BackgroundChild {
     pid: u32,
+    /// Stack depth of the spawning process; only that process may address
+    /// this child, and it is reaped when the owner departs.
+    owner: usize,
     runtime: ComputerRuntime,
     output: Vec<u8>,
     exit: Option<i32>,
@@ -789,6 +806,7 @@ pub struct ComputerSupervisor {
     background: Vec<BackgroundChild>,
     environment: Vec<(String, String)>,
     next_pid: u32,
+    pending_output: Vec<u8>,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeMap<String, Vec<u8>>,
     backend: polkavm::BackendKind,
@@ -823,6 +841,7 @@ impl ComputerSupervisor {
             stack: vec![root],
             background: Vec::new(),
             next_pid: 2,
+            pending_output: Vec::new(),
             environment,
             files: BTreeMap::new(),
             modified: BTreeMap::new(),
@@ -865,6 +884,9 @@ impl ComputerSupervisor {
         for process in &mut self.stack {
             process.set_terminal_size(columns, rows)?;
         }
+        for child in &mut self.background {
+            child.runtime.set_terminal_size(columns, rows)?;
+        }
         self.columns = columns;
         self.rows = rows;
         Ok(())
@@ -886,8 +908,18 @@ impl ComputerSupervisor {
         self.foreground().send_terminal_input(bytes)
     }
 
-    /// Drains ANSI output produced by the foreground process.
+    /// Returns remaining space in the foreground process's input queue.
+    pub fn terminal_input_space(&self) -> usize {
+        self.stack
+            .last()
+            .map_or(0, ComputerRuntime::terminal_input_space)
+    }
+    /// Drains ANSI output: first any output a departed child left behind,
+    /// then the foreground process's buffer.
     pub fn take_terminal_output(&mut self) -> Option<Vec<u8>> {
+        if !self.pending_output.is_empty() {
+            return Some(core::mem::take(&mut self.pending_output));
+        }
         self.foreground().take_terminal_output()
     }
 
@@ -903,10 +935,26 @@ impl ComputerSupervisor {
         core::mem::take(&mut self.modified).into_iter().collect()
     }
 
+    /// Exit status reported for a child that faulted (trap, gas, segfault).
+    const FAULTED_CHILD_STATUS: i32 = 139;
+
     /// Runs the foreground process until the system yields or the root exits.
+    ///
+    /// A fault in a child process (trap, out of gas) fails only that child:
+    /// it is discarded and its parent resumes with status 139. Only a root
+    /// fault propagates as an error.
     pub fn run(&mut self) -> Result<ComputerStatus> {
         loop {
-            let status = self.foreground().run()?;
+            let status = match self.foreground().run() {
+                Ok(status) => status,
+                Err(error) => {
+                    if self.stack.len() == 1 {
+                        return Err(error);
+                    }
+                    self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
+                    continue;
+                }
+            };
             self.collect_modified();
             match status {
                 ComputerStatus::Yielded => return Ok(ComputerStatus::Yielded),
@@ -933,18 +981,34 @@ impl ComputerSupervisor {
                     if self.stack.len() == 1 {
                         return Ok(ComputerStatus::Exited(code));
                     }
-                    self.stack.pop();
-                    let parent = self.foreground();
-                    parent.resolve_spawn(code.clamp(-128, 255));
-                    // The child may have changed shared files while the
-                    // parent held stale copies; refresh the parent's view.
-                    let files = self.files.clone();
-                    for (path, bytes) in files {
-                        self.foreground().mount_file(&path, bytes)?;
-                    }
+                    self.pop_foreground(code.clamp(0, 255))?;
                 }
             }
         }
+    }
+
+    /// Discards the foreground child: forwards its remaining terminal
+    /// output, reaps its orphaned background children, resolves the parent
+    /// with `status`, and rebases the shared `/home` view.
+    fn pop_foreground(&mut self, status: i32) -> Result<()> {
+        if let Some(mut child) = self.stack.pop() {
+            if let Some(bytes) = child.take_terminal_output() {
+                let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(self.pending_output.len());
+                self.pending_output
+                    .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            }
+        }
+        // Background children spawned by the departed process (or anything
+        // deeper) are unreachable now; reap them so their slots, memory,
+        // and sockets do not leak.
+        let depth = self.stack.len();
+        self.background.retain(|child| child.owner <= depth);
+        self.foreground().resolve_spawn(status);
+        let files = self.files.clone();
+        for (path, bytes) in files {
+            self.foreground().mount_file(&path, bytes)?;
+        }
+        Ok(())
     }
 
     /// Host-authority cancellation of the foreground process.
@@ -954,14 +1018,12 @@ impl ComputerSupervisor {
     pub fn terminate_foreground(&mut self) -> Result<ComputerStatus> {
         self.collect_modified();
         if self.stack.len() == 1 {
+            // Record the exit so subsequent run() calls stay terminated.
+            self.foreground().exit_status = Some(130);
+            self.background.clear();
             return Ok(ComputerStatus::Exited(130));
         }
-        self.stack.pop();
-        self.foreground().resolve_spawn(130);
-        let files = self.files.clone();
-        for (path, bytes) in files {
-            self.foreground().mount_file(&path, bytes)?;
-        }
+        self.pop_foreground(130)?;
         Ok(ComputerStatus::Yielded)
     }
 
@@ -1012,7 +1074,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 let child = &mut self.background[index];
-                if child.exit.is_some() {
+                if child.exit.is_some() || child.runtime.terminal_input_closed() {
                     self.foreground().resolve_spawn(STATUS_INVALID);
                     return Ok(());
                 }
@@ -1060,8 +1122,13 @@ impl ComputerSupervisor {
         Ok(())
     }
 
+    /// Resolves a pid to a background slot, enforcing ownership: only the
+    /// process that spawned a child may address it.
     fn background_index(&self, pid: u32) -> Option<usize> {
-        self.background.iter().position(|child| child.pid == pid)
+        let depth = self.stack.len();
+        self.background
+            .iter()
+            .position(|child| child.pid == pid && child.owner == depth)
     }
 
     /// Runs a background child until it exits or blocks awaiting input.
@@ -1075,7 +1142,15 @@ impl ComputerSupervisor {
             if child.exit.is_some() {
                 return Ok(());
             }
-            let status = child.runtime.run()?;
+            let status = match child.runtime.run() {
+                Ok(status) => status,
+                Err(_) => {
+                    // A faulted piped child fails alone; the parent observes
+                    // the fault status through wait.
+                    child.exit = Some(Self::FAULTED_CHILD_STATUS);
+                    return Ok(());
+                }
+            };
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
                 child
@@ -1089,7 +1164,7 @@ impl ComputerSupervisor {
             let child = &mut self.background[index];
             match status {
                 ComputerStatus::Exited(code) => {
-                    child.exit = Some(code.clamp(-128, 255));
+                    child.exit = Some(code.clamp(0, 255));
                     return Ok(());
                 }
                 ComputerStatus::Yielded => {
@@ -1130,6 +1205,7 @@ impl ComputerSupervisor {
         self.next_pid += 1;
         self.background.push(BackgroundChild {
             pid,
+            owner: self.stack.len(),
             runtime: child,
             output: Vec::new(),
             exit: None,

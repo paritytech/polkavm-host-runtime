@@ -556,6 +556,26 @@ explicitly deferred until this direct editor slice works.
 - Surface protocol and text/IME input.
 - Package identity, discovery, and child capability attenuation.
 
+## Known limitations (reviewed, deliberately deferred)
+
+From the pre-publication security review of the experimental runtime:
+
+- Host-side work is not metered by guest gas: every process transition clones
+  the shared `/home` store (up to 64 MiB), and one pipe hostcall can drive a
+  background child through up to 1,024 full gas slices. Needs copy-on-write
+  file sharing and a shared drive budget.
+- A granted network capability has no destination policy: loopback,
+  link-local, and private ranges are reachable, and resolution/connect block
+  the runtime thread (up to 5 s). Needs a Host-supplied address policy and
+  async connect before any untrusted deployment.
+- `fs_list`/`core_args` "required size" returns overlap the status-code
+  space for records under 7 bytes.
+- Cancelling a process persists its partial writes; whether cancellation
+  should roll back dirty buffers is an open design call.
+- Out-of-range pointer registers terminate the guest rather than returning
+  a status; safe, but a child fault surfaces as status 139 rather than a
+  distinguishable error.
+
 ## References
 
 - WASI: <https://wasi.dev/>

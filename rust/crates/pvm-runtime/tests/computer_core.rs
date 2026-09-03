@@ -130,4 +130,6 @@ fn supervisor_terminates_root_as_interrupted() {
         ComputerStatus::Exited(130)
     );
     assert!(supervisor.take_modified_files().is_empty());
+    // Termination is recorded: the computer stays exited on later runs.
+    assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(130));
 }
