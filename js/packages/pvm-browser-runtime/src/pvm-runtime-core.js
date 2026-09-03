@@ -145,6 +145,23 @@ globalThis.createPvmRuntime = (endpoint) => {
     postMessage({ type: "ui-semantics", bytes }, [bytes.buffer]);
   }
 
+  function drainUiOutput() {
+    if (!pvm.pvm_browser_take_ui_output?.()) {
+      return;
+    }
+    const length = pvm.pvm_browser_ui_output_length();
+    const bytes = new Uint8Array(
+      pvm.memory.buffer,
+      pvm.pvm_browser_ui_output_pointer(),
+      length,
+    ).slice();
+    const output = globalThis.decodePvmUiOutput?.(bytes);
+    if (output == null) {
+      throw new Error("interpreter emitted invalid UI output");
+    }
+    postMessage({ type: "ui-output", output });
+  }
+
   function drainGpuBatches() {
     while (pvm.pvm_browser_take_gpu_batch?.()) {
       const length = pvm.pvm_browser_gpu_batch_length();
@@ -228,6 +245,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         drainFrame();
         drainTri2d();
         drainUiSemantics();
+        drainUiOutput();
         drainGpuBatches();
         drainTruapiRequests();
         drainAudio();
@@ -532,6 +550,7 @@ globalThis.createPvmRuntime = (endpoint) => {
       }
       postMessage({ type: "startup", stage: "interpreter-initialized" });
       drainTri2d();
+      drainUiOutput();
       drainGpuBatches();
       drainTruapiRequests();
       drainLogs();

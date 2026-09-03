@@ -6,6 +6,7 @@ FIXTURES="$ROOT/rust/crates/pvm-runtime/tests/fixtures"
 TOOLCHAIN="${PVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
   "polkavm-app-v1/truapi-roundtrip pvm_truapi_roundtrip truapi-roundtrip.polkavm"
+  "polkavm-app-v1/ui-output pvm_ui_output ui-output.polkavm"
   "polkadot-host-computer-0.1/core-context pvm_computer_core_context computer-core-context.polkavm"
   "polkadot-host-computer-0.1/tty-fs-roundtrip pvm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
   "polkadot-host-computer-0.1/pipe-filter pvm_computer_pipe_filter computer-pipe-filter.polkavm"

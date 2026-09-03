@@ -970,6 +970,7 @@ dependencies = [
  "pollster",
  "pvm-gpu-wire",
  "pvm-motion-wire",
+ "pvm-ui-wire",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -986,6 +987,10 @@ version = "0.1.9"
 dependencies = [
  "sha2",
 ]
+
+[[package]]
+name = "pvm-ui-wire"
+version = "0.1.9"
 
 [[package]]
 name = "quote"

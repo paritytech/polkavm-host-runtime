@@ -5,7 +5,8 @@
 use crate::corevm::{Interruption, Vm};
 use crate::{
     AudioChunk, ComputerContext, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile,
-    Runtime, TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
+    Runtime, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
+    MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -248,6 +249,13 @@ impl ApplicationRuntime {
     pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_ui_semantics(),
+            Self::CoreVm(_) => None,
+        }
+    }
+
+    pub fn take_ui_output(&mut self) -> Option<UiOutputFrame> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_ui_output(),
             Self::CoreVm(_) => None,
         }
     }

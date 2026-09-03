@@ -4,7 +4,8 @@
 
 use crate::{
     ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
+    PresentationProfile, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
+    INPUT_EVENT_BYTES,
 };
 #[cfg(feature = "native-gpu")]
 use crate::{NativeGpuFrame, NativeGpuRenderer};
@@ -117,6 +118,17 @@ pub struct NativePvmUiSemanticsFrame {
 
 impl From<UiSemanticsFrame> for NativePvmUiSemanticsFrame {
     fn from(frame: UiSemanticsFrame) -> Self {
+        Self { bytes: frame.bytes }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct NativePvmUiOutputFrame {
+    pub bytes: Vec<u8>,
+}
+
+impl From<UiOutputFrame> for NativePvmUiOutputFrame {
+    fn from(frame: UiOutputFrame) -> Self {
         Self { bytes: frame.bytes }
     }
 }
@@ -444,6 +456,10 @@ impl NativePvmRuntime {
 
     pub fn take_ui_semantics(&self) -> Result<Option<NativePvmUiSemanticsFrame>, NativePvmError> {
         Ok(self.lock()?.take_ui_semantics().map(Into::into))
+    }
+
+    pub fn take_ui_output(&self) -> Result<Option<NativePvmUiOutputFrame>, NativePvmError> {
+        Ok(self.lock()?.take_ui_output().map(Into::into))
     }
 
     pub fn take_log(&self) -> Result<Option<String>, NativePvmError> {
