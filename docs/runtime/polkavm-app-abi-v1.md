@@ -25,7 +25,7 @@ the Host imports available to those applications, guest-memory rules, common
 resource bounds, and failure behavior.
 
 Graphics command payloads are defined by the separately versioned Framebuffer,
-Tri2D, and WebGPU Raster profile contracts. The `_pvm_start` CoreVM
+[Tri2D](tri2d-v1.md), and WebGPU Raster profile contracts. The `_pvm_start` CoreVM
 compatibility path is outside this ABI and must be specified separately before
 it is advertised as a portable Product runtime.
 
@@ -125,8 +125,8 @@ Return values:
 3  Tri2D profile unavailable for this execution
 ```
 
-The Tri2D profile contract defines the command stream and retained-resource
-semantics.
+The [Tri2D profile contract](tri2d-v1.md) defines the command stream and
+retained-resource semantics.
 
 ### WebGPU Raster capabilities
 

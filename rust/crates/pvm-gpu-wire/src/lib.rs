@@ -4,6 +4,11 @@
 
 #![no_std]
 
+#[cfg(feature = "tri2d-validation")]
+extern crate std;
+
+pub mod tri2d;
+
 use core::fmt;
 
 pub const GPU_WIRE_MAGIC: [u8; 4] = *b"EPG1";
