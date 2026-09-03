@@ -21,7 +21,7 @@ pub fn browser_assets() -> &'static [BrowserAsset] {
     &ASSETS
 }
 
-const ASSETS: [BrowserAsset; 7] = [
+const ASSETS: [BrowserAsset; 8] = [
     BrowserAsset {
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
@@ -59,10 +59,16 @@ const ASSETS: [BrowserAsset; 7] = [
         sha256: "fa600faff369b09eae5a50dd4b08445b7762d89d6db269b70230ad5a8bf67951",
     },
     BrowserAsset {
+        path: "polkavm-computer.js",
+        content_type: "text/javascript",
+        bytes: include_bytes!("../assets/polkavm-computer.js"),
+        sha256: "4bc365bb0f8db75b67c567c0977968e1ec9ae5caf21b9c169beb69381e342449",
+    },
+    BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "aa04767354482f9ed99d405c5242ef07b10e5b735be3f4b598b4416864bc3912",
+        sha256: "a14b2ecabadf40e7769192702c6ddb70d9260ce899673cf8cade9be9cf524dfc",
     },
 ];
 

@@ -96,6 +96,10 @@ await copyFile(
   resolve(source, "polkavm-wasm-worker-entry.js"),
   resolve(dist, "polkavm-wasm-worker-entry.js"),
 );
+await copyFile(
+  resolve(source, "polkavm-computer.js"),
+  resolve(dist, "polkavm-computer.js"),
+);
 await writeFile(
   resolve(dist, "polkavm-worker.js"),
   Buffer.concat([
@@ -114,6 +118,7 @@ const files = [
   "polkavm-wasm-translated.js",
   "polkavm-runtime-core.js",
   "polkavm-wasm-worker-entry.js",
+  "polkavm-computer.js",
 ];
 const sums = [];
 for (const file of files) {

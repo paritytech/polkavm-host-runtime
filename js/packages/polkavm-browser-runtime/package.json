@@ -20,6 +20,7 @@
     "./translator": "./dist/polkavm-wasm-translated.js",
     "./runtime-core": "./dist/polkavm-runtime-core.js",
     "./gpu-worker": "./dist/polkavm-gpu-worker.js",
+    "./computer": "./dist/polkavm-computer.js",
     "./checksums": "./dist/SHA256SUMS"
   },
   "engines": {
