@@ -20,6 +20,7 @@
     "./translator": "./dist/pvm-wasm-translated.js",
     "./runtime-core": "./dist/pvm-runtime-core.js",
     "./gpu-worker": "./dist/pvm-gpu-worker.js",
+    "./computer": "./dist/pvm-computer.js",
     "./checksums": "./dist/SHA256SUMS"
   },
   "engines": {
