@@ -5,6 +5,7 @@
 
 #![allow(non_upper_case_globals)]
 
+use crate::computer::ComputerContext;
 use polkavm::{
     Config, Engine, GasMeteringKind, InterruptKind, MemoryAccessError, Module, ModuleConfig,
     ProgramBlob, ProgramCounter, RawInstance, Reg,
@@ -74,6 +75,10 @@ pub struct Vm {
     truapi_request_bytes: usize,
     truapi_responses: VecDeque<Vec<u8>>,
     truapi_response_bytes: usize,
+    core_arguments: Vec<u8>,
+    core_environment: Vec<u8>,
+    pub(crate) computer: crate::computer::ComputerDevices,
+    computer_calls: BTreeMap<u32, ComputerCall>,
 
     import_syscall: Option<u32>,
     import_set_palette: Option<u32>,
@@ -90,6 +95,9 @@ pub struct Vm {
     import_truapi_send: Option<u32>,
     import_motion_read: Option<u32>,
     import_truapi_poll: Option<u32>,
+    import_core_args: Option<u32>,
+    import_core_environment: Option<u32>,
+    import_core_exit: Option<u32>,
 }
 
 #[derive(Copy, Clone)]
@@ -97,6 +105,52 @@ pub struct Vm {
 struct InputEvent {
     key: u8,
     value: u8,
+}
+
+#[derive(Clone, Copy)]
+enum ComputerCall {
+    Yield,
+    TtyCurrent,
+    TtyRead,
+    TtyWrite,
+    TtyGetSize,
+    TtySetMode,
+    FsOpen,
+    FsRead,
+    FsWrite,
+    FsSeek,
+    FsTruncate,
+    FsStat,
+    FsSync,
+    FsClose,
+    FsList,
+    ProcessRun,
+}
+
+fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
+    Some(match name {
+        b"polkadot_host_0_1_core_yield" => ComputerCall::Yield,
+        b"polkadot_host_0_1_tty_current" => ComputerCall::TtyCurrent,
+        b"polkadot_host_0_1_tty_read" => ComputerCall::TtyRead,
+        b"polkadot_host_0_1_tty_write" => ComputerCall::TtyWrite,
+        b"polkadot_host_0_1_tty_get_size" => ComputerCall::TtyGetSize,
+        b"polkadot_host_0_1_tty_set_mode" => ComputerCall::TtySetMode,
+        b"polkadot_host_0_1_fs_open" => ComputerCall::FsOpen,
+        b"polkadot_host_0_1_fs_read" => ComputerCall::FsRead,
+        b"polkadot_host_0_1_fs_write" => ComputerCall::FsWrite,
+        b"polkadot_host_0_1_fs_seek" => ComputerCall::FsSeek,
+        b"polkadot_host_0_1_fs_truncate" => ComputerCall::FsTruncate,
+        b"polkadot_host_0_1_fs_stat" => ComputerCall::FsStat,
+        b"polkadot_host_0_1_fs_sync" => ComputerCall::FsSync,
+        b"polkadot_host_0_1_fs_close" => ComputerCall::FsClose,
+        b"polkadot_host_0_1_fs_list" => ComputerCall::FsList,
+        b"polkadot_host_0_1_process_run" => ComputerCall::ProcessRun,
+        _ => return None,
+    })
+}
+
+fn guest_pointer(value: u64, label: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{label} is out of range"))
 }
 
 const SYS_read: u64 = 63;
@@ -203,9 +257,34 @@ fn input_destination(address: u64, event_offset: usize) -> Result<u32, String> {
         .ok_or_else(|| "input address is out of range".to_owned())
 }
 
+fn write_core_record(
+    instance: &mut RawInstance,
+    pointer: u64,
+    capacity: u64,
+    record: &[u8],
+) -> Result<u64, String> {
+    let required = u32::try_from(record.len())
+        .map_err(|_| "computer context record length overflow".to_owned())?;
+    if capacity < u64::from(required) {
+        let required = i32::try_from(required)
+            .map_err(|_| "computer context record length overflow".to_owned())?;
+        return Ok(i64::from(-required) as u64);
+    }
+    let pointer = u32::try_from(pointer)
+        .map_err(|_| "computer context destination is out of range".to_owned())?;
+    instance
+        .write_memory(pointer, record)
+        .map_err(|error| error.to_string())?;
+    Ok(u64::from(required))
+}
+
 pub enum Interruption {
-    Exit,
+    Exit(i32),
     Yield,
+    ProcessRun {
+        package: String,
+        arguments: Vec<String>,
+    },
     SetPalette {
         palette: Vec<u8>,
     },
@@ -267,6 +346,10 @@ impl Vm {
         let mut import_truapi_send = None;
         let mut import_truapi_poll = None;
         let mut import_motion_read = None;
+        let mut import_core_args = None;
+        let mut import_core_environment = None;
+        let mut import_core_exit = None;
+        let mut computer_calls = BTreeMap::new();
 
         for (import_index, import) in module.imports().into_iter().enumerate() {
             let Some(import) = import else {
@@ -290,7 +373,17 @@ impl Vm {
                 b"host_truapi_send" => import_truapi_send = Some(import_index),
                 b"host_truapi_poll" => import_truapi_poll = Some(import_index),
                 b"host_motion_read" => import_motion_read = Some(import_index),
-                _ => return Err(format!("unsupported import: {}", import).into()),
+                b"polkadot_host_0_1_core_args" => import_core_args = Some(import_index),
+                b"polkadot_host_0_1_core_environment" => {
+                    import_core_environment = Some(import_index)
+                }
+                b"polkadot_host_0_1_core_exit" => import_core_exit = Some(import_index),
+                name => match computer_call_for(name) {
+                    Some(call) => {
+                        computer_calls.insert(import_index, call);
+                    }
+                    None => return Err(format!("unsupported import: {}", import).into()),
+                },
             }
         }
 
@@ -314,6 +407,10 @@ impl Vm {
             truapi_request_bytes: 0,
             truapi_responses: VecDeque::new(),
             truapi_response_bytes: 0,
+            core_arguments: Vec::new(),
+            core_environment: Vec::new(),
+            computer: crate::computer::ComputerDevices::new(),
+            computer_calls,
             import_syscall,
             import_set_palette,
             import_display,
@@ -329,6 +426,9 @@ impl Vm {
             import_truapi_send,
             import_truapi_poll,
             import_motion_read,
+            import_core_args,
+            import_core_environment,
+            import_core_exit,
         })
     }
 
@@ -574,15 +674,15 @@ impl Vm {
     }
 
     #[allow(non_upper_case_globals)]
-    pub fn setup<'a, I>(&mut self, argv: I) -> Result<(), String>
-    where
-        I: IntoIterator<Item = &'a str>,
-        <I as IntoIterator>::IntoIter: ExactSizeIterator,
-    {
-        let argv = argv.into_iter();
-        let argc = argv.len() as u64;
-        let envp: &[&str] = &[];
-        let envp_len = envp.len() as u64;
+    pub fn setup(&mut self, context: ComputerContext) -> Result<(), String> {
+        let ComputerContext {
+            arguments,
+            environment,
+            encoded_arguments,
+            encoded_environment,
+        } = context;
+        let argc = arguments.len() as u64;
+        let envp_len = environment.len() as u64;
         let auxv: &[(u64, u64)] = &[(AT_PAGESZ, 4096)];
         let auxv_len = auxv.len() as u64;
 
@@ -595,17 +695,21 @@ impl Vm {
         self.instance.write_u64(p as u32, argc)?;
         p += 8;
 
-        for arg in argv {
-            sp -= arg.len() as u64 + 1;
-            self.instance.write_memory(sp as u32, arg.as_bytes())?;
+        for argument in &arguments {
+            sp -= argument.len() as u64 + 1;
+            self.instance.write_memory(sp as u32, argument.as_bytes())?;
             self.instance.write_u64(p as u32, sp)?;
             p += 8;
         }
         p += 8; // Null pointer.
 
-        for arg in envp {
-            sp -= arg.len() as u64 + 1;
-            self.instance.write_memory(sp as u32, arg.as_bytes())?;
+        for (key, value) in &environment {
+            sp -= key.len() as u64 + value.len() as u64 + 2;
+            self.instance.write_memory(sp as u32, key.as_bytes())?;
+            self.instance
+                .write_memory((sp + key.len() as u64) as u32, b"=")?;
+            self.instance
+                .write_memory((sp + key.len() as u64 + 1) as u32, value.as_bytes())?;
             self.instance.write_u64(p as u32, sp)?;
             p += 8;
         }
@@ -618,6 +722,8 @@ impl Vm {
             p += 8;
         }
 
+        self.core_arguments = encoded_arguments;
+        self.core_environment = encoded_environment;
         self.instance.set_reg(Reg::SP, sp);
         self.instance.set_reg(Reg::A0, address_init);
         self.instance.set_reg(Reg::RA, polkavm::RETURN_TO_HOST);
@@ -629,6 +735,36 @@ impl Vm {
         'outer_loop: loop {
             #[allow(clippy::redundant_guards)] // Disable buggy lint.
             match self.instance.run()? {
+                InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_core_args => {
+                    let pointer = self.instance.reg(Reg::A0);
+                    let capacity = self.instance.reg(Reg::A1);
+                    let result = write_core_record(
+                        &mut self.instance,
+                        pointer,
+                        capacity,
+                        &self.core_arguments,
+                    )?;
+                    self.instance.set_reg(Reg::A0, result);
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall)
+                    if Some(hostcall) == self.import_core_environment =>
+                {
+                    let pointer = self.instance.reg(Reg::A0);
+                    let capacity = self.instance.reg(Reg::A1);
+                    let result = write_core_record(
+                        &mut self.instance,
+                        pointer,
+                        capacity,
+                        &self.core_environment,
+                    )?;
+                    self.instance.set_reg(Reg::A0, result);
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_core_exit => {
+                    let status = self.instance.reg(Reg::A0) as u32 as i32;
+                    return Ok(Interruption::Exit(status));
+                }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_set_palette => {
                     let address = self.instance.reg(Reg::A0);
                     log::debug!("Set palette called: 0x{:x}", address);
@@ -962,12 +1098,10 @@ impl Vm {
                             continue;
                         }
                         SYS_exit => {
-                            log::info!("Exit called: status={}", a1);
-                            if a1 == 0 {
-                                return Ok(Interruption::Exit);
-                            } else {
-                                return Err(format!("exit called with status: {a1}"));
-                            }
+                            let status = i32::try_from(a1)
+                                .map_err(|_| format!("exit status is out of range: {a1}"))?;
+                            log::info!("Exit called: status={status}");
+                            return Ok(Interruption::Exit(status));
                         }
                         SYS_openat => {
                             if a1 == AT_FDCWD {
@@ -999,10 +1133,16 @@ impl Vm {
                     self.instance.set_reg(Reg::A0, errno(ENOSYS));
                 }
                 InterruptKind::Finished => {
-                    return Ok(Interruption::Exit);
+                    return Ok(Interruption::Exit(0));
                 }
                 InterruptKind::Ecalli(hostcall) => {
-                    return Err(format!("unsupported host call: {hostcall}"));
+                    let Some(call) = self.computer_calls.get(&hostcall).copied() else {
+                        return Err(format!("unsupported host call: {hostcall}"));
+                    };
+                    if let Some(interruption) = self.handle_computer_call(call)? {
+                        return Ok(interruption);
+                    }
+                    continue;
                 }
                 InterruptKind::Trap => {
                     return Err(format!(
@@ -1019,6 +1159,247 @@ impl Vm {
                 InterruptKind::Step => return Err("unexpected guest step".into()),
             }
         }
+    }
+
+    fn handle_computer_call(&mut self, call: ComputerCall) -> Result<Option<Interruption>, String> {
+        const MAX_TTY_TRANSFER: usize = 64 * 1024;
+        const MAX_FS_TRANSFER: usize = 1024 * 1024;
+
+        let a0 = self.instance.reg(Reg::A0);
+        let a1 = self.instance.reg(Reg::A1);
+        let a2 = self.instance.reg(Reg::A2);
+        let status = |value: i32| i64::from(value) as u64;
+
+        match call {
+            ComputerCall::Yield => return Ok(Some(Interruption::Yield)),
+            ComputerCall::TtyCurrent => {
+                self.instance
+                    .set_reg(Reg::A0, u64::from(crate::computer::COMPUTER_TTY_HANDLE));
+            }
+            ComputerCall::TtyRead => {
+                let handle = a0 as u32;
+                let destination = guest_pointer(a1, "tty read destination")?;
+                let capacity = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_TTY_TRANSFER);
+                let result = if capacity == 0 {
+                    crate::computer::STATUS_INVALID
+                } else {
+                    let mut buffer = vec![0u8; capacity];
+                    let result = self.computer.tty_read_into(handle, &mut buffer);
+                    if result > 0 {
+                        self.instance
+                            .write_memory(destination, &buffer[..result as usize])?;
+                    }
+                    result
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::TtyWrite => {
+                let handle = a0 as u32;
+                let source = guest_pointer(a1, "tty write source")?;
+                let length = usize::try_from(a2).unwrap_or(usize::MAX);
+                if length > MAX_TTY_TRANSFER {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_LIMIT));
+                } else {
+                    let bytes = self.instance.read_memory(source, length as u32)?;
+                    let result = self.computer.tty_write(handle, &bytes);
+                    self.instance.set_reg(Reg::A0, status(result));
+                }
+            }
+            ComputerCall::TtyGetSize => {
+                let handle = a0 as u32;
+                let record = guest_pointer(a1, "tty size record")?;
+                if handle != crate::computer::COMPUTER_TTY_HANDLE {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_BAD_HANDLE));
+                } else {
+                    let (columns, rows) = self.computer.terminal_size();
+                    let mut bytes = [0u8; 8];
+                    bytes[..4].copy_from_slice(&columns.to_le_bytes());
+                    bytes[4..].copy_from_slice(&rows.to_le_bytes());
+                    self.instance.write_memory(record, &bytes)?;
+                    self.instance.set_reg(Reg::A0, 0);
+                }
+            }
+            ComputerCall::TtySetMode => {
+                let result = self.computer.tty_set_mode(a0 as u32, a1 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsOpen => {
+                let path = self.read_computer_path(a0, a1)?;
+                let result = match path {
+                    Some(path) => self.computer.fs_open(&path, a2 as u32),
+                    None => crate::computer::STATUS_INVALID,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsRead => {
+                let handle = a0 as u32;
+                let destination = guest_pointer(a1, "file read destination")?;
+                let capacity = usize::try_from(a2)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_FS_TRANSFER);
+                let mut buffer = vec![0u8; capacity];
+                let result = self.computer.fs_read(handle, &mut buffer);
+                if result > 0 {
+                    self.instance
+                        .write_memory(destination, &buffer[..result as usize])?;
+                }
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsWrite => {
+                let handle = a0 as u32;
+                let source = guest_pointer(a1, "file write source")?;
+                let length = usize::try_from(a2).unwrap_or(usize::MAX);
+                if length > MAX_FS_TRANSFER {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_LIMIT));
+                } else {
+                    let bytes = self.instance.read_memory(source, length as u32)?;
+                    let result = self.computer.fs_write(handle, &bytes);
+                    self.instance.set_reg(Reg::A0, status(result));
+                }
+            }
+            ComputerCall::FsSeek => {
+                let result = self
+                    .computer
+                    .fs_seek(a0 as u32, a1 as u32 as i32, a2 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsTruncate => {
+                let result = self.computer.fs_truncate(a0 as u32, a1 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsStat => {
+                let path = self.read_computer_path(a0, a1)?;
+                let record = guest_pointer(a2, "stat record")?;
+                let result = match path.as_deref().and_then(|path| self.computer.fs_stat(path)) {
+                    Some(size) => {
+                        self.instance.write_memory(record, &size.to_le_bytes())?;
+                        0
+                    }
+                    None => crate::computer::STATUS_NOT_FOUND,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsSync => {
+                let result = self.computer.fs_sync(a0 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsClose => {
+                let result = self.computer.fs_close(a0 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsList => {
+                let destination = guest_pointer(a0, "list destination")?;
+                let capacity = usize::try_from(a1)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_FS_TRANSFER);
+                let record = self.computer.fs_list_record();
+                if record.len() > capacity {
+                    let required = i32::try_from(record.len())
+                        .map_err(|_| "listing record length overflow".to_owned())?;
+                    self.instance.set_reg(Reg::A0, status(-required));
+                } else {
+                    self.instance.write_memory(destination, &record)?;
+                    self.instance.set_reg(Reg::A0, record.len() as u64);
+                }
+            }
+            ComputerCall::ProcessRun => {
+                let a3 = self.instance.reg(Reg::A3);
+                let Some(package) = self.read_computer_string(a0, a1, 64)? else {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_INVALID));
+                    return Ok(None);
+                };
+                let Some(arguments) = self.read_string_record(a2, a3)? else {
+                    self.instance
+                        .set_reg(Reg::A0, status(crate::computer::STATUS_INVALID));
+                    return Ok(None);
+                };
+                return Ok(Some(Interruption::ProcessRun { package, arguments }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_computer_string(
+        &mut self,
+        pointer: u64,
+        length: u64,
+        maximum: usize,
+    ) -> Result<Option<String>, String> {
+        let length = usize::try_from(length).unwrap_or(usize::MAX);
+        if length == 0 || length > maximum {
+            return Ok(None);
+        }
+        let pointer = guest_pointer(pointer, "string pointer")?;
+        let bytes = self.instance.read_memory(pointer, length as u32)?;
+        Ok(String::from_utf8(bytes).ok())
+    }
+
+    fn read_string_record(
+        &mut self,
+        pointer: u64,
+        length: u64,
+    ) -> Result<Option<Vec<String>>, String> {
+        let length = usize::try_from(length).unwrap_or(usize::MAX);
+        if length > 4 * 1024 {
+            return Ok(None);
+        }
+        if length == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let pointer = guest_pointer(pointer, "record pointer")?;
+        let bytes = self.instance.read_memory(pointer, length as u32)?;
+        if bytes.len() < 4 {
+            return Ok(None);
+        }
+        let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if count > 16 {
+            return Ok(None);
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut cursor = 4usize;
+        for _ in 0..count {
+            let Some(end) = cursor.checked_add(4) else {
+                return Ok(None);
+            };
+            let Some(header) = bytes.get(cursor..end) else {
+                return Ok(None);
+            };
+            let entry_length =
+                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            cursor = end;
+            let Some(entry_end) = cursor.checked_add(entry_length) else {
+                return Ok(None);
+            };
+            let Some(entry) = bytes.get(cursor..entry_end) else {
+                return Ok(None);
+            };
+            let Ok(entry) = String::from_utf8(entry.to_vec()) else {
+                return Ok(None);
+            };
+            entries.push(entry);
+            cursor = entry_end;
+        }
+        Ok(Some(entries))
+    }
+
+    /// Completes a pending `process_run` hostcall with the child's status.
+    pub(crate) fn resolve_process_run(&mut self, result: i32) {
+        self.instance.set_reg(Reg::A0, i64::from(result) as u64);
+    }
+    fn read_computer_path(&mut self, pointer: u64, length: u64) -> Result<Option<String>, String> {
+        let length = usize::try_from(length).unwrap_or(usize::MAX);
+        if length == 0 || length > crate::computer::MAX_COMPUTER_PATH_BYTES {
+            return Ok(None);
+        }
+        let pointer = guest_pointer(pointer, "path pointer")?;
+        let bytes = self.instance.read_memory(pointer, length as u32)?;
+        Ok(String::from_utf8(bytes).ok())
     }
 }
 

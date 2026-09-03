@@ -4,8 +4,8 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile, Runtime,
-    TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
+    AudioChunk, ComputerContext, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile,
+    Runtime, TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -86,7 +86,8 @@ impl ApplicationRuntime {
         for (path, bytes) in assets {
             vm.register_file(&path, bytes);
         }
-        vm.setup(["./quake"]).map_err(|error| anyhow!(error))?;
+        let context = ComputerContext::new(vec!["./quake".into()], Vec::new())?;
+        vm.setup(context).map_err(|error| anyhow!(error))?;
         Ok(Self::CoreVm(CoreVmRuntime {
             vm,
             frame: None,
@@ -285,9 +286,17 @@ impl CoreVmRuntime {
         self.vm.set_gas(self.max_gas_per_update);
         for _ in 0..MAX_INTERRUPTS_PER_UPDATE {
             match self.vm.run().map_err(|error| anyhow!(error))? {
-                Interruption::Exit => {
+                Interruption::Exit(status) => {
+                    if status != 0 {
+                        return Err(anyhow!("exit called with status: {status}"));
+                    }
                     self.exited = true;
                     return Ok(());
+                }
+                Interruption::ProcessRun { package, .. } => {
+                    return Err(anyhow!(
+                        "CoreVM guest requested process spawn of {package:?}"
+                    ));
                 }
                 Interruption::Yield => return Ok(()),
                 Interruption::SetPalette { palette } => {

@@ -2,9 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GUEST="$ROOT/conformance/runtime/polkavm-app-v1/truapi-roundtrip"
-FIXTURE="$ROOT/rust/crates/pvm-runtime/tests/fixtures/truapi-roundtrip.polkavm"
+FIXTURES="$ROOT/rust/crates/pvm-runtime/tests/fixtures"
 TOOLCHAIN="${PVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
+GUESTS=(
+  "polkavm-app-v1/truapi-roundtrip pvm_truapi_roundtrip truapi-roundtrip.polkavm"
+  "polkadot-host-computer-0.1/core-context pvm_computer_core_context computer-core-context.polkavm"
+  "polkadot-host-computer-0.1/tty-fs-roundtrip pvm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
+)
 
 for tool in cargo polkatool rustup; do
   command -v "$tool" >/dev/null 2>&1 || {
@@ -20,17 +24,20 @@ TARGET_NAME="$(basename "$TARGET_JSON" .json)"
 TARGET_DIR="$(mktemp -d)"
 trap 'rm -rf "$TARGET_DIR"' EXIT
 
-cargo +"$TOOLCHAIN" build \
-  -Z build-std=core \
-  --locked \
-  --manifest-path "$GUEST/Cargo.toml" \
-  --target-dir "$TARGET_DIR" \
-  --target "$TARGET_JSON" \
-  --release
+for guest in "${GUESTS[@]}"; do
+  read -r directory artifact fixture <<<"$guest"
+  cargo +"$TOOLCHAIN" build \
+    -Z build-std=core \
+    --locked \
+    --manifest-path "$ROOT/conformance/runtime/$directory/Cargo.toml" \
+    --target-dir "$TARGET_DIR" \
+    --target "$TARGET_JSON" \
+    --release
 
-polkatool link \
-  "$TARGET_DIR/$TARGET_NAME/release/pvm_truapi_roundtrip.elf" \
-  -o "$TARGET_DIR/truapi-roundtrip.polkavm"
+  polkatool link \
+    "$TARGET_DIR/$TARGET_NAME/release/$artifact.elf" \
+    -o "$TARGET_DIR/$fixture"
 
-cmp "$FIXTURE" "$TARGET_DIR/truapi-roundtrip.polkavm"
-printf 'Verified %s\n' "$FIXTURE"
+  cmp "$FIXTURES/$fixture" "$TARGET_DIR/$fixture"
+  printf 'Verified %s\n' "$FIXTURES/$fixture"
+done
