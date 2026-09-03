@@ -46,6 +46,7 @@ if (process.env.PVM_RUNTIME_WASM === undefined) {
           process.env.RUSTFLAGS,
           `--remap-path-prefix=${repositoryRoot}=/workspace`,
           `--remap-path-prefix=${process.env.CARGO_HOME ?? resolve(homedir(), ".cargo")}=/cargo`,
+          `--remap-path-prefix=${process.env.RUSTUP_HOME ?? resolve(homedir(), ".rustup")}=/rustup`,
         ]
           .filter(Boolean)
           .join(" "),
