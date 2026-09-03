@@ -378,12 +378,23 @@ Status: neatvi (ISC, vendored unmodified in the application repository as
 layer grew `poll`, `getchar`, `memchr`, `getenv`, file-descriptor reads, and
 ICRNL emulation along the way.
 
-Vim (feature-tiny, patch 9.2.1036) has been assessed against the same
-freestanding toolchain: all 129 sources compile with zero source edits, and
-link-level analysis finds 46 libc gaps — roughly 30 one-line stubs plus one
-real work item (a small in-memory FILE layer over `fs_*`). **No blocker
-exists for a terminal-only tiny Vim.** Full matrix:
-[vim-tiny-compatibility.md](vim-tiny-compatibility.md).
+Vim (feature-tiny, patch 9.2.1036) **runs**: vendored unmodified as
+`apps/vim-tty`, built from the assessment's config.h and stub headers, with
+~30 trivial glue stubs and the pvm-posix FILE layer. The phase-2 success
+criterion holds end to end — launch, edit a persistent file, `:wq`, relaunch,
+see the changes — both standalone and as a sandboxed child of the shell.
+`:!` filters remain stubbed pending a `mch_call_shell` mapping onto the pipe
+capability. Full matrix: [vim-tiny-compatibility.md](vim-tiny-compatibility.md).
+
+SSH (phase 4) is assessed: Dropbear's dbclient plus its bundled crypto stack
+compiles cleanly against the same toolchain; the single missing host
+capability is entropy (`core_random`). Matrix and vertical-slice plan:
+[ssh-client-compatibility.md](ssh-client-compatibility.md).
+
+Presentation: the `computer-serve` Host mode (application repository: Epoca)
+renders the supervisor's ANSI stream host-side through the shared terminal
+emulator and speaks the framebuffer-app wire protocol, so browser surfaces
+can present the computer without new message types.
 
 ### Targeted POSIX compatibility
 

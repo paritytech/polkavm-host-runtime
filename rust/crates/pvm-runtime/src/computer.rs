@@ -848,6 +848,11 @@ impl ComputerSupervisor {
         Ok(())
     }
 
+    /// Returns the selected execution backend.
+    pub fn backend(&self) -> polkavm::BackendKind {
+        self.backend
+    }
+
     /// Mounts one persistent file into the shared `/home` store.
     pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
         self.foreground().mount_file(path, bytes.clone())?;
