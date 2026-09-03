@@ -26,6 +26,22 @@ const wasm =
   );
 
 if (process.env.PVM_RUNTIME_WASM === undefined) {
+  const rustcVersion = spawnSync("rustc", ["-vV"], {
+    encoding: "utf8",
+  });
+  if (rustcVersion.status !== 0) process.exit(rustcVersion.status ?? 1);
+  const commit = /^commit-hash: ([0-9a-f]+)$/m.exec(rustcVersion.stdout)?.[1];
+  if (!commit) throw new Error("rustc did not report its commit hash");
+  const rustcSysroot = spawnSync("rustc", ["--print", "sysroot"], {
+    encoding: "utf8",
+  });
+  if (rustcSysroot.status !== 0) process.exit(rustcSysroot.status ?? 1);
+  const rustLibrarySource = resolve(
+    rustcSysroot.stdout.trim(),
+    "lib/rustlib/src/rust/library",
+  );
+  const canonicalRustLibrary = `/rustc/${commit}/library`;
+
   const build = spawnSync(
     "cargo",
     [
@@ -47,6 +63,7 @@ if (process.env.PVM_RUNTIME_WASM === undefined) {
           `--remap-path-prefix=${repositoryRoot}=/workspace`,
           `--remap-path-prefix=${process.env.CARGO_HOME ?? resolve(homedir(), ".cargo")}=/cargo`,
           `--remap-path-prefix=${process.env.RUSTUP_HOME ?? resolve(homedir(), ".rustup")}=/rustup`,
+          `--remap-path-prefix=${rustLibrarySource}=${canonicalRustLibrary}`,
         ]
           .filter(Boolean)
           .join(" "),
