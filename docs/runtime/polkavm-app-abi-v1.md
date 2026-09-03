@@ -301,6 +301,97 @@ Return values:
 2  a tree was already submitted during this call
 ```
 
+### UI platform output
+
+```text
+host_ui_output_submit(pointer: u32, length: u32) -> u32
+```
+
+The guest may submit one complete `PUI1` stream per `init` or `update` call.
+The stream combines persistent integration state (cursor and text-editor
+geometry) with ordered ephemeral commands. It is part of the base ABI and does
+not require a manifest capability. Acceptance means that the stream was
+validated and queued; it does not imply that platform policy allowed every
+command to complete.
+
+The fixed 48-byte little-endian header is:
+
+```text
+offset  type    field
+0       [u8;4]  magic "PUI1"
+4       u16     version = 1
+6       u16     header bytes = 48
+8       u32     total stream bytes
+12      u16     command count
+14      u8      cursor icon
+15      u8      flags
+16      f32     text editor x0
+20      f32     text editor y0
+24      f32     text editor x1
+28      f32     text editor y1
+32      f32     primary cursor x0
+36      f32     primary cursor y0
+40      f32     primary cursor x1
+44      f32     primary cursor y1
+```
+
+Header flag bit 0 means the pointer is over mutable text. Bit 1 means the two
+rectangles contain active IME geometry. Coordinates are surface-relative
+logical UI points and both rectangles MUST be finite and ordered. When bit 1 is
+clear, bytes 16–47 MUST be zero. Unknown flag bits are invalid.
+
+Cursor values are:
+
+```text
+0 default        1 none             2 context-menu     3 help
+4 pointing-hand  5 progress         6 wait             7 cell
+8 crosshair      9 text            10 vertical-text   11 alias
+12 copy         13 move            14 no-drop         15 not-allowed
+16 grab         17 grabbing        18 all-scroll      19 resize-horizontal
+20 resize-ne-sw 21 resize-nw-se    22 resize-vertical 23 resize-east
+24 resize-se    25 resize-south    26 resize-sw       27 resize-west
+28 resize-nw    29 resize-north    30 resize-ne       31 resize-column
+32 resize-row   33 zoom-in         34 zoom-out
+```
+
+Each command immediately follows the previous payload:
+
+```text
+offset  type  field
+0       u8    opcode
+1       u8    flags
+2       u16   zero
+4       u32   payload bytes
+8       [...] payload
+```
+
+Version 1 commands are:
+
+```text
+opcode  flags  payload
+1       0      clipboard text as UTF-8
+2       bit 0  non-empty URL as UTF-8; bit 0 requests a new surface
+```
+
+Commands are processed in stream order. URL bytes are untrusted input: the Host
+MUST apply its navigation scheme, origin, permission, and user-gesture policy,
+and a new surface MUST NOT retain a privileged opener. Clipboard access remains
+subject to platform policy. Version 1 deliberately has no image-clipboard
+command; unknown opcodes are rejected rather than ignored.
+
+A stream is at most 256 KiB and contains at most 64 commands. Clipboard text is
+at most 64 KiB and a URL is at most 8 KiB. All reserved bytes and unsupported
+flags MUST be zero. The encoded total must end exactly after the declared
+command sequence.
+
+Return values:
+
+```text
+0  accepted
+1  malformed, out-of-bounds, or over-limit stream
+2  a stream was already submitted during this call
+```
+
 ### Motion
 
 ```text

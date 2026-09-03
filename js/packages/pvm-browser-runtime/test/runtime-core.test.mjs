@@ -311,6 +311,57 @@ test("native-Wasm and translated backends round-trip opaque TrUAPI frames", asyn
   }
 });
 
+test("native-Wasm and translated backends validate and emit UI output v1", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/ui-output.polkavm",
+    ),
+  );
+  const expected = {
+    cursorIcon: "text",
+    mutableTextUnderCursor: true,
+    ime: {
+      rect: [10, 20, 210, 60],
+      cursorRect: [24, 22, 25, 58],
+    },
+    commands: [
+      { type: "copy-text", text: "hello" },
+      {
+        type: "open-url",
+        url: "https://example.test",
+        newSurface: true,
+      },
+    ],
+  };
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "tri2d",
+        audioEnabled: false,
+        cacheKey: `ui-output-${forceInterpreter}`,
+        forceInterpreter,
+      },
+    });
+
+    await waitForMessage(messages, "ready");
+    const output = await waitForMessage(messages, "ui-output");
+    assert.deepEqual(output.output, expected);
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("compiler backend implements MotionSample v1 status and reads", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),

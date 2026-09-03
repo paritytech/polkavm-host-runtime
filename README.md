@@ -8,6 +8,8 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 
 - `rust/crates/pvm-runtime`: execution, hostcalls, lifecycle, bounds, and native/wasm backends.
 - `rust/crates/pvm-gpu-wire`: bounded Tri2D and WebGPU Raster wire protocol.
+- `rust/crates/pvm-motion-wire`: bounded motion-sample wire protocol.
+- `rust/crates/pvm-ui-wire`: bounded cursor, clipboard, navigation, and IME output protocol.
 - `rust/crates/pvm-runtime-assets`: source-identified browser assets exposed as static Rust data.
 - `rust/crates/pvm-assets-export`: exports those assets for Android, iOS, and browser packaging.
 - `js/packages/pvm-browser-runtime`: source-built `@parity/pvm-browser-runtime` package.

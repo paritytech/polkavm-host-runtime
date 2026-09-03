@@ -10,6 +10,7 @@ mod computer;
 mod corevm;
 pub use pvm_gpu_wire as gpu_wire;
 pub use pvm_motion_wire as motion_wire;
+pub use pvm_ui_wire as ui_wire;
 mod manifest;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
@@ -250,6 +251,13 @@ pub struct GpuBatch {
     pub bytes: Vec<u8>,
 }
 
+/// One validated UI platform-output stream emitted by the guest.
+#[derive(Debug)]
+pub struct UiOutputFrame {
+    /// Canonical [`ui_wire`] bytes.
+    pub bytes: Vec<u8>,
+}
+
 struct HostClock {
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
@@ -371,6 +379,8 @@ struct HostState {
     tri2d_submitted: bool,
     ui_semantics: Option<UiSemanticsFrame>,
     ui_semantics_submitted: bool,
+    ui_output: Option<UiOutputFrame>,
+    ui_output_submitted: bool,
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
     input: VecDeque<[u8; INPUT_EVENT_BYTES]>,
@@ -411,6 +421,8 @@ impl HostState {
             tri2d_submitted: false,
             ui_semantics: None,
             ui_semantics_submitted: false,
+            ui_output: None,
+            ui_output_submitted: false,
             audio: VecDeque::new(),
             audio_samples: 0,
             input: VecDeque::new(),
@@ -442,6 +454,7 @@ impl HostState {
         self.sleep_ms_remaining = max_sleep_ms;
         self.tri2d_submitted = false;
         self.ui_semantics_submitted = false;
+        self.ui_output_submitted = false;
         self.gpu_submits_remaining = MAX_GPU_SUBMITS_PER_TICK;
         self.gpu_upload_bytes_remaining = MAX_GPU_UPLOAD_BYTES_PER_TICK;
     }
@@ -526,6 +539,16 @@ impl HostState {
         ui::validate_ui_semantics(&bytes)?;
         self.ui_semantics = Some(UiSemanticsFrame { bytes });
         self.ui_semantics_submitted = true;
+        Ok(())
+    }
+
+    fn queue_ui_output(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if self.ui_output_submitted {
+            bail!("UI output was already submitted during this call");
+        }
+        ui_wire::decode_ui_output(&bytes).map_err(|error| anyhow!("invalid UI output: {error}"))?;
+        self.ui_output = Some(UiOutputFrame { bytes });
+        self.ui_output_submitted = true;
         Ok(())
     }
 
@@ -733,6 +756,34 @@ impl Runtime {
                 },
             )
             .context("define host_ui_semantics_submit")?;
+
+        linker
+            .define_typed(
+                ui_wire::UI_OUTPUT_SUBMIT_IMPORT,
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if !(ui_wire::UI_OUTPUT_HEADER_BYTES..=ui_wire::MAX_UI_OUTPUT_BYTES)
+                        .contains(&length)
+                    {
+                        return Ok(ui_wire::UI_OUTPUT_SUBMIT_INVALID);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    if caller.user_data.ui_output_submitted {
+                        return Ok(ui_wire::UI_OUTPUT_SUBMIT_DUPLICATE);
+                    }
+                    let Ok(bytes) = read_guest_memory(caller.instance, pointer, length) else {
+                        return Ok(ui_wire::UI_OUTPUT_SUBMIT_INVALID);
+                    };
+                    if caller.user_data.queue_ui_output(bytes).is_err() {
+                        return Ok(ui_wire::UI_OUTPUT_SUBMIT_INVALID);
+                    }
+                    Ok(ui_wire::UI_OUTPUT_SUBMIT_ACCEPTED)
+                },
+            )
+            .context("define host_ui_output_submit")?;
 
         linker
             .define_typed(
@@ -1254,6 +1305,11 @@ impl Runtime {
 
     pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
         self.state.ui_semantics.take()
+    }
+
+    /// Take the newest UI platform-output snapshot, if one is pending.
+    pub fn take_ui_output(&mut self) -> Option<UiOutputFrame> {
+        self.state.ui_output.take()
     }
 
     pub fn take_audio(&mut self) -> Option<AudioChunk> {

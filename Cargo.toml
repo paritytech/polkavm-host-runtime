@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "rust/crates/pvm-gpu-wire",
     "rust/crates/pvm-motion-wire",
+    "rust/crates/pvm-ui-wire",
     "rust/crates/pvm-runtime",
     "rust/crates/pvm-runtime-assets",
     "rust/crates/pvm-assets-export",
