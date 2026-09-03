@@ -437,7 +437,7 @@ application behavior.
 The initial v1 implementation applies the following ceilings:
 
 ```text
-program bytes                         16 MiB
+program bytes                         64 MiB
 read-write data                       64 MiB
 stack                                 16 MiB
 heap                                  128 MiB
@@ -447,7 +447,7 @@ all assets                            128 MiB
 one asset read                        16 MiB
 Host-call bytes per init/update       32 MiB
 Host calls during init                131,072
-Host calls during update              8,192
+Host calls during update              65,536
 sleep during init                     100 ms
 sleep during update                   50 ms
 audio samples per submission          96,000

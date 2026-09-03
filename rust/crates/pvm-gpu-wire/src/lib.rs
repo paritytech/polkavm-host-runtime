@@ -161,6 +161,7 @@ pub enum GpuTextureFormat {
     Bgra8UnormSrgb = 4,
     Depth24Plus = 5,
     Depth32Float = 6,
+    R8Unorm = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +273,7 @@ pub enum GpuBindingKind {
     UniformBuffer = 1,
     Sampler = 2,
     Texture = 3,
+    StorageBuffer = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +325,7 @@ pub const GPU_BUFFER_USAGE_COPY_DST: u32 = 8;
 pub const GPU_BUFFER_USAGE_INDEX: u32 = 16;
 pub const GPU_BUFFER_USAGE_VERTEX: u32 = 32;
 pub const GPU_BUFFER_USAGE_UNIFORM: u32 = 64;
+pub const GPU_BUFFER_USAGE_STORAGE: u32 = 128;
 pub const GPU_TEXTURE_USAGE_COPY_SRC: u32 = 1;
 pub const GPU_TEXTURE_USAGE_COPY_DST: u32 = 2;
 pub const GPU_TEXTURE_USAGE_TEXTURE_BINDING: u32 = 4;
@@ -927,6 +930,13 @@ mod tests {
             decode_gpu_batch(&batch)
                 .unwrap_or_else(|error| panic!("{opcode:?} fixture failed: {error}"));
         }
+    }
+
+    #[test]
+    fn keeps_extended_gpu_ids_stable() {
+        assert_eq!(GpuTextureFormat::R8Unorm as u16, 7);
+        assert_eq!(GpuBindingKind::StorageBuffer as u16, 4);
+        assert_eq!(GPU_BUFFER_USAGE_STORAGE, 128);
     }
 
     #[test]

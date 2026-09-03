@@ -583,8 +583,8 @@ impl NativeGpuRenderer {
             let p0 = reader.u32()?;
             let p1 = reader.u32()?;
             let ty = match kind {
-                1 => wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
+                1 | 4 => wgpu::BindingType::Buffer {
+                    ty: buffer_binding_type(kind, flags, p0, p1)?,
                     has_dynamic_offset: flags & 1 != 0,
                     min_binding_size: NonZeroU64::new(min),
                 },
@@ -684,7 +684,7 @@ impl NativeGpuRenderer {
             let offset = reader.u64()?;
             let size = reader.u64()?;
             specs.push(match kind {
-                1 => EntrySpec::Buffer {
+                1 | 4 => EntrySpec::Buffer {
                     binding,
                     id: resource,
                     offset,
@@ -1176,7 +1176,23 @@ fn texture_format(id: u16) -> Result<wgpu::TextureFormat> {
         4 => wgpu::TextureFormat::Bgra8UnormSrgb,
         5 => wgpu::TextureFormat::Depth24Plus,
         6 => wgpu::TextureFormat::Depth32Float,
+        7 => wgpu::TextureFormat::R8Unorm,
         _ => bail!("invalid texture format"),
+    })
+}
+fn buffer_binding_type(
+    id: u16,
+    flags: u16,
+    parameter_0: u32,
+    parameter_1: u32,
+) -> Result<wgpu::BufferBindingType> {
+    if flags & !1 != 0 || parameter_0 != 0 || parameter_1 != 0 {
+        bail!("invalid buffer binding layout");
+    }
+    Ok(match id {
+        1 => wgpu::BufferBindingType::Uniform,
+        4 => wgpu::BufferBindingType::Storage { read_only: true },
+        _ => bail!("invalid buffer binding type"),
     })
 }
 fn address_mode(id: u8) -> Result<wgpu::AddressMode> {
@@ -1336,5 +1352,18 @@ mod tests {
 
         crate::validate_gpu_capabilities(&bytes).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 12);
+    }
+
+    #[test]
+    fn maps_extended_gpu_contract_values() {
+        assert_eq!(texture_format(7).unwrap(), wgpu::TextureFormat::R8Unorm);
+        assert_eq!(
+            buffer_binding_type(4, 0, 0, 0).unwrap(),
+            wgpu::BufferBindingType::Storage { read_only: true }
+        );
+        assert_eq!(
+            buffer_binding_type(4, 2, 0, 0).unwrap_err().to_string(),
+            "invalid buffer binding layout"
+        );
     }
 }

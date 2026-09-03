@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 
@@ -30,6 +31,16 @@ test("browser runtime artifacts match their published checksums", async () => {
       createHash("sha256").update(bytes).digest("hex"),
       expected.get(file),
     );
+  }
+});
+
+test("Wasm runtime omits machine-specific Rust source paths", async () => {
+  const bytes = await readFile(resolve(dist, "pvm-browser-runtime.wasm"));
+  for (const root of [
+    resolve(homedir(), ".cargo"),
+    resolve(homedir(), ".rustup"),
+  ]) {
+    assert.equal(bytes.includes(Buffer.from(root)), false, `embedded ${root}`);
   }
 });
 
