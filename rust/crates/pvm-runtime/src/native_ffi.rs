@@ -4,7 +4,7 @@
 
 use crate::{
     ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, Tri2dFrame,
+    PresentationProfile, TextInputKind, Tri2dFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
 };
 #[cfg(feature = "native-gpu")]
 use crate::{NativeGpuFrame, NativeGpuRenderer};
@@ -54,6 +54,23 @@ impl From<NativePvmInputEventType> for InputEventType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum NativePvmTextInputKind {
+    Text,
+    ImePreedit,
+    ImeCommit,
+}
+
+impl From<NativePvmTextInputKind> for TextInputKind {
+    fn from(value: NativePvmTextInputKind) -> Self {
+        match value {
+            NativePvmTextInputKind::Text => Self::Text,
+            NativePvmTextInputKind::ImePreedit => Self::ImePreedit,
+            NativePvmTextInputKind::ImeCommit => Self::ImeCommit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePvmMotionAvailability {
     Unavailable,
     Available,
@@ -90,6 +107,17 @@ impl From<Frame> for NativePvmFrame {
             height: frame.height,
             argb: frame.argb,
         }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct NativePvmUiSemanticsFrame {
+    pub bytes: Vec<u8>,
+}
+
+impl From<UiSemanticsFrame> for NativePvmUiSemanticsFrame {
+    fn from(frame: UiSemanticsFrame) -> Self {
+        Self { bytes: frame.bytes }
     }
 }
 
@@ -271,6 +299,27 @@ impl NativePvmRuntime {
         Ok(())
     }
 
+    pub fn send_input_record(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
+        let record: [u8; INPUT_EVENT_BYTES] = bytes.try_into().map_err(|_| {
+            NativePvmError::runtime(format!(
+                "input record must contain exactly {INPUT_EVENT_BYTES} bytes"
+            ))
+        })?;
+        self.lock()?
+            .send_input_record(record)
+            .map_err(NativePvmError::runtime)
+    }
+
+    pub fn send_text_input(
+        &self,
+        kind: NativePvmTextInputKind,
+        text: String,
+    ) -> Result<(), NativePvmError> {
+        self.lock()?
+            .send_text_input(kind.into(), &text)
+            .map_err(NativePvmError::runtime)
+    }
+
     pub fn set_motion_availability(
         &self,
         availability: NativePvmMotionAvailability,
@@ -393,6 +442,10 @@ impl NativePvmRuntime {
         Ok(self.lock()?.take_gpu_batch().map(Into::into))
     }
 
+    pub fn take_ui_semantics(&self) -> Result<Option<NativePvmUiSemanticsFrame>, NativePvmError> {
+        Ok(self.lock()?.take_ui_semantics().map(Into::into))
+    }
+
     pub fn take_log(&self) -> Result<Option<String>, NativePvmError> {
         Ok(self.lock()?.take_log())
     }
@@ -429,5 +482,21 @@ mod tests {
             1,
         );
         assert!(matches!(result, Err(NativePvmError::DuplicateAsset { .. })));
+    }
+
+    #[test]
+    fn text_input_kinds_match_the_runtime_contract() {
+        assert_eq!(
+            TextInputKind::from(NativePvmTextInputKind::Text),
+            TextInputKind::Text
+        );
+        assert_eq!(
+            TextInputKind::from(NativePvmTextInputKind::ImePreedit),
+            TextInputKind::ImePreedit
+        );
+        assert_eq!(
+            TextInputKind::from(NativePvmTextInputKind::ImeCommit),
+            TextInputKind::ImeCommit
+        );
     }
 }
