@@ -118,6 +118,43 @@ test("spawn without registration fails from the start", () => {
   assert.equal(runToExit(supervisor), 13);
 });
 
+test("open spawn suspends for the embedder and resumes", () => {
+  const supervisor = new ComputerSupervisor(
+    pipeDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  const requested = [];
+  for (let step = 0; step < 10_000; step++) {
+    const status = supervisor.run();
+    if (status.kind === "exited") {
+      assert.equal(status.code, 0);
+      assert.equal(text(supervisor.takeTerminalOutput()), "HELLO, PIPES");
+      // The driver probes one unknown package (rejected -> NOT_FOUND, the
+      // same observable as the default path) and pipes through "upper"
+      // (provided by the embedder without prior registration).
+      assert.ok(requested.includes("upper"));
+      assert.ok(requested.some((name) => name !== "upper"));
+      return;
+    }
+    if (status.kind === "package") {
+      // Suspension is idempotent until the embedder acts.
+      assert.deepEqual(supervisor.run(), status);
+      requested.push(status.package);
+      if (status.package === "upper") {
+        supervisor.providePackage(pipeFilter);
+      } else {
+        supervisor.rejectPackage();
+      }
+      continue;
+    }
+    assert.equal(status.kind, "yielded");
+  }
+  throw new Error("guest did not exit");
+});
+
 test("supervisor terminates the root as interrupted", () => {
   const supervisor = new ComputerSupervisor(
     roundtrip,

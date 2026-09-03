@@ -142,7 +142,9 @@
       !path.startsWith("/home/") ||
       path.endsWith("/") ||
       path.includes("\0") ||
-      path.split("/").some((segment) => segment === "." || segment === "..")
+      path
+        .split("/")
+        .some((segment) => segment === "." || segment === "..")
     ) {
       return null;
     }
@@ -1018,7 +1020,7 @@
   /** Supervises computer processes sharing one terminal and `/home`
    * (mirror of ComputerSupervisor, including the hardening semantics). */
   class ComputerSupervisor {
-    constructor(module, context, maxGas, emitLog = null) {
+    constructor(module, context, maxGas, emitLog = null, options = null) {
       this.packages = new Map();
       this.stack = [new ComputerProcess(module, context, maxGas, emitLog)];
       this.background = [];
@@ -1031,6 +1033,55 @@
       this.emitLog = emitLog;
       this.columns = 80;
       this.rows = 24;
+      // Open spawn: when enabled, a spawn naming an unregistered package
+      // suspends the computer with { kind: "package" } instead of failing
+      // with NOT_FOUND, so the embedding Host can resolve the name (e.g.
+      // through DotNS), then providePackage()/rejectPackage(). Disabled by
+      // default: the conformance contract expects immediate NOT_FOUND.
+      this.packageResolution = options?.packageResolution === true;
+      this.pendingResolution = null;
+    }
+
+    /** Registers the pending package and retries the suspended spawn. */
+    providePackage(module) {
+      const pending = this.pendingResolution;
+      if (pending === null) {
+        throw new Error("no package resolution is pending");
+      }
+      this.pendingResolution = null;
+      this.registerPackage(pending.request.package, module);
+      this.#dispatchSpawn(pending);
+    }
+
+    /** Fails the suspended spawn; the guest observes the status. */
+    rejectPackage(status = STATUS_NOT_FOUND) {
+      const pending = this.pendingResolution;
+      if (pending === null) {
+        throw new Error("no package resolution is pending");
+      }
+      this.pendingResolution = null;
+      this.#foreground().resolveSpawn(status);
+    }
+
+    #dispatchSpawn(pending) {
+      if (pending.mode === "child") {
+        this.#handleChildRequest(pending.request);
+        return;
+      }
+      const child = this.#spawnChild(
+        pending.request.package,
+        pending.request.arguments,
+      );
+      if (typeof child === "number") {
+        this.#foreground().resolveSpawn(child);
+      } else {
+        this.stack.push(child);
+      }
+    }
+
+    #suspendForPackage(request, mode) {
+      this.pendingResolution = { request, mode };
+      return { kind: "package", package: request.package };
     }
 
     registerPackage(name, module) {
@@ -1094,6 +1145,14 @@
     /** Runs the foreground process until the system yields or the root
      * exits; child faults fail only the child (status 139). */
     run() {
+      if (this.pendingResolution !== null) {
+        // Idempotent while suspended: the embedder must provide or reject
+        // the pending package before execution can continue.
+        return {
+          kind: "package",
+          package: this.pendingResolution.request.package,
+        };
+      }
       let faultPops = 0;
       for (;;) {
         let status;
@@ -1120,6 +1179,9 @@
             throw new Error("spawn status without a pending request");
           }
           const child = this.#spawnChild(request.package, request.arguments);
+          if (child === STATUS_NOT_FOUND && this.packageResolution) {
+            return this.#suspendForPackage(request, "stack");
+          }
           if (typeof child === "number") {
             this.#foreground().resolveSpawn(child);
           } else {
@@ -1133,6 +1195,12 @@
             throw new Error("child-request status without a pending request");
           }
           this.#handleChildRequest(request);
+          if (this.pendingResolution !== null) {
+            return {
+              kind: "package",
+              package: this.pendingResolution.request.package,
+            };
+          }
           continue;
         }
         // Exited.
@@ -1240,6 +1308,10 @@
           return;
         }
         const child = this.#spawnChild(request.package, request.arguments);
+        if (child === STATUS_NOT_FOUND && this.packageResolution) {
+          this.#suspendForPackage(request, "child");
+          return;
+        }
         if (typeof child === "number") {
           resolve(child);
           return;

@@ -62,13 +62,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-computer.js"),
-        sha256: "4bc365bb0f8db75b67c567c0977968e1ec9ae5caf21b9c169beb69381e342449",
+        sha256: "a92302a4b7abe7906f07a7098fc8ba1d73064cc635b6620532d5ca2477f7df9f",
     },
     BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "a14b2ecabadf40e7769192702c6ddb70d9260ce899673cf8cade9be9cf524dfc",
+        sha256: "edf44e65be29ad30db63a68e6699e121971096153b712c51eb8691cfa7ef768d",
     },
 ];
 
