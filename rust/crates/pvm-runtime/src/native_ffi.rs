@@ -17,6 +17,7 @@ pub enum NativePvmPresentationProfile {
     Framebuffer,
     Tri2d,
     WebGpuRaster,
+    WebGpu,
 }
 
 impl From<NativePvmPresentationProfile> for PresentationProfile {
@@ -25,6 +26,7 @@ impl From<NativePvmPresentationProfile> for PresentationProfile {
             NativePvmPresentationProfile::Framebuffer => Self::Framebuffer,
             NativePvmPresentationProfile::Tri2d => Self::Tri2d,
             NativePvmPresentationProfile::WebGpuRaster => Self::WebGpuRaster,
+            NativePvmPresentationProfile::WebGpu => Self::WebGpu,
         }
     }
 }

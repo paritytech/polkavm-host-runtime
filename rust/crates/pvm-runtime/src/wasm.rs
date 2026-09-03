@@ -168,6 +168,7 @@ fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) 
             0 => PresentationProfile::Framebuffer,
             1 => PresentationProfile::Tri2d,
             2 => PresentationProfile::WebGpuRaster,
+            3 => PresentationProfile::WebGpu,
             _ => return Err(anyhow!("invalid PolkaVM browser presentation profile")),
         };
         host.phase = Phase::Building(Launch {

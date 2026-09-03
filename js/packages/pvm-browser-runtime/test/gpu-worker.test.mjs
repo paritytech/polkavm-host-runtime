@@ -20,10 +20,10 @@ const context = vm.createContext({
   postMessage() {},
 });
 vm.runInContext(
-  `${source}\nglobalThis.gpuWorkerTest = { GpuEngine, parseCommand };`,
+  `${source}\nglobalThis.gpuWorkerTest = { GpuEngine, parseCommand, parseCommands };`,
   context,
 );
-const { GpuEngine, parseCommand } = context.gpuWorkerTest;
+const { GpuEngine, parseCommand, parseCommands } = context.gpuWorkerTest;
 
 function parse(opcode, payload) {
   return parseCommand({ opcode, payload, index: 0 });
@@ -63,6 +63,75 @@ test("parses read-only storage buffer layouts", () => {
   assert.throws(() => parse(7, payload), /invalid buffer binding layout/);
 });
 
+test("parses writable storage buffer layouts", () => {
+  const payload = new Uint8Array(40);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, 1, true);
+  view.setUint32(8, 3, true);
+  view.setUint32(12, 3, true);
+  view.setUint16(16, 5, true);
+  view.setBigUint64(24, 16n, true);
+
+  const [entry] = parse(7, payload).entries;
+  assert.equal(entry.binding, 3);
+  assert.equal(entry.buffer.type, "storage");
+  assert.equal(entry.buffer.minBindingSize, 16);
+});
+
+test("validates compute pipeline dispatch batches", () => {
+  const shader = new TextEncoder().encode("@compute @workgroup_size(1) fn cs_main() {}");
+  const shaderPayload = new Uint8Array(8 + Math.ceil(shader.byteLength / 4) * 4);
+  const shaderView = new DataView(shaderPayload.buffer);
+  shaderView.setUint32(0, handle(1), true);
+  shaderView.setUint32(4, shader.byteLength, true);
+  shaderPayload.set(shader, 8);
+  const layoutPayload = u32s([handle(3), 0]);
+  const computePipelinePayload = u32s([handle(4), handle(3), handle(1), 0]);
+  const batch = commands([
+    [6, shaderPayload],
+    [8, layoutPayload],
+    [24, computePipelinePayload],
+    [25, new Uint8Array()],
+    [26, u32s([handle(4)])],
+    [28, u32s([1, 1, 1])],
+    [29, new Uint8Array()],
+  ]);
+  const engine = Object.assign(Object.create(GpuEngine.prototype), {
+    resources: new Map(),
+    handleSlots: new Map(),
+    lastSequence: 0n,
+    limits: [
+      4096,
+      16 * 1024 * 1024,
+      16,
+      4,
+      8,
+      16,
+      4,
+      256 * 1024 * 1024,
+      64 * 1024 * 1024,
+      8192,
+      4 * 1024 * 1024,
+      16 * 1024 * 1024,
+      16 * 1024 * 1024,
+      8,
+      16 * 1024,
+      256,
+      256,
+      256,
+      64,
+      65_535,
+      8192,
+    ],
+    surfaceGeneration: 1,
+  });
+
+  const validated = engine.validate(parseCommands(batch));
+
+  assert.equal(validated.commands.at(-2).opcode, 28);
+});
+
 test("completes a validated batch without render commands", async () => {
   let completions = 0;
   const engine = Object.create(GpuEngine.prototype);
@@ -99,3 +168,36 @@ test("completes a validated batch without render commands", async () => {
   assert.equal(completions, 1);
   assert.equal(engine.lastSequence, 1);
 });
+
+function handle(slot) {
+  return (1 << 20) | slot;
+}
+
+function u32s(values) {
+  const bytes = new Uint8Array(values.length * 4);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, index) => view.setUint32(index * 4, value, true));
+  return bytes;
+}
+
+function commands(items) {
+  const commandBytes = items.reduce(
+    (total, [, payload]) => total + 8 + payload.byteLength,
+    0,
+  );
+  const bytes = new Uint8Array(24 + commandBytes);
+  const view = new DataView(bytes.buffer);
+  bytes.set(new TextEncoder().encode("EPG1"));
+  view.setUint16(4, 1, true);
+  view.setUint32(8, bytes.byteLength, true);
+  view.setUint32(12, items.length, true);
+  view.setBigUint64(16, 1n, true);
+  let offset = 24;
+  for (const [opcode, payload] of items) {
+    view.setUint16(offset, opcode, true);
+    view.setUint32(offset + 4, 8 + payload.byteLength, true);
+    bytes.set(payload, offset + 8);
+    offset += 8 + payload.byteLength;
+  }
+  return bytes;
+}

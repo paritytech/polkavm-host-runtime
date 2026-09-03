@@ -29,7 +29,8 @@ enum Resource {
     BindGroupLayout(wgpu::BindGroupLayout),
     PipelineLayout(wgpu::PipelineLayout),
     BindGroup(wgpu::BindGroup),
-    Pipeline(wgpu::RenderPipeline),
+    RenderPipeline(wgpu::RenderPipeline),
+    ComputePipeline(wgpu::ComputePipeline),
 }
 
 struct PendingPass {
@@ -69,6 +70,20 @@ enum RenderOperation {
         base_vertex: i32,
         first_instance: u32,
     },
+}
+
+struct PendingComputePass {
+    operations: Vec<ComputeOperation>,
+}
+
+enum ComputeOperation {
+    Pipeline(u32),
+    BindGroup {
+        slot: u32,
+        bind_group: u32,
+        offsets: Vec<u32>,
+    },
+    Dispatch([u32; 3]),
 }
 
 pub struct NativeGpuRenderer {
@@ -163,6 +178,7 @@ impl NativeGpuRenderer {
         let batch = gpu_wire::decode_gpu_batch(batch_bytes).context("decode native GPU batch")?;
         let mut encoder: Option<wgpu::CommandEncoder> = None;
         let mut pending_pass: Option<PendingPass> = None;
+        let mut pending_compute_pass: Option<PendingComputePass> = None;
         let mut presented = false;
 
         for (index, command) in batch.commands().enumerate() {
@@ -318,7 +334,7 @@ impl NativeGpuRenderer {
                 GpuOpcode::CreateBindGroupLayout => self.create_bind_group_layout(&mut reader)?,
                 GpuOpcode::CreatePipelineLayout => self.create_pipeline_layout(&mut reader)?,
                 GpuOpcode::CreateBindGroup => self.create_bind_group(&mut reader)?,
-                GpuOpcode::CreateRenderPipeline => self.create_pipeline(&mut reader)?,
+                GpuOpcode::CreateRenderPipeline => self.create_render_pipeline(&mut reader)?,
                 GpuOpcode::DestroyResource => {
                     let id = reader.u32()?;
                     reader.finish()?;
@@ -333,7 +349,7 @@ impl NativeGpuRenderer {
                     }
                 }
                 GpuOpcode::BeginRenderPass => {
-                    if pending_pass.is_some() {
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
                         bail!("nested render pass");
                     }
                     let color_view = reader.u32()?;
@@ -443,7 +459,7 @@ impl NativeGpuRenderer {
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
-                    self.encode_pass(command_encoder, pass)?;
+                    self.encode_render_pass(command_encoder, pass)?;
                     presented = true;
                 }
                 GpuOpcode::CopyBufferToBuffer => {
@@ -453,6 +469,9 @@ impl NativeGpuRenderer {
                     let destination_offset = reader.u64()?;
                     let size = reader.u64()?;
                     reader.finish()?;
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
+                        bail!("buffer copy inside GPU pass");
+                    }
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
@@ -465,11 +484,81 @@ impl NativeGpuRenderer {
                     );
                 }
                 GpuOpcode::CreateTextureView => self.create_texture_view(&mut reader)?,
+                GpuOpcode::CreateComputePipeline => {
+                    let id = reader.u32()?;
+                    self.require_new(id)?;
+                    let layout_id = reader.u32()?;
+                    let shader_id = reader.u32()?;
+                    reader.zero(4)?;
+                    reader.finish()?;
+                    let value =
+                        self.device
+                            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                label: None,
+                                layout: Some(self.pipeline_layout(layout_id)?),
+                                module: self.shader(shader_id)?,
+                                entry_point: Some("cs_main"),
+                                compilation_options: Default::default(),
+                                cache: None,
+                            });
+                    self.resources.insert(id, Resource::ComputePipeline(value));
+                }
+                GpuOpcode::BeginComputePass => {
+                    reader.finish()?;
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
+                        bail!("nested GPU pass");
+                    }
+                    pending_compute_pass = Some(PendingComputePass {
+                        operations: Vec::new(),
+                    });
+                }
+                GpuOpcode::SetComputePipeline => pending_compute(&mut pending_compute_pass)?
+                    .operations
+                    .push(ComputeOperation::Pipeline(reader.one_u32()?)),
+                GpuOpcode::SetComputeBindGroup => {
+                    let slot = reader.u32()?;
+                    let bind_group = reader.u32()?;
+                    let count = reader.u32()? as usize;
+                    let offsets = (0..count)
+                        .map(|_| reader.u32())
+                        .collect::<Result<Vec<_>>>()?;
+                    reader.finish()?;
+                    pending_compute(&mut pending_compute_pass)?.operations.push(
+                        ComputeOperation::BindGroup {
+                            slot,
+                            bind_group,
+                            offsets,
+                        },
+                    );
+                }
+                GpuOpcode::DispatchWorkgroups => {
+                    let values = reader.u32_array::<3>()?;
+                    reader.finish()?;
+                    if values.contains(&0) {
+                        bail!("zero compute dispatch dimension");
+                    }
+                    pending_compute(&mut pending_compute_pass)?
+                        .operations
+                        .push(ComputeOperation::Dispatch(values));
+                }
+                GpuOpcode::EndComputePass => {
+                    reader.finish()?;
+                    let pass = pending_compute_pass
+                        .take()
+                        .ok_or_else(|| anyhow!("compute pass is not active"))?;
+                    let command_encoder = encoder.get_or_insert_with(|| {
+                        self.device.create_command_encoder(&Default::default())
+                    });
+                    self.encode_compute_pass(command_encoder, pass)?;
+                }
             }
             let _ = index;
         }
         if pending_pass.is_some() {
             bail!("render pass was not ended");
+        }
+        if pending_compute_pass.is_some() {
+            bail!("compute pass was not ended");
         }
         let Some(mut encoder) = encoder else {
             return Ok(None);
@@ -560,10 +649,17 @@ impl NativeGpuRenderer {
             _ => bail!("invalid bind group {id}"),
         }
     }
-    fn pipeline(&self, id: u32) -> Result<&wgpu::RenderPipeline> {
+    fn render_pipeline(&self, id: u32) -> Result<&wgpu::RenderPipeline> {
         match self.resources.get(&id) {
-            Some(Resource::Pipeline(value)) => Ok(value),
-            _ => bail!("invalid pipeline {id}"),
+            Some(Resource::RenderPipeline(value)) => Ok(value),
+            _ => bail!("invalid render pipeline {id}"),
+        }
+    }
+
+    fn compute_pipeline(&self, id: u32) -> Result<&wgpu::ComputePipeline> {
+        match self.resources.get(&id) {
+            Some(Resource::ComputePipeline(value)) => Ok(value),
+            _ => bail!("invalid compute pipeline {id}"),
         }
     }
 
@@ -583,7 +679,7 @@ impl NativeGpuRenderer {
             let p0 = reader.u32()?;
             let p1 = reader.u32()?;
             let ty = match kind {
-                1 | 4 => wgpu::BindingType::Buffer {
+                1 | 4 | 5 => wgpu::BindingType::Buffer {
                     ty: buffer_binding_type(kind, flags, p0, p1)?,
                     has_dynamic_offset: flags & 1 != 0,
                     min_binding_size: NonZeroU64::new(min),
@@ -684,7 +780,7 @@ impl NativeGpuRenderer {
             let offset = reader.u64()?;
             let size = reader.u64()?;
             specs.push(match kind {
-                1 | 4 => EntrySpec::Buffer {
+                1 | 4 | 5 => EntrySpec::Buffer {
                     binding,
                     id: resource,
                     offset,
@@ -737,7 +833,7 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
-    fn create_pipeline(&mut self, reader: &mut Reader<'_>) -> Result<()> {
+    fn create_render_pipeline(&mut self, reader: &mut Reader<'_>) -> Result<()> {
         let id = reader.u32()?;
         self.require_new(id)?;
         let layout_id = reader.u32()?;
@@ -858,7 +954,7 @@ impl NativeGpuRenderer {
                 multiview: None,
                 cache: None,
             });
-        self.resources.insert(id, Resource::Pipeline(value));
+        self.resources.insert(id, Resource::RenderPipeline(value));
         Ok(())
     }
 
@@ -893,7 +989,11 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
-    fn encode_pass(&self, encoder: &mut wgpu::CommandEncoder, pending: PendingPass) -> Result<()> {
+    fn encode_render_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pending: PendingPass,
+    ) -> Result<()> {
         let surface_view = self.surface.create_view(&Default::default());
         let depth_view = if pending.depth_view == 0 {
             None
@@ -941,7 +1041,7 @@ impl NativeGpuRenderer {
         });
         for operation in pending.operations {
             match operation {
-                RenderOperation::Pipeline(id) => pass.set_pipeline(self.pipeline(id)?),
+                RenderOperation::Pipeline(id) => pass.set_pipeline(self.render_pipeline(id)?),
                 RenderOperation::VertexBuffer {
                     slot,
                     buffer,
@@ -982,6 +1082,31 @@ impl NativeGpuRenderer {
                     base_vertex,
                     first_instance..first_instance + instances,
                 ),
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_compute_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pending: PendingComputePass,
+    ) -> Result<()> {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        for operation in pending.operations {
+            match operation {
+                ComputeOperation::Pipeline(id) => pass.set_pipeline(self.compute_pipeline(id)?),
+                ComputeOperation::BindGroup {
+                    slot,
+                    bind_group,
+                    offsets,
+                } => pass.set_bind_group(slot, self.bind_group(bind_group)?, &offsets),
+                ComputeOperation::Dispatch(values) => {
+                    pass.dispatch_workgroups(values[0], values[1], values[2]);
+                }
             }
         }
         Ok(())
@@ -1028,6 +1153,15 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
         (10, 8192),
         (11, gpu_wire::MAX_GPU_BATCH_BYTES as u64),
         (12, 16 * 1024 * 1024),
+        (13, 16 * 1024 * 1024),
+        (14, 8),
+        (15, 16 * 1024),
+        (16, 256),
+        (17, 256),
+        (18, 256),
+        (19, 64),
+        (20, 65_535),
+        (21, gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64),
     ];
     let mut bytes = vec![0; 56 + limits.len() * 16];
     bytes[..4].copy_from_slice(&gpu_wire::GPU_CAPABILITIES_MAGIC);
@@ -1088,6 +1222,11 @@ fn create_surface(
 fn pending(pass: &mut Option<PendingPass>) -> Result<&mut PendingPass> {
     pass.as_mut()
         .ok_or_else(|| anyhow!("render pass is not active"))
+}
+
+fn pending_compute(pass: &mut Option<PendingComputePass>) -> Result<&mut PendingComputePass> {
+    pass.as_mut()
+        .ok_or_else(|| anyhow!("compute pass is not active"))
 }
 
 struct Reader<'a> {
@@ -1192,6 +1331,7 @@ fn buffer_binding_type(
     Ok(match id {
         1 => wgpu::BufferBindingType::Uniform,
         4 => wgpu::BufferBindingType::Storage { read_only: true },
+        5 => wgpu::BufferBindingType::Storage { read_only: false },
         _ => bail!("invalid buffer binding type"),
     })
 }
@@ -1351,7 +1491,7 @@ mod tests {
         let bytes = encode_capabilities(800, 600, 7);
 
         crate::validate_gpu_capabilities(&bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 21);
     }
 
     #[test]
@@ -1360,6 +1500,10 @@ mod tests {
         assert_eq!(
             buffer_binding_type(4, 0, 0, 0).unwrap(),
             wgpu::BufferBindingType::Storage { read_only: true }
+        );
+        assert_eq!(
+            buffer_binding_type(5, 0, 0, 0).unwrap(),
+            wgpu::BufferBindingType::Storage { read_only: false }
         );
         assert_eq!(
             buffer_binding_type(4, 2, 0, 0).unwrap_err().to_string(),

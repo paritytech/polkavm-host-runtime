@@ -2,12 +2,12 @@
 
 Host-neutral PolkaVM application runtime for native and browser Hosts.
 
-The repository owns one implementation of the App Manifest v2 PolkaVM execution contract across native Rust, browser WebAssembly, framebuffer, Tri2D, and WebGPU Raster presentation. Runtime limits, GPU records, browser workers, and distributable assets are built and reviewed together.
+The repository owns one implementation of the App Manifest v2 PolkaVM execution contract across native Rust, browser WebAssembly, framebuffer, Tri2D, WebGPU Raster, and expanded WebGPU presentation. Runtime limits, GPU records, browser workers, and distributable assets are built and reviewed together.
 
 ## Layout
 
 - `rust/crates/pvm-runtime`: execution, hostcalls, lifecycle, bounds, and native/wasm backends.
-- `rust/crates/pvm-gpu-wire`: bounded Tri2D and WebGPU Raster wire protocol.
+- `rust/crates/pvm-gpu-wire`: bounded Tri2D and WebGPU wire protocol.
 - `rust/crates/pvm-motion-wire`: bounded motion-sample wire protocol.
 - `rust/crates/pvm-ui-wire`: bounded cursor, clipboard, navigation, and IME output protocol.
 - `rust/crates/pvm-runtime-assets`: source-identified browser assets exposed as static Rust data.
