@@ -29,7 +29,7 @@ Two rejected alternatives frame the design:
   section id with the high bit set is length-prefixed and skippable;
   ids 128–131 are reserved for debug data and the metadata hash).
 
-Therefore: one small declaration record, carried in two places.
+Therefore: one small declaration record, carried by the executable manifest (and optionally mirrored in the blob for tooling).
 
 ## The declaration record
 
@@ -55,7 +55,7 @@ A canonical UTF-8 JSON object:
 - Future extensions attach per-interface parameters as sibling keys
   (e.g. filesystem path grants); the RFC must reserve that shape.
 
-## Carrier 1: the executable manifest
+## The executable manifest
 
 App Manifest v2 apps declare the record under `capabilities.host`:
 
@@ -65,8 +65,7 @@ App Manifest v2 apps declare the record under `capabilities.host`:
   "kind": "app",
   "runtime": { "kind": "polkavm", "entrypoint": "shell.polkavm" },
   "capabilities": {
-    "host": { "requires": ["polkadot-host/0.1/core", "…"] },
-    "packages": [{ "name": "vim", "path": "vim.polkavm" }]
+    "host": { "requires": ["polkadot-host/0.1/core", "…"] }
   }
 }
 ```
@@ -81,27 +80,40 @@ App Manifest v2 apps declare the record under `capabilities.host`:
   DotNS executable record, byte-verified against the packaged
   `manifest.json`, and evaluable before any content is fetched.
 
-## Carrier 2: a `.polkavm` custom section
+## Spawning published apps (open spawn)
 
-The identical record embedded in the program blob as an optional custom
-section (id to be assigned by the RFC from the skippable `0x80..0xFF`
-space, payload = the canonical JSON bytes).
+`process_spawn(name)` is not gated on any manifest enumeration. The name
+resolves like any app launch: the host looks up the DotNS label, the
+fetched archive is verified against the child's OWN signed executable
+record, the child must declare a host contract the host supports, and
+its grant clamps to the parent's. The child is a first-class published
+app — the same artifact serves `vim.example` standalone and every
+computer that spawns it, deduplicated by CID.
 
-Why a second carrier:
+Two qualifications:
 
-- **Child packages have no manifest.** A computer package such as
-  `vim.polkavm` is spawned by a guest, not resolved through DotNS. The
-  supervisor reads the child's declared interfaces from its blob and
-  clamps grants to the intersection with the parent's authority.
-- **Tooling and provenance.** `polkatool`-style tools can print what a
-  blob requires; conformance CI can assert fixtures declare exactly the
-  interfaces they exercise.
-- **Defense in depth.** For top-level apps carrying both, hosts MUST
-  refuse on mismatch between manifest and blob declarations.
+- **Registry reach is host-mediated.** Spawning by name lets a guest
+  trigger resolutions and content fetches, which is authority (and a
+  covert channel: data can be encoded in which names are looked up).
+  The host owns the policy: prompt, install-on-first-use, cache-only,
+  or unrestricted on development hosts. An unresolvable or refused name
+  fails the spawn with NOT_FOUND; the guest observes nothing else.
+- **Pins are an optional lockfile, not authorization.** A manifest MAY
+  carry `packages` entries pinning a spawn name to a CID (and MAY bundle
+  program files archive-locally for fixtures and private helpers). Pins
+  buy determinism, offline closure, and supply-chain stability — like a
+  `Cargo.lock`, they never grant or deny anything.
 
-Compatibility: existing loaders, the wasm translator, and gas metering
-ignore unknown optional sections, so stamped blobs run unchanged on
-hosts that predate this RFC.
+## A `.polkavm` custom section (optional tooling)
+
+The same declaration record MAY be embedded in a program blob as an
+optional custom section (id from the skippable `0x80..0xFF` space,
+payload = the canonical JSON bytes). Existing loaders, the wasm
+translator, and gas metering ignore unknown optional sections, so
+stamped blobs run unchanged everywhere. This is tooling and defense in
+depth, not a required carrier: `polkatool`-style tools can print what a
+blob requires, archive-local programs that never pass through DotNS can
+self-describe, and hosts MAY refuse on a manifest/blob mismatch.
 
 ## Host rules
 
