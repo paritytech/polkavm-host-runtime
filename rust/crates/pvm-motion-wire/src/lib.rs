@@ -174,6 +174,101 @@ impl MotionSample {
     }
 }
 
+/// Standard gravitational acceleration used to normalize device tilt.
+pub const STANDARD_GRAVITY_MPS2: f32 = 9.806_65;
+/// Gravity projected onto one screen axis at the default full-scale tilt.
+pub const TILT_GRAVITY_RANGE: f32 = 0.4;
+/// Integrated pointer rotation, in degrees, that maps to full-scale tilt.
+pub const POINTER_TILT_RANGE_DEGREES: f32 = 24.0;
+/// Per-sample low-pass weight applied to derived tilt.
+pub const TILT_SMOOTHING: f32 = 0.18;
+
+/// Source-neutral normalized tilt derived from MotionSample v1 records.
+///
+/// Physical samples use acceleration including gravity relative to the first
+/// observed pose. Pointer-emulated samples integrate rotation rate over their
+/// monotonic timestamps. Both paths produce bounded `[-1, 1]` axes and share
+/// the same low-pass filter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TiltTracker {
+    baseline_gravity: Option<(f32, f32)>,
+    pointer_tilt: (f32, f32),
+    tilt: (f32, f32),
+    last_timestamp_ms: Option<f64>,
+    pointer_emulated: Option<bool>,
+}
+
+impl TiltTracker {
+    /// Creates a centered tracker with no calibrated physical pose.
+    pub const fn new() -> Self {
+        Self {
+            baseline_gravity: None,
+            pointer_tilt: (0.0, 0.0),
+            tilt: (0.0, 0.0),
+            last_timestamp_ms: None,
+            pointer_emulated: None,
+        }
+    }
+
+    /// Consumes one validated sample and returns normalized horizontal and
+    /// vertical tilt when that sample contains a usable source.
+    pub fn update(&mut self, sample: MotionSample) -> Option<(f32, f32)> {
+        let pointer_emulated = sample.flags & MOTION_FLAG_POINTER_EMULATED != 0;
+        if self.pointer_emulated != Some(pointer_emulated) {
+            self.last_timestamp_ms = None;
+            if pointer_emulated {
+                self.pointer_tilt = self.tilt;
+            } else {
+                self.baseline_gravity = None;
+            }
+            self.pointer_emulated = Some(pointer_emulated);
+        }
+
+        let target = if pointer_emulated && sample.flags & MOTION_FLAG_ROTATION != 0 {
+            let elapsed_seconds = self
+                .last_timestamp_ms
+                .map(|previous| ((sample.timestamp_ms - previous) / 1_000.0).clamp(0.0, 0.1))
+                .unwrap_or(0.0) as f32;
+            self.pointer_tilt.0 = (self.pointer_tilt.0
+                + sample.rotation_gamma * elapsed_seconds / POINTER_TILT_RANGE_DEGREES)
+                .clamp(-1.0, 1.0);
+            self.pointer_tilt.1 = (self.pointer_tilt.1
+                + sample.rotation_beta * elapsed_seconds / POINTER_TILT_RANGE_DEGREES)
+                .clamp(-1.0, 1.0);
+            self.pointer_tilt
+        } else if sample.flags & MOTION_FLAG_ACCELERATION != 0 {
+            let gravity = (
+                sample.acceleration_x / STANDARD_GRAVITY_MPS2,
+                sample.acceleration_y / STANDARD_GRAVITY_MPS2,
+            );
+            let baseline = *self.baseline_gravity.get_or_insert(gravity);
+            (
+                (-(gravity.0 - baseline.0) / TILT_GRAVITY_RANGE).clamp(-1.0, 1.0),
+                ((gravity.1 - baseline.1) / TILT_GRAVITY_RANGE).clamp(-1.0, 1.0),
+            )
+        } else {
+            self.last_timestamp_ms = Some(sample.timestamp_ms);
+            return None;
+        };
+
+        self.last_timestamp_ms = Some(sample.timestamp_ms);
+        self.tilt.0 += (target.0 - self.tilt.0) * TILT_SMOOTHING;
+        self.tilt.1 += (target.1 - self.tilt.1) * TILT_SMOOTHING;
+        Some(self.tilt)
+    }
+
+    /// Clears calibration, integration, and smoothing state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+impl Default for TiltTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// MotionSample v1 decoding or validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MotionSampleError {
@@ -258,5 +353,42 @@ mod tests {
         invalid = sample();
         invalid.flags = MOTION_FLAG_POINTER_EMULATED;
         assert_eq!(invalid.encode(), Err(MotionSampleError::Flags));
+    }
+
+    #[test]
+    fn tilt_tracker_calibrates_physical_gravity() {
+        let mut tracker = TiltTracker::new();
+        let mut physical = sample();
+        physical.flags = MOTION_FLAG_ACCELERATION | MOTION_FLAG_ROTATION;
+        physical.timestamp_ms = 1_000.0;
+        physical.acceleration_x = 0.0;
+        physical.acceleration_y = 0.0;
+        physical.acceleration_z = STANDARD_GRAVITY_MPS2;
+        assert_eq!(tracker.update(physical), Some((0.0, 0.0)));
+
+        physical.sequence += 1;
+        physical.timestamp_ms = 1_016.0;
+        physical.acceleration_x = -STANDARD_GRAVITY_MPS2 * TILT_GRAVITY_RANGE;
+        let (x, y) = tracker.update(physical).unwrap();
+        assert!((x - TILT_SMOOTHING).abs() < 0.0001);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn tilt_tracker_integrates_pointer_rotation_rate() {
+        let mut tracker = TiltTracker::new();
+        let mut pointer = sample();
+        pointer.timestamp_ms = 1_000.0;
+        pointer.rotation_beta = 0.0;
+        pointer.rotation_gamma = 0.0;
+        assert_eq!(tracker.update(pointer), Some((0.0, 0.0)));
+
+        pointer.sequence += 1;
+        pointer.timestamp_ms = 1_100.0;
+        pointer.rotation_beta = -60.0;
+        pointer.rotation_gamma = 120.0;
+        let (x, y) = tracker.update(pointer).unwrap();
+        assert!((x - 0.09).abs() < 0.0001);
+        assert!((y + 0.045).abs() < 0.0001);
     }
 }
