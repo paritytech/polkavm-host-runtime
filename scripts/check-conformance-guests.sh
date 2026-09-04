@@ -9,6 +9,7 @@ GUESTS=(
   "polkavm-app-v1/ui-output pvm_ui_output ui-output.polkavm"
   "polkavm-app-v1/pointer-capture pvm_pointer_capture pointer-capture.polkavm"
   "polkadot-host-computer-0.1/core-context pvm_computer_core_context computer-core-context.polkavm"
+  "polkadot-host-computer-0.1/core-services pvm_computer_core_services computer-core-services.polkavm"
   "polkadot-host-computer-0.1/tty-fs-roundtrip pvm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
   "polkadot-host-computer-0.1/pipe-filter pvm_computer_pipe_filter computer-pipe-filter.polkavm"
   "polkadot-host-computer-0.1/pipe-driver pvm_computer_pipe_driver computer-pipe-driver.polkavm"

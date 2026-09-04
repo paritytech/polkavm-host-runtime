@@ -17,6 +17,7 @@ const {
   ComputerProcess,
   ComputerSupervisor,
   ComputerTranslator,
+  WebSocketTcpProvider,
   TTY_MODE_RAW,
 } = globalThis.PvmComputer;
 
@@ -33,6 +34,7 @@ async function fixture(name) {
 }
 
 const coreContext = await fixture("computer-core-context");
+const coreServices = await fixture("computer-core-services");
 const roundtrip = await fixture("computer-tty-fs-roundtrip");
 const pipeDriver = await fixture("computer-pipe-driver");
 const pipeFilter = await fixture("computer-pipe-filter");
@@ -62,6 +64,15 @@ test("computer guest reads context and exits with status", () => {
   const process = new ComputerProcess(coreContext, context, MAX_GAS);
   assert.deepEqual(process.run(), { kind: "exited", code: 23 });
   assert.deepEqual(process.run(), { kind: "exited", code: 23 });
+});
+
+test("computer guest reads clocks and secure random", () => {
+  const process = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  assert.deepEqual(process.run(), { kind: "exited", code: 31 });
 });
 
 test("computer guest roundtrips terminal and filesystem", () => {
@@ -178,6 +189,90 @@ test("supervisor terminates the root as interrupted", () => {
   assert.deepEqual(supervisor.takeModifiedFiles(), []);
   // Termination is recorded: the computer stays exited on later runs.
   assert.deepEqual(supervisor.run(), { kind: "exited", code: 130 });
+});
+
+test("WebSocket TCP provider negotiates then carries bounded binary streams", () => {
+  const instances = [];
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.bufferedAmount = 0;
+      this.sent = [];
+      instances.push(this);
+    }
+
+    send(value) {
+      this.sent.push(value);
+    }
+
+    close() {
+      this.onclose?.();
+    }
+  }
+
+  let activity = 0;
+  const provider = new WebSocketTcpProvider(
+    "wss://relay.invalid/tcp",
+    () => activity++,
+    FakeWebSocket,
+  );
+  const stream = provider.connect("example.org:443");
+  const socket = instances[0];
+  socket.onopen();
+  assert.deepEqual(JSON.parse(socket.sent[0]), {
+    version: 1,
+    address: "example.org:443",
+  });
+  assert.equal(stream.write(new Uint8Array([1])), null);
+
+  socket.onmessage({ data: JSON.stringify({ type: "connected" }) });
+  assert.equal(stream.write(new Uint8Array([1, 2])), 2);
+  assert.ok(socket.sent[1] instanceof ArrayBuffer);
+  socket.onmessage({ data: new Uint8Array([3, 4, 5]) });
+  assert.deepEqual(stream.read(2), new Uint8Array([3, 4]));
+  assert.deepEqual(stream.read(2), new Uint8Array([5]));
+  assert.equal(stream.read(2), null);
+  assert.ok(activity >= 2);
+
+  stream.close();
+  assert.deepEqual(stream.read(2), new Uint8Array());
+});
+
+test("network capability roundtrips through a Host byte-stream provider", () => {
+  let closed = false;
+  const provider = {
+    connect(address) {
+      assert.equal(address, "fixture.invalid:443");
+      const incoming = [];
+      return {
+        read(capacity) {
+          if (incoming.length === 0) return null;
+          return Uint8Array.from(incoming.splice(0, capacity));
+        },
+        write(bytes) {
+          for (const byte of bytes) {
+            incoming.push(
+              byte >= 0x61 && byte <= 0x7a ? byte - (0x61 - 0x41) : byte,
+            );
+          }
+          return bytes.byteLength;
+        },
+        close() {
+          closed = true;
+        },
+      };
+    },
+  };
+  const process = new ComputerProcess(
+    tcpRoundtrip,
+    computerContext([], [["NET_TARGET", "fixture.invalid:443"]]),
+    MAX_GAS,
+    null,
+    provider,
+  );
+  process.setNetworkEnabled(true);
+  assert.equal(runToExit(process), 0);
+  assert.equal(closed, true);
 });
 
 test("network capability reports denied on the web host", () => {
