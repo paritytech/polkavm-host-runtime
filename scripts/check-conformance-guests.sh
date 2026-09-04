@@ -14,6 +14,8 @@ GUESTS=(
   "polkadot-host-computer-0.1/pipe-filter polkavm_computer_pipe_filter computer-pipe-filter.polkavm"
   "polkadot-host-computer-0.1/pipe-driver polkavm_computer_pipe_driver computer-pipe-driver.polkavm"
   "polkadot-host-computer-0.1/tcp-roundtrip polkavm_computer_tcp_roundtrip computer-tcp-roundtrip.polkavm"
+  "polkadot-host-computer-0.1/workspace-pane polkavm_computer_workspace_pane computer-workspace-pane.polkavm"
+  "polkadot-host-computer-0.1/workspace-driver polkavm_computer_workspace_driver computer-workspace-driver.polkavm"
 )
 
 for tool in cargo polkatool rustup; do

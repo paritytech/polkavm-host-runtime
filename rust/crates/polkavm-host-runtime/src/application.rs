@@ -345,6 +345,14 @@ impl CoreVmRuntime {
                 | Interruption::PipeClose { .. } => {
                     return Err(anyhow!("CoreVM guest requested a pipe operation"));
                 }
+                Interruption::WorkspaceSpawn { .. }
+                | Interruption::WorkspaceSendInput { .. }
+                | Interruption::WorkspaceRead { .. }
+                | Interruption::WorkspaceResize { .. }
+                | Interruption::WorkspaceWait { .. }
+                | Interruption::WorkspaceClose { .. } => {
+                    return Err(anyhow!("CoreVM guest requested a workspace operation"));
+                }
                 Interruption::Yield => return Ok(()),
                 Interruption::SetPalette { palette } => {
                     if palette.len() != 256 * 3 {
