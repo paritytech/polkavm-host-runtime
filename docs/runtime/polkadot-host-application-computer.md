@@ -197,6 +197,9 @@ The first executable slice uses these versioned imports:
 polkadot_host_0_1_core_args(pointer: u32, capacity: u32) -> i32
 polkadot_host_0_1_core_environment(pointer: u32, capacity: u32) -> i32
 polkadot_host_0_1_core_yield() -> ()
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
 polkadot_host_0_1_core_exit(status: i32) -> never
 ```
 
@@ -210,6 +213,12 @@ The read operations return bytes written when capacity is sufficient. Otherwise
 they return the required capacity as a negative `i32` and write nothing.
 Invalid guest memory fails the execution. Each encoded record is limited to
 64 KiB and 1,024 entries.
+
+Clock calls write one little-endian `u64` nanosecond value: monotonic time since
+the process was created, or wall time since the Unix epoch. The pointer-based
+record avoids target-specific 64-bit return-register conventions on 32-bit
+guests. `core_random` fills exactly the requested bytes from the Host CSPRNG;
+zero-length requests are invalid and one call is limited to 4 KiB.
 
 ### Stream operations
 
@@ -293,7 +302,12 @@ polkadot_host_0_1_net_close(handle)           -> 0 | error
 
 The Host grants the capability per computer (`set_network_enabled`); at most
 4 sockets, nonblocking, 64 KiB per transfer. Listen, accept, and UDP remain
-unimplemented. Wasm hosts currently report DENIED.
+unimplemented. Browser Hosts inject a byte-stream provider and remain DENIED
+when none is configured. The reference `WebSocketTcpProvider` opens a
+Host-selected relay URL, sends one JSON request
+`{"version":1,"address":"host:port"}`, waits for `{"type":"connected"}`, then
+exchanges raw TCP bytes as binary frames. TLS, HTTP, and SSH stay in the guest.
+Browser buffering is capped; activity wakes the yielded guest to retry.
 
 ### `host.tty`
 

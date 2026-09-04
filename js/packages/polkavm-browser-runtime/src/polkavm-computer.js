@@ -14,7 +14,7 @@
  * PolkaVM bytecode is translated to wasm by the staged translator in
  * polkavm-browser-runtime.wasm, and every hostcall is handled here.
  *
- * Networking is DENIED on the web host, matching the runtime's wasm build.
+ * Networking is denied unless the embedding Host injects a byte-stream provider.
  */
 
 "use strict";
@@ -48,6 +48,10 @@
   const MAX_BACKGROUND_PROCESSES = 4;
   const FIRST_FILE_HANDLE = 16;
   const MAX_TTY_TRANSFER = 64 * 1024;
+  const MAX_RANDOM_BYTES = 4 * 1024;
+  const MAX_OPEN_SOCKETS = 4;
+  const FIRST_SOCKET_HANDLE = 0x1000;
+  const MAX_NET_ADDRESS_BYTES = 256;
   const MAX_FS_TRANSFER = 1024 * 1024;
   const FS_OPEN_READ = 1;
   const FS_OPEN_WRITE = 2;
@@ -219,10 +223,157 @@
     };
   }
 
+  /**
+   * Generic WebSocket-to-TCP relay provider for browser Hosts.
+   *
+   * Protocol: the client opens `relayUrl`, sends one JSON text frame
+   * `{ \"version\": 1, \"address\": \"host:port\" }`, waits for
+   * `{ \"type\": \"connected\" }`, then exchanges raw TCP bytes as binary
+   * frames. `{ \"type\": \"error\" }` or WebSocket closure terminates the
+   * stream. TLS/HTTP/SSH remain entirely inside the guest.
+   */
+  class WebSocketTcpProvider {
+    constructor(
+      relayUrl,
+      onActivity = null,
+      WebSocketClass = globalThis.WebSocket,
+    ) {
+      if (typeof relayUrl !== "string" || relayUrl.length === 0) {
+        throw new Error("TCP relay URL must be non-empty");
+      }
+      if (typeof WebSocketClass !== "function") {
+        throw new Error("WebSocket is unavailable in this Host");
+      }
+      this.relayUrl = relayUrl;
+      this.onActivity = onActivity;
+      this.WebSocketClass = WebSocketClass;
+    }
+
+    connect(address) {
+      return new WebSocketTcpSocket(
+        this.relayUrl,
+        address,
+        this.onActivity,
+        this.WebSocketClass,
+      );
+    }
+  }
+
+  class WebSocketTcpSocket {
+    constructor(relayUrl, address, onActivity, WebSocketClass) {
+      this.incoming = [];
+      this.incomingOffset = 0;
+      this.connected = false;
+      this.closed = false;
+      this.onActivity = onActivity;
+      this.socket = new WebSocketClass(relayUrl);
+      this.socket.binaryType = "arraybuffer";
+      this.socket.onopen = () => {
+        this.socket.send(JSON.stringify({ version: 1, address }));
+      };
+      this.socket.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch {
+            this.#terminate();
+            return;
+          }
+          if (message?.type === "connected") {
+            this.connected = true;
+            this.#activity();
+          } else if (message?.type === "error") {
+            this.#terminate();
+          }
+          return;
+        }
+        const bytes =
+          event.data instanceof ArrayBuffer
+            ? new Uint8Array(event.data)
+            : ArrayBuffer.isView(event.data)
+              ? new Uint8Array(
+                  event.data.buffer,
+                  event.data.byteOffset,
+                  event.data.byteLength,
+                )
+              : null;
+        if (bytes === null) {
+          this.#terminate();
+          return;
+        }
+        if (bytes.byteLength > 0) {
+          this.incoming.push(bytes.slice());
+        }
+        this.#activity();
+      };
+      this.socket.onclose = () => this.#terminate();
+      this.socket.onerror = () => this.#terminate();
+    }
+
+    read(capacity) {
+      if (this.incoming.length === 0) {
+        return this.closed ? new Uint8Array() : null;
+      }
+      const output = new Uint8Array(capacity);
+      let written = 0;
+      while (written < capacity && this.incoming.length > 0) {
+        const chunk = this.incoming[0];
+        const available = chunk.byteLength - this.incomingOffset;
+        const count = Math.min(available, capacity - written);
+        output.set(
+          chunk.subarray(this.incomingOffset, this.incomingOffset + count),
+          written,
+        );
+        written += count;
+        this.incomingOffset += count;
+        if (this.incomingOffset === chunk.byteLength) {
+          this.incoming.shift();
+          this.incomingOffset = 0;
+        }
+      }
+      return output.subarray(0, written);
+    }
+
+    write(bytes) {
+      if (!this.connected) {
+        if (this.closed) {
+          throw new Error("TCP relay stream is closed");
+        }
+        return null;
+      }
+      // Bound browser buffering; the guest yields and retries after activity.
+      if (this.socket.bufferedAmount > 1024 * 1024) {
+        return null;
+      }
+      const owned = bytes.slice();
+      this.socket.send(owned.buffer);
+      return owned.byteLength;
+    }
+
+    close() {
+      this.#terminate();
+    }
+
+    #activity() {
+      this.onActivity?.();
+    }
+
+    #terminate() {
+      if (this.closed) {
+        return;
+      }
+      this.closed = true;
+      this.connected = false;
+      this.socket.close();
+      this.#activity();
+    }
+  }
+
   /** Terminal and filesystem devices granted to one computer guest
    * (mirror of ComputerDevices). */
   class ComputerDevices {
-    constructor() {
+    constructor(networkProvider = null) {
       this.ttyInput = [];
       this.ttyInputClosed = false;
       this.ttyOutput = [];
@@ -232,6 +383,99 @@
       this.files = new Map();
       this.modified = new Set();
       this.openFiles = new Map();
+      this.networkProvider = networkProvider;
+      this.networkEnabled = false;
+      this.sockets = new Map();
+      this.nextSocket = FIRST_SOCKET_HANDLE;
+    }
+
+    setNetworkEnabled(enabled) {
+      this.networkEnabled = enabled;
+      if (!enabled) {
+        for (const socket of this.sockets.values()) {
+          socket.close();
+        }
+        this.sockets.clear();
+      }
+    }
+
+    netTcpConnect(address) {
+      if (!this.networkEnabled || this.networkProvider === null) {
+        return STATUS_DENIED;
+      }
+      if (this.sockets.size >= MAX_OPEN_SOCKETS) {
+        return STATUS_LIMIT;
+      }
+      let socket;
+      try {
+        socket = this.networkProvider.connect(address);
+      } catch {
+        return STATUS_INVALID;
+      }
+      if (
+        socket === null ||
+        typeof socket.read !== "function" ||
+        typeof socket.write !== "function" ||
+        typeof socket.close !== "function"
+      ) {
+        return STATUS_INVALID;
+      }
+      if (this.nextSocket > 0xffffffff) {
+        socket.close();
+        return STATUS_LIMIT;
+      }
+      const handle = this.nextSocket++;
+      this.sockets.set(handle, socket);
+      return handle;
+    }
+
+    netRead(handle, capacity) {
+      const socket = this.sockets.get(handle);
+      if (socket === undefined) {
+        return { status: STATUS_BAD_HANDLE, bytes: new Uint8Array() };
+      }
+      try {
+        const bytes = socket.read(capacity);
+        if (bytes === null) {
+          return { status: STATUS_WOULD_BLOCK, bytes: new Uint8Array() };
+        }
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength > capacity) {
+          return { status: STATUS_INVALID, bytes: new Uint8Array() };
+        }
+        return { status: bytes.byteLength, bytes };
+      } catch {
+        return { status: STATUS_INVALID, bytes: new Uint8Array() };
+      }
+    }
+
+    netWrite(handle, bytes) {
+      const socket = this.sockets.get(handle);
+      if (socket === undefined) {
+        return STATUS_BAD_HANDLE;
+      }
+      try {
+        const written = socket.write(bytes);
+        if (written === null) {
+          return STATUS_WOULD_BLOCK;
+        }
+        return Number.isInteger(written) &&
+          written >= 0 &&
+          written <= bytes.byteLength
+          ? written
+          : STATUS_INVALID;
+      } catch {
+        return STATUS_INVALID;
+      }
+    }
+
+    netClose(handle) {
+      const socket = this.sockets.get(handle);
+      if (socket === undefined) {
+        return STATUS_BAD_HANDLE;
+      }
+      this.sockets.delete(handle);
+      socket.close();
+      return 0;
     }
 
     pushTerminalInput(bytes) {
@@ -496,20 +740,21 @@
 
   /** One translated computer guest process (mirror of ComputerRuntime). */
   class ComputerProcess {
-    constructor(module, context, maxGas, emitLog = null) {
+    constructor(module, context, maxGas, emitLog = null, networkProvider = null) {
       this.metadata = readMetadata(module);
       this.instance = new WebAssembly.Instance(module, {});
       this.pvm = this.instance.exports;
       this.memory = this.pvm.memory;
       this.maxGas = BigInt(maxGas);
       this.emitLog = emitLog;
-      this.devices = new ComputerDevices();
+      this.devices = new ComputerDevices(networkProvider);
       this.encodedArguments = context.encodedArguments;
       this.encodedEnvironment = context.encodedEnvironment;
       this.exitStatus = null;
       this.pendingSpawn = null;
       this.pendingChildRequest = null;
       this.resumePending = false;
+      this.monotonicEpoch = performance.now();
       const start = this.metadata.exports.get("_pvm_start");
       if (start === undefined) {
         throw new Error("computer guests must export '_pvm_start'");
@@ -652,6 +897,10 @@
       this.devices.closeInput();
     }
 
+    setNetworkEnabled(enabled) {
+      this.devices.setNetworkEnabled(enabled);
+    }
+
     setTerminalSize(columns, rows) {
       if (!columns || !rows || columns > 1000 || rows > 1000) {
         throw new Error(`invalid terminal size ${columns}x${rows}`);
@@ -690,6 +939,44 @@
         case "polkadot_host_0_1_core_environment":
           this.#writeRecord(a0, a1, this.encodedEnvironment);
           return "continue";
+        case "polkadot_host_0_1_core_clock_monotonic": {
+          const record = new Uint8Array(8);
+          new DataView(record.buffer).setBigUint64(
+            0,
+            BigInt(
+              Math.floor((performance.now() - this.monotonicEpoch) * 1e6),
+            ),
+            true,
+          );
+          this.#write(this.#u32(a0), record);
+          this.#setReg(7, 0n);
+          return "continue";
+        }
+        case "polkadot_host_0_1_core_clock_wall": {
+          const record = new Uint8Array(8);
+          new DataView(record.buffer).setBigUint64(
+            0,
+            BigInt(Date.now()) * 1_000_000n,
+            true,
+          );
+          this.#write(this.#u32(a0), record);
+          this.#setReg(7, 0n);
+          return "continue";
+        }
+        case "polkadot_host_0_1_core_random": {
+          const length = this.#u32(a1);
+          if (length === 0) {
+            this.#setReg(7, BigInt(STATUS_INVALID));
+          } else if (length > MAX_RANDOM_BYTES) {
+            this.#setReg(7, BigInt(STATUS_LIMIT));
+          } else {
+            const bytes = new Uint8Array(length);
+            crypto.getRandomValues(bytes);
+            this.#write(this.#u32(a0), bytes);
+            this.#setReg(7, 0n);
+          }
+          return "continue";
+        }
         case "polkadot_host_0_1_tty_current":
           this.#setReg(7, BigInt(COMPUTER_TTY_HANDLE));
           return "continue";
@@ -864,13 +1151,46 @@
         case "polkadot_host_0_1_pipe_close":
           this.pendingChildRequest = { kind: "pipeClose", pid: this.#u32(a0) };
           return "child";
-        case "polkadot_host_0_1_net_tcp_connect":
-        case "polkadot_host_0_1_net_read":
-        case "polkadot_host_0_1_net_write":
+        case "polkadot_host_0_1_net_tcp_connect": {
+          const address = this.#readString(a0, a1, MAX_NET_ADDRESS_BYTES);
+          this.#setReg(
+            7,
+            BigInt(
+              address === null
+                ? STATUS_INVALID
+                : this.devices.netTcpConnect(address),
+            ),
+          );
+          return "continue";
+        }
+        case "polkadot_host_0_1_net_read": {
+          const capacity = Math.min(this.#u32(a2), MAX_TTY_TRANSFER);
+          const result = this.devices.netRead(this.#u32(a0), capacity);
+          if (result.status > 0) {
+            this.#write(this.#u32(a1), result.bytes);
+          }
+          this.#setReg(7, BigInt(result.status));
+          return "continue";
+        }
+        case "polkadot_host_0_1_net_write": {
+          const length = this.#u32(a2);
+          if (length > MAX_TTY_TRANSFER) {
+            this.#setReg(7, BigInt(STATUS_LIMIT));
+          } else {
+            this.#setReg(
+              7,
+              BigInt(
+                this.devices.netWrite(
+                  this.#u32(a0),
+                  this.#read(this.#u32(a1), length),
+                ),
+              ),
+            );
+          }
+          return "continue";
+        }
         case "polkadot_host_0_1_net_close":
-          // The web host has no socket capability, matching the runtime's
-          // wasm build: everything reports DENIED.
-          this.#setReg(7, BigInt(STATUS_DENIED));
+          this.#setReg(7, BigInt(this.devices.netClose(this.#u32(a0))));
           return "continue";
         case "host_log": {
           const length = Math.min(this.#u32(a1), 4096);
@@ -1022,7 +1342,16 @@
   class ComputerSupervisor {
     constructor(module, context, maxGas, emitLog = null, options = null) {
       this.packages = new Map();
-      this.stack = [new ComputerProcess(module, context, maxGas, emitLog)];
+      this.networkProvider = options?.networkProvider ?? null;
+      this.stack = [
+        new ComputerProcess(
+          module,
+          context,
+          maxGas,
+          emitLog,
+          this.networkProvider,
+        ),
+      ];
       this.background = [];
       this.nextPid = 2;
       this.pendingOutput = [];
@@ -1031,6 +1360,7 @@
       this.modified = new Map();
       this.maxGas = maxGas;
       this.emitLog = emitLog;
+      this.network = false;
       this.columns = 80;
       this.rows = 24;
       // Open spawn: when enabled, a spawn naming an unregistered package
@@ -1098,6 +1428,19 @@
     mountFile(path, bytes) {
       this.#foreground().mountFile(path, bytes);
       this.files.set(path, Uint8Array.from(bytes));
+    }
+
+    setNetworkEnabled(enabled) {
+      if (enabled && this.networkProvider === null) {
+        throw new Error("network capability requires a Host network provider");
+      }
+      for (const process of this.stack) {
+        process.setNetworkEnabled(enabled);
+      }
+      for (const child of this.background) {
+        child.process.setNetworkEnabled(enabled);
+      }
+      this.network = enabled;
     }
 
     setTerminalSize(columns, rows) {
@@ -1282,8 +1625,14 @@
       }
       let child;
       try {
-        child = new ComputerProcess(module, context, this.maxGas, this.emitLog);
-        child.setTerminalSize(this.columns, this.rows);
+        child = new ComputerProcess(
+          module,
+          context,
+          this.maxGas,
+          this.emitLog,
+          this.networkProvider,
+        );
+        child.setNetworkEnabled(this.network);
         for (const [path, bytes] of this.files) {
           child.mountFile(path, bytes);
         }
@@ -1489,6 +1838,7 @@
     ComputerProcess,
     ComputerSupervisor,
     ComputerTranslator,
+    WebSocketTcpProvider,
     STATUS_WOULD_BLOCK,
     STATUS_BAD_HANDLE,
     STATUS_INVALID,
