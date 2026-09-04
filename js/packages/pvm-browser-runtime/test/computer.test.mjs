@@ -39,6 +39,8 @@ const roundtrip = await fixture("computer-tty-fs-roundtrip");
 const pipeDriver = await fixture("computer-pipe-driver");
 const pipeFilter = await fixture("computer-pipe-filter");
 const tcpRoundtrip = await fixture("computer-tcp-roundtrip");
+const workspaceDriver = await fixture("computer-workspace-driver");
+const workspacePane = await fixture("computer-workspace-pane");
 
 const text = (bytes) => new TextDecoder().decode(bytes);
 
@@ -410,4 +412,45 @@ test("network capability reports denied on the web host", () => {
   );
   // The tcp fixture maps a DENIED connect to its distinct exit code 21.
   assert.equal(runToExit(process), 21);
+});
+
+test("workspace guest supervises an independent child", () => {
+  const supervisor = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("pane", workspacePane);
+  supervisor.setWorkspaceEnabled(true);
+
+  // The driver asserts every contract detail internally (bad handles,
+  // unknown package, invalid geometry, banner, byte roundtrip, resize
+  // observability, nested denial, persistence, exit reporting, EOF after
+  // drain, close-once) and exits nonzero with a distinct code on the
+  // first violation.
+  assert.equal(runToExit(supervisor), 0);
+  assert.equal(text(supervisor.takeTerminalOutput()), "workspace:ok");
+
+  // The pane's `/home` write surfaced through the parent supervisor.
+  const modified = supervisor.takeModifiedFiles();
+  assert.ok(
+    modified.some(
+      ([path, bytes]) =>
+        path === "/home/pane.txt" && text(bytes) === "from-pane",
+    ),
+    `pane write should merge into the parent /home: ${modified.map(([path]) => path)}`,
+  );
+});
+
+test("workspace operations are denied without the grant", () => {
+  const supervisor = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("pane", workspacePane);
+
+  // Without setWorkspaceEnabled the driver's first probe observes DENIED
+  // and exits with its distinct gating code.
+  assert.equal(runToExit(supervisor), 41);
 });
