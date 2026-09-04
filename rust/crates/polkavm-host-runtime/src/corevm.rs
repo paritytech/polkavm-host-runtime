@@ -128,6 +128,7 @@ enum ComputerCall {
     FsStat,
     FsSync,
     FsClose,
+    FsRemove,
     FsList,
     ProcessRun,
     ProcessSpawn,
@@ -160,6 +161,7 @@ fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
         b"polkadot_host_0_1_fs_stat" => ComputerCall::FsStat,
         b"polkadot_host_0_1_fs_sync" => ComputerCall::FsSync,
         b"polkadot_host_0_1_fs_close" => ComputerCall::FsClose,
+        b"polkadot_host_0_1_fs_remove" => ComputerCall::FsRemove,
         b"polkadot_host_0_1_fs_list" => ComputerCall::FsList,
         b"polkadot_host_0_1_process_run" => ComputerCall::ProcessRun,
         b"polkadot_host_0_1_process_spawn" => ComputerCall::ProcessSpawn,
@@ -1413,6 +1415,15 @@ impl Vm {
             }
             ComputerCall::FsClose => {
                 let result = self.computer.fs_close(a0 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsRemove => {
+                let result = self
+                    .read_computer_path(a0, a1)?
+                    .as_deref()
+                    .map_or(crate::computer::STATUS_INVALID, |path| {
+                        self.computer.fs_remove(path)
+                    });
                 self.instance.set_reg(Reg::A0, status(result));
             }
             ComputerCall::FsList => {

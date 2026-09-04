@@ -89,6 +89,7 @@ fn computer_guest_roundtrips_terminal_and_filesystem() {
     assert_eq!(drain_output(&mut runtime), b"ready:seeded\r\n");
     assert_eq!(runtime.terminal_mode(), polkavm_host_runtime::TTY_MODE_RAW);
     assert!(runtime.take_modified_files().is_empty());
+    assert!(runtime.take_removed_files().is_empty());
 
     runtime.send_terminal_input(b"hello").unwrap();
     assert_eq!(runtime.run().unwrap(), ComputerStatus::Yielded);
@@ -104,6 +105,10 @@ fn computer_guest_roundtrips_terminal_and_filesystem() {
     assert_eq!(
         runtime.take_modified_files(),
         vec![("/home/echo.txt".to_owned(), b"hello pvm".to_vec())]
+    );
+    assert_eq!(
+        runtime.take_removed_files(),
+        vec!["/home/remove.tmp".to_owned()]
     );
 
     let mut relaunched = ComputerRuntime::new_with_backend(

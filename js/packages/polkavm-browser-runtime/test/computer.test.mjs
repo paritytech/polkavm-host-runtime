@@ -88,6 +88,7 @@ test("computer guest roundtrips terminal and filesystem", () => {
   assert.equal(text(process.takeTerminalOutput()), "ready:seeded\r\n");
   assert.equal(process.terminalMode(), TTY_MODE_RAW);
   assert.deepEqual(process.takeModifiedFiles(), []);
+  assert.deepEqual(process.takeRemovedFiles(), []);
 
   process.sendTerminalInput(new TextEncoder().encode("hello"));
   assert.equal(process.run().kind, "yielded");
@@ -103,6 +104,7 @@ test("computer guest roundtrips terminal and filesystem", () => {
   assert.equal(modified.length, 1);
   assert.equal(modified[0][0], "/home/echo.txt");
   assert.equal(text(modified[0][1]), "hello pvm");
+  assert.deepEqual(process.takeRemovedFiles(), ["/home/remove.tmp"]);
 });
 
 test("guest streams bytes through a piped child and reaps it", () => {
