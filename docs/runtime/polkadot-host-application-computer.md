@@ -355,50 +355,70 @@ SplitHorizontal
     +-- ssh.pvm
 ```
 
-### Draft `host.workspace` surface ABI (unimplemented)
+### `host.workspace` (prototype)
 
-Design draft; binary signatures follow the conventions above and must be
-pinned by conformance fixtures before any Host advertises them.
+Binary signatures follow the conventions above and are pinned by conformance
+fixtures before any Host advertises them as stable.
 
 A surface is an opaque handle owned by the Host, like every other resource.
-Two surface kinds exist initially, and both deliberately avoid a fixed bitmap
-geometry:
+Two surface kinds exist; both deliberately avoid a fixed bitmap geometry:
 
-- `text`: a column/row cell grid. The Host renders cells natively, so
-  terminals stay DPI-independent on every platform (this removes the current
-  640x400 presentation ceiling rather than generalizing it).
+- `text`: an ANSI byte stream over a column/row cell grid. The workspace
+  guest emulates each child grid itself (the tmux model) and repaints its own
+  terminal, so the Host renders exactly one terminal natively and terminals
+  stay DPI-independent on every platform.
 - `frame`: an RGBA framebuffer presented whole. This is the phase-7 graphics
   contract and is not required for the tiling milestone.
 
+In `0.1` each child owns exactly one `text` surface, so the child handle
+doubles as the surface handle; a separate surface handle space is reserved
+for multi-surface children and `frame` surfaces.
+
 ```text
-polkadot_host_0_1_workspace_spawn(package, argv, environment)
-    -> (child_handle, surface_handle) | error
-polkadot_host_0_1_workspace_run(child_handle) -> status
-polkadot_host_0_1_workspace_send_input(child_handle, record_pointer, length)
-    -> written | WOULD_BLOCK | error
-polkadot_host_0_1_workspace_resize(child_handle, columns, rows) -> status
-polkadot_host_0_1_workspace_surface_read(surface_handle, pointer, capacity)
-    -> length | WOULD_BLOCK | error
-polkadot_host_0_1_workspace_close(child_handle) -> status
+polkadot_host_0_1_workspace_spawn(pkg_ptr, pkg_len, args_ptr, args_len,
+                                  columns, rows) -> child handle | error
+polkadot_host_0_1_workspace_send_input(child, source, length)
+    -> written | error
+polkadot_host_0_1_workspace_read(child, destination, capacity)
+    -> bytes | 0 after exit drained | WOULD_BLOCK
+polkadot_host_0_1_workspace_resize(child, columns, rows) -> status
+polkadot_host_0_1_workspace_wait(child) -> exit status | WOULD_BLOCK
+polkadot_host_0_1_workspace_close(child) -> status
 ```
+
+A workspace child is a complete computer: a nested supervisor with its own
+foreground stack, piped children, and granted `/home` view, whose terminal
+endpoint is the parent-held child handle instead of the Host terminal. A
+shell pane can therefore `process_run` Vim without any workspace-specific
+support. Nesting depth is bounded: a workspace child is not granted
+`host.workspace` in `0.1`.
+
+Scheduling stays cooperative and inherits the piped-children rule: children
+execute only while the workspace guest is suspended inside a workspace
+hostcall or `core_yield`. Package resolution uses the same Host-owned
+registry and open-spawn suspension as `process_spawn`.
 
 Invariants carried over from the terminal-computer supervisor:
 
 - The Host owns every child VM, its gas budget, its capability grants, and its
-  fault containment. `workspace_run` returns the same status codes as
-  `process_run`; a faulted child is reported and reaped, never resurrected.
-- The workspace guest sees only surface output records and child exit status.
+  fault containment. A faulted child is reported through `workspace_wait`
+  with the same status codes as `process_run` and is reaped, never
+  resurrected.
+- The workspace guest sees only surface output bytes and child exit status.
   It never reads child memory, files, or capability state.
 - Input is routed, not shared: the Host delivers input records exclusively to
   the workspace, which forwards bytes to at most one focused child per call.
   Host-authority cancellation (the Ctrl-] equivalent) always targets the
   workspace itself and cannot be intercepted by it.
-- `workspace_resize` obeys the existing 1..=1000 column/row clamp, and surface
-  reads are bounded by the same queue limits as terminal output.
+- `workspace_resize` obeys the existing 1..=1000 column/row clamp; a child
+  observes the new geometry through `tty_get_size` on its next read. Surface
+  reads, input queues, and transfer sizes obey the same bounds as terminal
+  output (64 KiB per transfer, bounded per-child queues), and at most 4
+  workspace children are live at once.
 
 A workspace application therefore composes existing contracts: it is an
-ordinary computer guest whose extra capability is holding child and surface
-handles. Layout, focus, and keybindings are guest policy.
+ordinary computer guest whose extra capability is holding child handles.
+Layout, focus, and keybindings are guest policy.
 
 A first tiling workspace may implement bindings such as:
 
