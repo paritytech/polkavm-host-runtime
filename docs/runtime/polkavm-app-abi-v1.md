@@ -268,6 +268,13 @@ ABI v1 event types are:
 14  wheel delta (`x` and `y` are signed i16)
 ```
 
+Pointer button, position, and delta records are baseline optional input. An App
+does not list `pointer` in `deviceInput.requiredFeatures`: a Host with no
+pointer source simply emits no pointer records, and that absence is not a
+launch failure. Pointer capture is Host policy in ABI v1 and is not selected by
+the manifest. A later ABI can let the guest arm capture for the next eligible
+primary activation without turning capture into a package capability.
+
 Text and IME records use `code` bits 0–2 as a payload length from zero through
 six, bit 6 for the first chunk, and bit 7 for the last chunk. Bytes 2–7 contain
 the chunk and zero padding. A complete text event is at most 4 KiB. The Host
