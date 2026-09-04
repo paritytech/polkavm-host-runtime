@@ -237,10 +237,13 @@ polkadot_host_0_1_fs_truncate(handle, length) -> status
 polkadot_host_0_1_fs_stat(path_pointer, path_length, record_pointer) -> status
 polkadot_host_0_1_fs_sync(handle) -> status
 polkadot_host_0_1_fs_close(handle) -> status
+polkadot_host_0_1_fs_remove(path_pointer, path_length) -> status
 ```
 
 The first implementation uses a virtual filesystem with a Host-provided
-persistent `/home` mount.
+persistent `/home` mount. Removing an open file returns `DENIED`; a successful
+removal is reported separately from modified file contents so persistence
+adapters can delete the backing entry.
 
 ### `host.process`
 

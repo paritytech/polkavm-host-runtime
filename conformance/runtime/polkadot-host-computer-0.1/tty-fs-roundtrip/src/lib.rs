@@ -12,6 +12,7 @@
 
 const SEED_PATH: &[u8] = b"/home/seed.txt";
 const ECHO_PATH: &[u8] = b"/home/echo.txt";
+const REMOVE_PATH: &[u8] = b"/home/remove.tmp";
 const MODE_RAW: u32 = 1;
 const OPEN_READ: u32 = 1;
 const OPEN_WRITE: u32 = 2;
@@ -40,6 +41,7 @@ extern "C" {
     fn polkadot_host_0_1_fs_stat(path: u32, path_length: u32, record: u32) -> i32;
     fn polkadot_host_0_1_fs_sync(handle: u32) -> i32;
     fn polkadot_host_0_1_fs_close(handle: u32) -> i32;
+    fn polkadot_host_0_1_fs_remove(path: u32, path_length: u32) -> i32;
 }
 
 fn tty_write(handle: u32, bytes: &[u8]) {
@@ -94,6 +96,20 @@ fn save_and_exit() -> ! {
         assert_eq!(written, RECEIVED_LENGTH as i32);
         assert_eq!(polkadot_host_0_1_fs_sync(handle), 0);
         assert_eq!(polkadot_host_0_1_fs_close(handle), 0);
+        let remove_handle = polkadot_host_0_1_fs_open(
+            REMOVE_PATH.as_ptr() as u32,
+            REMOVE_PATH.len() as u32,
+            OPEN_WRITE | OPEN_CREATE,
+        );
+        assert!(remove_handle > 0);
+        assert_eq!(polkadot_host_0_1_fs_close(remove_handle as u32), 0);
+        assert_eq!(
+            polkadot_host_0_1_fs_remove(
+                REMOVE_PATH.as_ptr() as u32,
+                REMOVE_PATH.len() as u32,
+            ),
+            0
+        );
         polkadot_host_0_1_core_exit(EXIT_SUCCESS);
     }
     unreachable!()
