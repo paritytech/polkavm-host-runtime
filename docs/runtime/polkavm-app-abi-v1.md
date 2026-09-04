@@ -25,7 +25,7 @@ the Host imports available to those applications, guest-memory rules, common
 resource bounds, and failure behavior.
 
 Graphics command payloads are defined by the separately versioned Framebuffer,
-[Tri2D](tri2d-v1.md), and WebGPU Raster profile contracts. The `_pvm_start` CoreVM
+[Tri2D](tri2d-v1.md), WebGPU Raster, and WebGPU profile contracts. The `_pvm_start` CoreVM
 compatibility path is outside this ABI and must be specified separately before
 it is advertised as a portable Product runtime.
 
@@ -128,15 +128,16 @@ Return values:
 The [Tri2D profile contract](tri2d-v1.md) defines the command stream and
 retained-resource semantics.
 
-### WebGPU Raster capabilities
+### WebGPU capabilities
 
 ```text
 host_gpu_capabilities(pointer: u32, capacity: u32) -> i32
 ```
 
-The selected graphics profile MUST be `webgpu-raster`. The Host writes the
-current WebGPU Raster capability record when the supplied capacity is
-sufficient.
+The selected graphics profile MUST be `webgpu-raster` or `webgpu`. The Host
+writes the current WebGPU capability record when the supplied capacity is
+sufficient. `webgpu-raster` exposes only raster commands. `webgpu` exposes the
+same resource table plus compute pipeline and dispatch commands.
 
 Return values:
 
@@ -144,20 +145,21 @@ Return values:
 > 0  capability-record bytes written
   0  capabilities are not ready
 < 0  required capacity, represented as the negated byte count, or a stable
-     GPU error defined by the WebGPU Raster contract
+     GPU error defined by the selected WebGPU contract
 ```
 
-### WebGPU Raster submission
+### WebGPU submission
 
 ```text
 host_gpu_submit(pointer: u32, length: u32) -> i32
 ```
 
-The call submits one complete WebGPU Raster batch. Acceptance means that the
-batch passed synchronous Host validation and was queued; it does not imply
-shader compilation or GPU completion.
+The call submits one complete WebGPU batch. Acceptance means that the batch
+passed synchronous Host validation and was queued; it does not imply shader
+compilation or GPU completion. A `webgpu-raster` Host MUST reject compute
+commands. A `webgpu` Host accepts both raster and compute commands.
 
-Return values are defined by the WebGPU Raster contract. ABI v1 reserves:
+Return values are defined by the selected WebGPU contract. ABI v1 reserves:
 
 ```text
  0  accepted
@@ -170,19 +172,19 @@ Return values are defined by the WebGPU Raster contract. ABI v1 reserves:
 -6  stopped execution
 ```
 
-### WebGPU Raster events
+### WebGPU events
 
 ```text
 host_gpu_receive(pointer: u32, capacity: u32) -> i32
 ```
 
-The call reads the oldest queued WebGPU Raster event.
+The call reads the oldest queued WebGPU event.
 
 ```text
 > 0  event bytes written
   0  no event is available
 < 0  required capacity, represented as the negated byte count, or a stable
-     GPU error defined by the WebGPU Raster contract
+     GPU error defined by the selected WebGPU contract
 ```
 
 ### TrUAPI transport
@@ -579,8 +581,8 @@ replaced, or platform lifecycle policy requires termination. ABI v1 does not
 promise transparent restoration of guest memory or graphics resources after a
 stop.
 
-Device loss and recoverable WebGPU Raster errors are delivered according to
-the WebGPU Raster event contract. They do not permit stale resource handles to
+Device loss and recoverable WebGPU errors are delivered according to the
+selected WebGPU event contract. They do not permit stale resource handles to
 be reused.
 
 ## Version compatibility

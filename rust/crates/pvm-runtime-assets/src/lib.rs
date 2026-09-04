@@ -26,31 +26,31 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "pvm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/pvm-browser-runtime.wasm"),
-        sha256: "2788972bdcff6a4e1f0735bda7c59dd4e4960931c4ff7b993ae98c93a8e5f587",
+        sha256: "7082fa7765d212e3934ca6ab5024dc489c7f9b574bab9c3bbe998296ae8de81e",
     },
     BrowserAsset {
         path: "pvm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-worker.js"),
-        sha256: "70b26828398cd795b00e588f5a9795deb24736bf12870d8e049afef35b780326",
+        sha256: "c0ea902cde5705729a037bf000911b45289b7a67ae8f7719d658016f1f6fc347",
     },
     BrowserAsset {
         path: "pvm-gpu-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-gpu-worker.js"),
-        sha256: "f087808bee3d0e2bdb2905b20a4bc1d0a2e32998b73786018f4bdd50210cf566",
+        sha256: "13a1d354904667dd288d88ac6cffc17e9bb0401cafb2aee8b5e71d85a7e16c60",
     },
     BrowserAsset {
         path: "pvm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-wasm-translated.js"),
-        sha256: "0285edc7bfc7f38fd5be06a74cd5577b51b0bfa4ca3304ff88745fd803152261",
+        sha256: "c282e8d3f45ac10d3dc85dfcd06e6e6931d0830e896c07c6381d2c55c1c308ab",
     },
     BrowserAsset {
         path: "pvm-runtime-core.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-runtime-core.js"),
-        sha256: "98414bbdb08ae75de68f51746dc6f935edf51e56bbd7dcb7859836997a7538a6",
+        sha256: "c8a3f129f9a564badf52eb02ce4b9d8ab4ad1efcbd97916c1c003246ef3b9e7a",
     },
     BrowserAsset {
         path: "pvm-wasm-worker-entry.js",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "901eb82962f73b5630a3879e291e3fc7d24983083ab2c0e78286bb1d90fc031e",
+        sha256: "ce026e6cc3bc1d90769c5dba6dc235958bd3254293325e171fa29e526099f5a2",
     },
 ];
 

@@ -314,6 +314,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     }
   }
 
+  function isWebGpuProfile(profile) {
+    return profile === "webgpu-raster" || profile === "webgpu";
+  }
+
   function validateStartMessage(message) {
     if (
       !(message.runtime instanceof WebAssembly.Module) &&
@@ -328,7 +332,7 @@ globalThis.createPvmRuntime = (endpoint) => {
       );
     }
     if (
-      !["framebuffer", "tri2d", "webgpu-raster"].includes(
+      !["framebuffer", "tri2d", "webgpu-raster", "webgpu"].includes(
         message.graphicsProfile,
       )
     ) {
@@ -374,7 +378,7 @@ globalThis.createPvmRuntime = (endpoint) => {
       }
     }
     if (
-      message.graphicsProfile === "webgpu-raster" &&
+      isWebGpuProfile(message.graphicsProfile) &&
       !(message.gpuCapabilities instanceof ArrayBuffer)
     ) {
       throw new Error(
@@ -492,6 +496,8 @@ globalThis.createPvmRuntime = (endpoint) => {
         presentation = 1;
       } else if (message.graphicsProfile === "webgpu-raster") {
         presentation = 2;
+      } else if (message.graphicsProfile === "webgpu") {
+        presentation = 3;
       }
       const begin = pvm.pvm_browser_launch_begin_v2;
       if (typeof begin !== "function") {
@@ -528,7 +534,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         );
         pendingMotionSample = null;
       }
-      if (message.graphicsProfile === "webgpu-raster") {
+      if (isWebGpuProfile(message.graphicsProfile)) {
         if (pendingGpuCapabilities === null) {
           throw new Error(
             "WebGPU capabilities are required before PVM initialization",

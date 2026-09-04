@@ -55,6 +55,8 @@ pub const MAX_GPU_VERTEX_ATTRIBUTES: usize = 16;
 pub const MAX_GPU_COLOR_ATTACHMENTS: usize = 4;
 pub const MAX_GPU_RENDER_PASSES_PER_BATCH: usize = 16;
 pub const MAX_GPU_DRAWS_PER_BATCH: usize = 8_192;
+pub const MAX_GPU_COMPUTE_PASSES_PER_BATCH: usize = 64;
+pub const MAX_GPU_DISPATCHES_PER_BATCH: usize = 8_192;
 
 pub const GPU_SUBMIT_ACCEPTED: i32 = 0;
 pub const GPU_SUBMIT_BUSY: i32 = 1;
@@ -82,6 +84,15 @@ pub enum GpuCapabilityKey {
     MaxDrawsPerBatch = 10,
     MaxBatchBytes = 11,
     MaxUploadBytesPerTick = 12,
+    MaxStorageBufferBindingSize = 13,
+    MaxStorageBuffersPerShaderStage = 14,
+    MaxComputeWorkgroupStorageSize = 15,
+    MaxComputeInvocationsPerWorkgroup = 16,
+    MaxComputeWorkgroupSizeX = 17,
+    MaxComputeWorkgroupSizeY = 18,
+    MaxComputeWorkgroupSizeZ = 19,
+    MaxComputeWorkgroupsPerDimension = 20,
+    MaxDispatchesPerBatch = 21,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +133,12 @@ pub enum GpuOpcode {
     EndRenderPass = 21,
     CopyBufferToBuffer = 22,
     CreateTextureView = 23,
+    CreateComputePipeline = 24,
+    BeginComputePass = 25,
+    SetComputePipeline = 26,
+    SetComputeBindGroup = 27,
+    DispatchWorkgroups = 28,
+    EndComputePass = 29,
 }
 
 impl TryFrom<u16> for GpuOpcode {
@@ -152,6 +169,12 @@ impl TryFrom<u16> for GpuOpcode {
             21 => Ok(Self::EndRenderPass),
             22 => Ok(Self::CopyBufferToBuffer),
             23 => Ok(Self::CreateTextureView),
+            24 => Ok(Self::CreateComputePipeline),
+            25 => Ok(Self::BeginComputePass),
+            26 => Ok(Self::SetComputePipeline),
+            27 => Ok(Self::SetComputeBindGroup),
+            28 => Ok(Self::DispatchWorkgroups),
+            29 => Ok(Self::EndComputePass),
             _ => Err(()),
         }
     }
@@ -279,6 +302,7 @@ pub enum GpuBindingKind {
     Sampler = 2,
     Texture = 3,
     StorageBuffer = 4,
+    StorageBufferReadWrite = 5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -644,6 +668,13 @@ fn validate_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
         GpuOpcode::DrawIndexed => exact_payload(index, opcode, payload, 20),
         GpuOpcode::EndRenderPass => exact_payload(index, opcode, payload, 0),
         GpuOpcode::CreateTextureView => exact_payload(index, opcode, payload, 20),
+        GpuOpcode::CreateComputePipeline => exact_payload(index, opcode, payload, 16),
+        GpuOpcode::BeginComputePass | GpuOpcode::EndComputePass => {
+            exact_payload(index, opcode, payload, 0)
+        }
+        GpuOpcode::SetComputePipeline => exact_payload(index, opcode, payload, 4),
+        GpuOpcode::SetComputeBindGroup => counted_payload(index, opcode, payload, 12, 8, 4),
+        GpuOpcode::DispatchWorkgroups => exact_payload(index, opcode, payload, 12),
     }
 }
 
@@ -929,6 +960,12 @@ mod tests {
             (GpuOpcode::EndRenderPass, 0),
             (GpuOpcode::CopyBufferToBuffer, 32),
             (GpuOpcode::CreateTextureView, 20),
+            (GpuOpcode::CreateComputePipeline, 16),
+            (GpuOpcode::BeginComputePass, 0),
+            (GpuOpcode::SetComputePipeline, 4),
+            (GpuOpcode::SetComputeBindGroup, 12),
+            (GpuOpcode::DispatchWorkgroups, 12),
+            (GpuOpcode::EndComputePass, 0),
         ];
         for (opcode, payload_bytes) in payloads {
             let batch = single_command(opcode, &vec![0; payload_bytes]);
@@ -941,6 +978,8 @@ mod tests {
     fn keeps_extended_gpu_ids_stable() {
         assert_eq!(GpuTextureFormat::R8Unorm as u16, 7);
         assert_eq!(GpuBindingKind::StorageBuffer as u16, 4);
+        assert_eq!(GpuBindingKind::StorageBufferReadWrite as u16, 5);
+        assert_eq!(GpuCapabilityKey::MaxDispatchesPerBatch as u16, 21);
         assert_eq!(GPU_BUFFER_USAGE_STORAGE, 128);
     }
 

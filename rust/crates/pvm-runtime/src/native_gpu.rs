@@ -6,6 +6,9 @@ use std::sync::mpsc;
 
 const FORMAT_RGBA8_UNORM: u16 = 1;
 const EVENT_HEADER_BYTES: usize = 24;
+const MAX_COMPUTE_WORKGROUP_STORAGE_SIZE: u32 = 16 * 1024;
+const MAX_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 8;
+const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 #[derive(Debug)]
 pub struct NativeGpuFrame {
@@ -29,7 +32,8 @@ enum Resource {
     BindGroupLayout(wgpu::BindGroupLayout),
     PipelineLayout(wgpu::PipelineLayout),
     BindGroup(wgpu::BindGroup),
-    Pipeline(wgpu::RenderPipeline),
+    RenderPipeline(wgpu::RenderPipeline),
+    ComputePipeline(wgpu::ComputePipeline),
 }
 
 struct PendingPass {
@@ -71,6 +75,20 @@ enum RenderOperation {
     },
 }
 
+struct PendingComputePass {
+    operations: Vec<ComputeOperation>,
+}
+
+enum ComputeOperation {
+    Pipeline(u32),
+    BindGroup {
+        slot: u32,
+        bind_group: u32,
+        offsets: Vec<u32>,
+    },
+    Dispatch([u32; 3]),
+}
+
 pub struct NativeGpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -99,7 +117,7 @@ impl NativeGpuRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("PolkaVM native GPU"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: native_required_limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
@@ -163,8 +181,9 @@ impl NativeGpuRenderer {
         let batch = gpu_wire::decode_gpu_batch(batch_bytes).context("decode native GPU batch")?;
         let mut encoder: Option<wgpu::CommandEncoder> = None;
         let mut pending_pass: Option<PendingPass> = None;
+        let mut pending_compute_pass: Option<PendingComputePass> = None;
         let mut presented = false;
-
+        let mut compute_dispatches = 0usize;
         for (index, command) in batch.commands().enumerate() {
             let mut reader = Reader::new(command.payload);
             match command.opcode {
@@ -318,7 +337,7 @@ impl NativeGpuRenderer {
                 GpuOpcode::CreateBindGroupLayout => self.create_bind_group_layout(&mut reader)?,
                 GpuOpcode::CreatePipelineLayout => self.create_pipeline_layout(&mut reader)?,
                 GpuOpcode::CreateBindGroup => self.create_bind_group(&mut reader)?,
-                GpuOpcode::CreateRenderPipeline => self.create_pipeline(&mut reader)?,
+                GpuOpcode::CreateRenderPipeline => self.create_render_pipeline(&mut reader)?,
                 GpuOpcode::DestroyResource => {
                     let id = reader.u32()?;
                     reader.finish()?;
@@ -333,7 +352,7 @@ impl NativeGpuRenderer {
                     }
                 }
                 GpuOpcode::BeginRenderPass => {
-                    if pending_pass.is_some() {
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
                         bail!("nested render pass");
                     }
                     let color_view = reader.u32()?;
@@ -443,7 +462,7 @@ impl NativeGpuRenderer {
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
-                    self.encode_pass(command_encoder, pass)?;
+                    self.encode_render_pass(command_encoder, pass)?;
                     presented = true;
                 }
                 GpuOpcode::CopyBufferToBuffer => {
@@ -453,6 +472,9 @@ impl NativeGpuRenderer {
                     let destination_offset = reader.u64()?;
                     let size = reader.u64()?;
                     reader.finish()?;
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
+                        bail!("buffer copy inside GPU pass");
+                    }
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
@@ -465,11 +487,79 @@ impl NativeGpuRenderer {
                     );
                 }
                 GpuOpcode::CreateTextureView => self.create_texture_view(&mut reader)?,
+                GpuOpcode::CreateComputePipeline => {
+                    let id = reader.u32()?;
+                    self.require_new(id)?;
+                    let layout_id = reader.u32()?;
+                    let shader_id = reader.u32()?;
+                    reader.zero(4)?;
+                    reader.finish()?;
+                    let value =
+                        self.device
+                            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                label: None,
+                                layout: Some(self.pipeline_layout(layout_id)?),
+                                module: self.shader(shader_id)?,
+                                entry_point: Some("cs_main"),
+                                compilation_options: Default::default(),
+                                cache: None,
+                            });
+                    self.resources.insert(id, Resource::ComputePipeline(value));
+                }
+                GpuOpcode::BeginComputePass => {
+                    reader.finish()?;
+                    if pending_pass.is_some() || pending_compute_pass.is_some() {
+                        bail!("nested GPU pass");
+                    }
+                    pending_compute_pass = Some(PendingComputePass {
+                        operations: Vec::new(),
+                    });
+                }
+                GpuOpcode::SetComputePipeline => pending_compute(&mut pending_compute_pass)?
+                    .operations
+                    .push(ComputeOperation::Pipeline(reader.one_u32()?)),
+                GpuOpcode::SetComputeBindGroup => {
+                    let slot = reader.u32()?;
+                    let bind_group = reader.u32()?;
+                    let count = reader.u32()? as usize;
+                    let offsets = (0..count)
+                        .map(|_| reader.u32())
+                        .collect::<Result<Vec<_>>>()?;
+                    reader.finish()?;
+                    pending_compute(&mut pending_compute_pass)?.operations.push(
+                        ComputeOperation::BindGroup {
+                            slot,
+                            bind_group,
+                            offsets,
+                        },
+                    );
+                }
+                GpuOpcode::DispatchWorkgroups => {
+                    let values = reader.u32_array::<3>()?;
+                    reader.finish()?;
+                    validate_compute_dispatch(values, &mut compute_dispatches)?;
+                    pending_compute(&mut pending_compute_pass)?
+                        .operations
+                        .push(ComputeOperation::Dispatch(values));
+                }
+                GpuOpcode::EndComputePass => {
+                    reader.finish()?;
+                    let pass = pending_compute_pass
+                        .take()
+                        .ok_or_else(|| anyhow!("compute pass is not active"))?;
+                    let command_encoder = encoder.get_or_insert_with(|| {
+                        self.device.create_command_encoder(&Default::default())
+                    });
+                    self.encode_compute_pass(command_encoder, pass)?;
+                }
             }
             let _ = index;
         }
         if pending_pass.is_some() {
             bail!("render pass was not ended");
+        }
+        if pending_compute_pass.is_some() {
+            bail!("compute pass was not ended");
         }
         let Some(mut encoder) = encoder else {
             return Ok(None);
@@ -560,10 +650,17 @@ impl NativeGpuRenderer {
             _ => bail!("invalid bind group {id}"),
         }
     }
-    fn pipeline(&self, id: u32) -> Result<&wgpu::RenderPipeline> {
+    fn render_pipeline(&self, id: u32) -> Result<&wgpu::RenderPipeline> {
         match self.resources.get(&id) {
-            Some(Resource::Pipeline(value)) => Ok(value),
-            _ => bail!("invalid pipeline {id}"),
+            Some(Resource::RenderPipeline(value)) => Ok(value),
+            _ => bail!("invalid render pipeline {id}"),
+        }
+    }
+
+    fn compute_pipeline(&self, id: u32) -> Result<&wgpu::ComputePipeline> {
+        match self.resources.get(&id) {
+            Some(Resource::ComputePipeline(value)) => Ok(value),
+            _ => bail!("invalid compute pipeline {id}"),
         }
     }
 
@@ -582,8 +679,9 @@ impl NativeGpuRenderer {
             let min = reader.u64()?;
             let p0 = reader.u32()?;
             let p1 = reader.u32()?;
+            validate_binding_visibility(kind, visibility)?;
             let ty = match kind {
-                1 | 4 => wgpu::BindingType::Buffer {
+                1 | 4 | 5 => wgpu::BindingType::Buffer {
                     ty: buffer_binding_type(kind, flags, p0, p1)?,
                     has_dynamic_offset: flags & 1 != 0,
                     min_binding_size: NonZeroU64::new(min),
@@ -684,7 +782,7 @@ impl NativeGpuRenderer {
             let offset = reader.u64()?;
             let size = reader.u64()?;
             specs.push(match kind {
-                1 | 4 => EntrySpec::Buffer {
+                1 | 4 | 5 => EntrySpec::Buffer {
                     binding,
                     id: resource,
                     offset,
@@ -737,7 +835,7 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
-    fn create_pipeline(&mut self, reader: &mut Reader<'_>) -> Result<()> {
+    fn create_render_pipeline(&mut self, reader: &mut Reader<'_>) -> Result<()> {
         let id = reader.u32()?;
         self.require_new(id)?;
         let layout_id = reader.u32()?;
@@ -858,7 +956,7 @@ impl NativeGpuRenderer {
                 multiview: None,
                 cache: None,
             });
-        self.resources.insert(id, Resource::Pipeline(value));
+        self.resources.insert(id, Resource::RenderPipeline(value));
         Ok(())
     }
 
@@ -893,7 +991,11 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
-    fn encode_pass(&self, encoder: &mut wgpu::CommandEncoder, pending: PendingPass) -> Result<()> {
+    fn encode_render_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pending: PendingPass,
+    ) -> Result<()> {
         let surface_view = self.surface.create_view(&Default::default());
         let depth_view = if pending.depth_view == 0 {
             None
@@ -941,7 +1043,7 @@ impl NativeGpuRenderer {
         });
         for operation in pending.operations {
             match operation {
-                RenderOperation::Pipeline(id) => pass.set_pipeline(self.pipeline(id)?),
+                RenderOperation::Pipeline(id) => pass.set_pipeline(self.render_pipeline(id)?),
                 RenderOperation::VertexBuffer {
                     slot,
                     buffer,
@@ -987,6 +1089,31 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
+    fn encode_compute_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pending: PendingComputePass,
+    ) -> Result<()> {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        for operation in pending.operations {
+            match operation {
+                ComputeOperation::Pipeline(id) => pass.set_pipeline(self.compute_pipeline(id)?),
+                ComputeOperation::BindGroup {
+                    slot,
+                    bind_group,
+                    offsets,
+                } => pass.set_bind_group(slot, self.bind_group(bind_group)?, &offsets),
+                ComputeOperation::Dispatch(values) => {
+                    pass.dispatch_workgroups(values[0], values[1], values[2]);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn read_frame(&self) -> Result<NativeGpuFrame> {
         let slice = self.readback.slice(..);
         let (sender, receiver) = mpsc::channel();
@@ -1016,18 +1143,27 @@ impl NativeGpuRenderer {
 
 fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
     let limits = [
-        (1u16, 4096u64),
-        (2, 16 * 1024 * 1024),
-        (3, 16),
-        (4, 4),
-        (5, 8),
-        (6, 16),
-        (7, 4),
-        (8, 256 * 1024 * 1024),
-        (9, 64 * 1024 * 1024),
-        (10, 8192),
+        (1u16, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D as u64),
+        (2, gpu_wire::MAX_GPU_BUFFER_BYTES as u64),
+        (3, gpu_wire::MAX_GPU_BINDINGS_PER_GROUP as u64),
+        (4, gpu_wire::MAX_GPU_BIND_GROUPS_PER_PIPELINE as u64),
+        (5, gpu_wire::MAX_GPU_VERTEX_BUFFERS as u64),
+        (6, gpu_wire::MAX_GPU_VERTEX_ATTRIBUTES as u64),
+        (7, gpu_wire::MAX_GPU_COLOR_ATTACHMENTS as u64),
+        (8, gpu_wire::MAX_GPU_TOTAL_TEXTURE_BYTES as u64),
+        (9, gpu_wire::MAX_GPU_TOTAL_BUFFER_BYTES as u64),
+        (10, gpu_wire::MAX_GPU_DRAWS_PER_BATCH as u64),
         (11, gpu_wire::MAX_GPU_BATCH_BYTES as u64),
-        (12, 16 * 1024 * 1024),
+        (12, gpu_wire::MAX_GPU_UPLOAD_BYTES_PER_TICK as u64),
+        (13, gpu_wire::MAX_GPU_BUFFER_BYTES as u64),
+        (14, MAX_STORAGE_BUFFERS_PER_SHADER_STAGE as u64),
+        (15, MAX_COMPUTE_WORKGROUP_STORAGE_SIZE as u64),
+        (16, 256),
+        (17, 256),
+        (18, 256),
+        (19, 64),
+        (20, MAX_COMPUTE_WORKGROUPS_PER_DIMENSION as u64),
+        (21, gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64),
     ];
     let mut bytes = vec![0; 56 + limits.len() * 16];
     bytes[..4].copy_from_slice(&gpu_wire::GPU_CAPABILITIES_MAGIC);
@@ -1050,9 +1186,41 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
     for (index, (key, value)) in limits.into_iter().enumerate() {
         let offset = 56 + index * 16;
         bytes[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
-        bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+        bytes[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn native_required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_texture_dimension_2d: gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D,
+        max_storage_buffers_per_shader_stage: MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+        max_compute_workgroup_storage_size: MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
+        ..wgpu::Limits::downlevel_defaults()
+    }
+}
+
+fn validate_compute_dispatch(values: [u32; 3], dispatches: &mut usize) -> Result<()> {
+    if values
+        .iter()
+        .any(|value| *value == 0 || *value > MAX_COMPUTE_WORKGROUPS_PER_DIMENSION)
+    {
+        bail!("compute dispatch dimension outside negotiated limits");
+    }
+    *dispatches = dispatches
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("compute dispatch count overflow"))?;
+    if *dispatches > gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH {
+        bail!("too many compute dispatches");
+    }
+    Ok(())
+}
+
+fn validate_binding_visibility(kind: u16, visibility: wgpu::ShaderStages) -> Result<()> {
+    if kind == 5 && visibility.contains(wgpu::ShaderStages::VERTEX) {
+        bail!("writable storage binding visible to the vertex stage");
+    }
+    Ok(())
 }
 
 fn create_surface(
@@ -1088,6 +1256,11 @@ fn create_surface(
 fn pending(pass: &mut Option<PendingPass>) -> Result<&mut PendingPass> {
     pass.as_mut()
         .ok_or_else(|| anyhow!("render pass is not active"))
+}
+
+fn pending_compute(pass: &mut Option<PendingComputePass>) -> Result<&mut PendingComputePass> {
+    pass.as_mut()
+        .ok_or_else(|| anyhow!("compute pass is not active"))
 }
 
 struct Reader<'a> {
@@ -1192,6 +1365,7 @@ fn buffer_binding_type(
     Ok(match id {
         1 => wgpu::BufferBindingType::Uniform,
         4 => wgpu::BufferBindingType::Storage { read_only: true },
+        5 => wgpu::BufferBindingType::Storage { read_only: false },
         _ => bail!("invalid buffer binding type"),
     })
 }
@@ -1351,7 +1525,57 @@ mod tests {
         let bytes = encode_capabilities(800, 600, 7);
 
         crate::validate_gpu_capabilities(&bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 21);
+        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[60..68].try_into().unwrap()), 4096);
+        assert_eq!(
+            u16::from_le_bytes(bytes[376..378].try_into().unwrap()),
+            gpu_wire::GpuCapabilityKey::MaxDispatchesPerBatch as u16
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[380..388].try_into().unwrap()),
+            gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64
+        );
+    }
+
+    #[test]
+    fn native_required_limits_cover_advertised_contract() {
+        let limits = native_required_limits();
+
+        assert!(limits.max_texture_dimension_2d >= gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D);
+        assert!(limits.max_buffer_size >= gpu_wire::MAX_GPU_BUFFER_BYTES as u64);
+        assert!(limits.max_storage_buffer_binding_size >= gpu_wire::MAX_GPU_BUFFER_BYTES as u32);
+        assert!(
+            limits.max_storage_buffers_per_shader_stage >= MAX_STORAGE_BUFFERS_PER_SHADER_STAGE
+        );
+        assert!(limits.max_compute_workgroup_storage_size >= MAX_COMPUTE_WORKGROUP_STORAGE_SIZE);
+        assert!(
+            limits.max_compute_workgroups_per_dimension >= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION
+        );
+    }
+
+    #[test]
+    fn rejects_compute_dispatches_outside_native_contract() {
+        let mut dispatches = 0;
+        validate_compute_dispatch([1, 1, 1], &mut dispatches).unwrap();
+        assert_eq!(dispatches, 1);
+
+        assert!(validate_compute_dispatch([0, 1, 1], &mut dispatches).is_err());
+        assert!(validate_compute_dispatch(
+            [MAX_COMPUTE_WORKGROUPS_PER_DIMENSION + 1, 1, 1],
+            &mut dispatches
+        )
+        .is_err());
+
+        let mut saturated = gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH;
+        assert!(validate_compute_dispatch([1, 1, 1], &mut saturated).is_err());
+    }
+
+    #[test]
+    fn rejects_vertex_visible_writable_storage_layouts() {
+        assert!(validate_binding_visibility(5, wgpu::ShaderStages::VERTEX).is_err());
+        validate_binding_visibility(5, wgpu::ShaderStages::COMPUTE).unwrap();
+        validate_binding_visibility(4, wgpu::ShaderStages::VERTEX).unwrap();
     }
 
     #[test]
@@ -1360,6 +1584,10 @@ mod tests {
         assert_eq!(
             buffer_binding_type(4, 0, 0, 0).unwrap(),
             wgpu::BufferBindingType::Storage { read_only: true }
+        );
+        assert_eq!(
+            buffer_binding_type(5, 0, 0, 0).unwrap(),
+            wgpu::BufferBindingType::Storage { read_only: false }
         );
         assert_eq!(
             buffer_binding_type(4, 2, 0, 0).unwrap_err().to_string(),

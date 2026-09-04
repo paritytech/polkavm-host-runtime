@@ -92,6 +92,14 @@ const GPU_LIMITS: &[&str] = &[
     "maxVertexBuffers",
     "maxVertexAttributes",
     "maxColorAttachments",
+    "maxStorageBufferBindingSize",
+    "maxStorageBuffersPerShaderStage",
+    "maxComputeWorkgroupStorageSize",
+    "maxComputeInvocationsPerWorkgroup",
+    "maxComputeWorkgroupSizeX",
+    "maxComputeWorkgroupSizeY",
+    "maxComputeWorkgroupSizeZ",
+    "maxComputeWorkgroupsPerDimension",
 ];
 
 impl AppDescriptor {
@@ -124,7 +132,7 @@ impl AppDescriptor {
         }
         let presentation = PresentationProfile::parse(&manifest.capabilities.graphics.profile)?;
         let gpu_limits = manifest.capabilities.graphics.required_limits;
-        if presentation == PresentationProfile::WebGpuRaster {
+        if presentation.supports_gpu() {
             for (name, value) in &gpu_limits {
                 if !GPU_LIMITS.contains(&name.as_str()) || *value == 0 {
                     return Err(anyhow!("unsupported WebGPU required limit {name}"));

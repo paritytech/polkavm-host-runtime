@@ -71,6 +71,7 @@ pub enum PresentationProfile {
     Framebuffer,
     Tri2d,
     WebGpuRaster,
+    WebGpu,
 }
 
 impl PresentationProfile {
@@ -79,6 +80,7 @@ impl PresentationProfile {
             "framebuffer" => Ok(Self::Framebuffer),
             "tri2d" => Ok(Self::Tri2d),
             "webgpu-raster" => Ok(Self::WebGpuRaster),
+            "webgpu" => Ok(Self::WebGpu),
             _ => Err(anyhow!("unsupported presentation profile {value}")),
         }
     }
@@ -88,7 +90,16 @@ impl PresentationProfile {
             Self::Framebuffer => "framebuffer",
             Self::Tri2d => "tri2d",
             Self::WebGpuRaster => "webgpu-raster",
+            Self::WebGpu => "webgpu",
         }
+    }
+
+    pub(crate) fn supports_gpu(self) -> bool {
+        matches!(self, Self::WebGpuRaster | Self::WebGpu)
+    }
+
+    pub(crate) fn supports_compute(self) -> bool {
+        matches!(self, Self::WebGpu)
     }
 }
 pub const BYTES_PER_PIXEL: usize = 4;
@@ -793,7 +804,7 @@ impl Runtime {
                  capacity: u32|
                  -> Result<i32> {
                     caller.user_data.charge_hostcall(0)?;
-                    if caller.user_data.presentation != PresentationProfile::WebGpuRaster {
+                    if !caller.user_data.presentation.supports_gpu() {
                         return Ok(gpu_wire::GPU_ERROR_INVALID_STATE);
                     }
                     let Some(required_len) =
@@ -825,7 +836,7 @@ impl Runtime {
                  -> Result<i32> {
                     let length = length as usize;
                     caller.user_data.charge_hostcall(0)?;
-                    if caller.user_data.presentation != PresentationProfile::WebGpuRaster {
+                    if !caller.user_data.presentation.supports_gpu() {
                         return Ok(gpu_wire::GPU_ERROR_INVALID_STATE);
                     }
                     if length == 0 || length > gpu_wire::MAX_GPU_BATCH_BYTES {
@@ -847,6 +858,9 @@ impl Runtime {
                     let Ok(batch) = gpu_wire::decode_gpu_batch(&bytes) else {
                         return Ok(gpu_wire::GPU_ERROR_MALFORMED_BATCH);
                     };
+                    if !gpu_batch_supported(caller.user_data.presentation, &batch) {
+                        return Ok(gpu_wire::GPU_ERROR_INVALID_STATE);
+                    }
                     if batch.sequence() <= caller.user_data.gpu_last_sequence {
                         return Ok(gpu_wire::GPU_ERROR_INVALID_STATE);
                     }
@@ -873,7 +887,7 @@ impl Runtime {
                  capacity: u32|
                  -> Result<i32> {
                     caller.user_data.charge_hostcall(0)?;
-                    if caller.user_data.presentation != PresentationProfile::WebGpuRaster {
+                    if !caller.user_data.presentation.supports_gpu() {
                         return Ok(gpu_wire::GPU_ERROR_INVALID_STATE);
                     }
                     let Some(required_len) = caller.user_data.gpu_events.front().map(Vec::len)
@@ -1253,12 +1267,11 @@ impl Runtime {
     }
 
     pub fn gpu_ready(&self) -> bool {
-        self.state.presentation != PresentationProfile::WebGpuRaster
-            || self.state.gpu_capabilities.is_some()
+        !self.state.presentation.supports_gpu() || self.state.gpu_capabilities.is_some()
     }
 
     pub fn set_gpu_capabilities(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if self.state.presentation != PresentationProfile::WebGpuRaster {
+        if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU capabilities sent to a non-GPU application"));
         }
         validate_gpu_capabilities(&bytes)?;
@@ -1267,7 +1280,7 @@ impl Runtime {
     }
 
     pub fn send_gpu_event(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if self.state.presentation != PresentationProfile::WebGpuRaster {
+        if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU event sent to a non-GPU application"));
         }
         validate_gpu_event(&bytes)?;
@@ -1338,6 +1351,21 @@ fn gpu_inline_upload_bytes(batch: &gpu_wire::GpuBatch<'_>) -> Option<usize> {
     })
 }
 
+fn gpu_batch_supported(presentation: PresentationProfile, batch: &gpu_wire::GpuBatch<'_>) -> bool {
+    presentation.supports_compute()
+        || batch.commands().all(|command| {
+            !matches!(
+                command.opcode,
+                gpu_wire::GpuOpcode::CreateComputePipeline
+                    | gpu_wire::GpuOpcode::BeginComputePass
+                    | gpu_wire::GpuOpcode::SetComputePipeline
+                    | gpu_wire::GpuOpcode::SetComputeBindGroup
+                    | gpu_wire::GpuOpcode::DispatchWorkgroups
+                    | gpu_wire::GpuOpcode::EndComputePass
+            )
+        })
+}
+
 fn validate_gpu_capabilities(bytes: &[u8]) -> Result<()> {
     const HEADER_BYTES: usize = 56;
     const ENTRY_BYTES: usize = 16;
@@ -1364,14 +1392,14 @@ fn validate_gpu_capabilities(bytes: &[u8]) -> Result<()> {
         return Err(anyhow!("invalid GPU capabilities scale"));
     }
     let count = gpu_u32(bytes, 44).unwrap() as usize;
-    if count > 12 || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES {
+    if count > 21 || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES {
         return Err(anyhow!("invalid GPU capabilities limit table"));
     }
     let mut previous = 0;
     for entry in bytes[HEADER_BYTES..].as_chunks::<ENTRY_BYTES>().0 {
         let key = gpu_u16(entry, 0).unwrap();
         if key <= previous
-            || key > 12
+            || key > 21
             || gpu_u16(entry, 2) != Some(0)
             || gpu_u64(entry, 4) == Some(0)
             || gpu_u32(entry, 12) != Some(0)
@@ -1550,6 +1578,23 @@ mod tests {
         builder.into_vec().unwrap()
     }
 
+    fn gpu_single_command(opcode: gpu_wire::GpuOpcode, payload: &[u8]) -> Vec<u8> {
+        let command_length = gpu_wire::GPU_COMMAND_HEADER_BYTES + payload.len();
+        let batch_length = gpu_wire::GPU_BATCH_HEADER_BYTES + command_length;
+        let mut bytes = Vec::with_capacity(batch_length);
+        bytes.extend_from_slice(&gpu_wire::GPU_WIRE_MAGIC);
+        bytes.extend_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(batch_length as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(opcode as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(command_length as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     #[test]
     fn runtime_reports_motion_import_usage() {
         let (motion_program, _) = motion_test_program();
@@ -1586,6 +1631,20 @@ mod tests {
             PresentationProfile::parse("ui-mesh").is_err(),
             "the provisional profile name must not remain an alias"
         );
+    }
+
+    #[test]
+    fn webgpu_raster_rejects_compute_batches() {
+        let batch = gpu_single_command(
+            gpu_wire::GpuOpcode::DispatchWorkgroups,
+            &[1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+        );
+        let batch = gpu_wire::decode_gpu_batch(&batch).unwrap();
+        assert!(!gpu_batch_supported(
+            PresentationProfile::WebGpuRaster,
+            &batch
+        ));
+        assert!(gpu_batch_supported(PresentationProfile::WebGpu, &batch));
     }
 
     #[test]
