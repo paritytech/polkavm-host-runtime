@@ -6,6 +6,7 @@ use crate::corevm::{Interruption, Vm};
 use anyhow::{anyhow, bail, Context, Result};
 use polkavm::ProgramBlob;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 /// Version of the experimental Polkadot Host application-computer contract.
 pub const COMPUTER_ABI_VERSION: (u16, u16) = (0, 1);
@@ -648,6 +649,32 @@ pub enum ChildProcessRequest {
     PipeClose {
         pid: u32,
     },
+    WorkspaceSpawn {
+        package: String,
+        arguments: Vec<String>,
+        columns: u32,
+        rows: u32,
+    },
+    WorkspaceSendInput {
+        handle: u32,
+        bytes: Vec<u8>,
+    },
+    WorkspaceRead {
+        handle: u32,
+        destination: u32,
+        capacity: usize,
+    },
+    WorkspaceResize {
+        handle: u32,
+        columns: u32,
+        rows: u32,
+    },
+    WorkspaceWait {
+        handle: u32,
+    },
+    WorkspaceClose {
+        handle: u32,
+    },
 }
 
 /// Experimental host-neutral runtime for `polkadot-host-computer/0.1` guests.
@@ -747,6 +774,57 @@ impl ComputerRuntime {
             }
             Interruption::PipeClose { pid } => {
                 self.pending_child_request = Some(ChildProcessRequest::PipeClose { pid });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceSpawn {
+                package,
+                arguments,
+                columns,
+                rows,
+            } => {
+                self.pending_child_request = Some(ChildProcessRequest::WorkspaceSpawn {
+                    package,
+                    arguments,
+                    columns,
+                    rows,
+                });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceSendInput { handle, bytes } => {
+                self.pending_child_request =
+                    Some(ChildProcessRequest::WorkspaceSendInput { handle, bytes });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceRead {
+                handle,
+                destination,
+                capacity,
+            } => {
+                self.pending_child_request = Some(ChildProcessRequest::WorkspaceRead {
+                    handle,
+                    destination,
+                    capacity,
+                });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceResize {
+                handle,
+                columns,
+                rows,
+            } => {
+                self.pending_child_request = Some(ChildProcessRequest::WorkspaceResize {
+                    handle,
+                    columns,
+                    rows,
+                });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceWait { handle } => {
+                self.pending_child_request = Some(ChildProcessRequest::WorkspaceWait { handle });
+                Ok(ComputerStatus::ChildRequest)
+            }
+            Interruption::WorkspaceClose { handle } => {
+                self.pending_child_request = Some(ChildProcessRequest::WorkspaceClose { handle });
                 Ok(ComputerStatus::ChildRequest)
             }
             Interruption::SetPalette { .. }
@@ -874,6 +952,9 @@ pub const MAX_COMPUTER_PROCESSES: usize = 4;
 /// Maximum simultaneously live piped background processes.
 pub const MAX_BACKGROUND_PROCESSES: usize = 4;
 
+/// Maximum simultaneously live workspace children.
+pub const MAX_WORKSPACE_CHILDREN: usize = 4;
+
 /// A piped background process: no terminal ownership; the parent exchanges
 /// bytes with it through the pipe hostcalls.
 struct BackgroundChild {
@@ -882,6 +963,16 @@ struct BackgroundChild {
     /// this child, and it is reaped when the owner departs.
     owner: usize,
     runtime: ComputerRuntime,
+    output: Vec<u8>,
+    exit: Option<i32>,
+}
+
+/// An independently supervised workspace child: a complete nested computer
+/// (its own foreground stack, piped children, and `/home` view) whose
+/// terminal endpoint is the parent-held handle instead of the Host terminal.
+struct WorkspaceChild {
+    handle: u32,
+    supervisor: Box<ComputerSupervisor>,
     output: Vec<u8>,
     exit: Option<i32>,
 }
@@ -895,9 +986,10 @@ struct BackgroundChild {
 /// through `process_spawn` run cooperatively while the parent is suspended
 /// inside a pipe or wait hostcall.
 pub struct ComputerSupervisor {
-    packages: BTreeMap<String, Vec<u8>>,
+    packages: BTreeMap<String, Arc<Vec<u8>>>,
     stack: Vec<ComputerRuntime>,
     background: Vec<BackgroundChild>,
+    workspace_children: Vec<WorkspaceChild>,
     environment: Vec<(String, String)>,
     next_pid: u32,
     pending_output: Vec<u8>,
@@ -909,6 +1001,7 @@ pub struct ComputerSupervisor {
     columns: u32,
     rows: u32,
     network: bool,
+    workspace: bool,
 }
 
 impl ComputerSupervisor {
@@ -935,6 +1028,7 @@ impl ComputerSupervisor {
             packages: BTreeMap::new(),
             stack: vec![root],
             background: Vec::new(),
+            workspace_children: Vec::new(),
             next_pid: 2,
             pending_output: Vec::new(),
             environment,
@@ -946,6 +1040,7 @@ impl ComputerSupervisor {
             columns: 80,
             rows: 24,
             network: false,
+            workspace: false,
         })
     }
 
@@ -959,7 +1054,7 @@ impl ComputerSupervisor {
         {
             bail!("invalid package name {name:?}");
         }
-        self.packages.insert(name.to_owned(), program);
+        self.packages.insert(name.to_owned(), Arc::new(program));
         Ok(())
     }
 
@@ -998,6 +1093,15 @@ impl ComputerSupervisor {
             child.runtime.set_network_enabled(enabled);
         }
         self.network = enabled;
+    }
+
+    /// Grants or revokes the workspace capability for the root process.
+    /// Revocation reaps every live workspace child.
+    pub fn set_workspace_enabled(&mut self, enabled: bool) {
+        self.workspace = enabled;
+        if !enabled {
+            self.workspace_children.clear();
+        }
     }
 
     /// Queues keyboard bytes toward the foreground process.
@@ -1157,6 +1261,7 @@ impl ComputerSupervisor {
             let status = *self.foreground().exit_status.get_or_insert(130);
             self.foreground().dispose();
             self.background.clear();
+            self.workspace_children.clear();
             return Ok(ComputerStatus::Exited(status));
         }
         self.pop_foreground(130)?;
@@ -1260,8 +1365,233 @@ impl ComputerSupervisor {
                 self.drive_background(index)?;
                 self.foreground().resolve_spawn(0);
             }
+            request @ (ChildProcessRequest::WorkspaceSpawn { .. }
+            | ChildProcessRequest::WorkspaceSendInput { .. }
+            | ChildProcessRequest::WorkspaceRead { .. }
+            | ChildProcessRequest::WorkspaceResize { .. }
+            | ChildProcessRequest::WorkspaceWait { .. }
+            | ChildProcessRequest::WorkspaceClose { .. }) => {
+                // Only the root computer holding the workspace grant may
+                // manage children; nested computers are never granted it.
+                if !self.workspace || self.stack.len() != 1 {
+                    self.foreground().resolve_spawn(STATUS_DENIED);
+                    return Ok(());
+                }
+                self.handle_workspace_request(request)?;
+            }
         }
         Ok(())
+    }
+
+    /// Executes one workspace operation and resolves it into the root guest.
+    fn handle_workspace_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+        match request {
+            ChildProcessRequest::WorkspaceSpawn {
+                package,
+                arguments,
+                columns,
+                rows,
+            } => {
+                if self.workspace_children.len() >= MAX_WORKSPACE_CHILDREN {
+                    self.foreground().resolve_spawn(STATUS_LIMIT);
+                    return Ok(());
+                }
+                match self.spawn_workspace_child(&package, arguments, columns, rows) {
+                    Ok(handle) => self.foreground().resolve_spawn(handle as i32),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            ChildProcessRequest::WorkspaceSendInput { handle, bytes } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                let child = &mut self.workspace_children[index];
+                if child.exit.is_some() {
+                    self.foreground().resolve_spawn(STATUS_INVALID);
+                    return Ok(());
+                }
+                let space = child.supervisor.terminal_input_space();
+                let written = bytes.len().min(space);
+                if written > 0 {
+                    child.supervisor.send_terminal_input(&bytes[..written])?;
+                }
+                self.drive_workspace_child(index)?;
+                self.foreground().resolve_spawn(written as i32);
+            }
+            ChildProcessRequest::WorkspaceRead {
+                handle,
+                destination,
+                capacity,
+            } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                if self.workspace_children[index].output.is_empty() {
+                    self.drive_workspace_child(index)?;
+                }
+                let child = &mut self.workspace_children[index];
+                if !child.output.is_empty() {
+                    let count = child.output.len().min(capacity);
+                    let bytes: Vec<u8> = child.output.drain(..count).collect();
+                    self.foreground().resolve_read(destination, &bytes)?;
+                } else if child.exit.is_some() {
+                    self.foreground().resolve_spawn(0);
+                } else {
+                    self.foreground().resolve_spawn(STATUS_WOULD_BLOCK);
+                }
+            }
+            ChildProcessRequest::WorkspaceResize {
+                handle,
+                columns,
+                rows,
+            } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                let child = &mut self.workspace_children[index];
+                if child.exit.is_some()
+                    || child.supervisor.set_terminal_size(columns, rows).is_err()
+                {
+                    self.foreground().resolve_spawn(STATUS_INVALID);
+                    return Ok(());
+                }
+                self.foreground().resolve_spawn(0);
+            }
+            ChildProcessRequest::WorkspaceWait { handle } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                self.drive_workspace_child(index)?;
+                // The handle stays valid after exit so remaining output can
+                // be drained; workspace_close reclaims the slot.
+                match self.workspace_children[index].exit {
+                    Some(status) => self.foreground().resolve_spawn(status & 0xff),
+                    None => self.foreground().resolve_spawn(STATUS_WOULD_BLOCK),
+                }
+            }
+            ChildProcessRequest::WorkspaceClose { handle } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
+                    return Ok(());
+                };
+                // File changes were merged after every drive; drop the child.
+                self.workspace_children.remove(index);
+                self.foreground().resolve_spawn(0);
+            }
+            request => bail!("non-workspace request {request:?} routed to workspace handler"),
+        }
+        Ok(())
+    }
+
+    /// Resolves a workspace child handle to its slot.
+    fn workspace_index(&self, handle: u32) -> Option<usize> {
+        self.workspace_children
+            .iter()
+            .position(|child| child.handle == handle)
+    }
+
+    /// Runs a workspace child until it exits or blocks awaiting input,
+    /// merging its terminal output and `/home` changes into the parent.
+    ///
+    /// Cooperative scheduling: workspace children only execute while the
+    /// workspace guest is suspended inside a workspace hostcall.
+    fn drive_workspace_child(&mut self, index: usize) -> Result<()> {
+        const MAX_DRIVE_STEPS: usize = 64;
+        for _ in 0..MAX_DRIVE_STEPS {
+            let child = &mut self.workspace_children[index];
+            if child.exit.is_some() {
+                return Ok(());
+            }
+            // A faulted child fails alone; the workspace observes the fault
+            // status through wait. Its final output and writes still land.
+            let outcome = child.supervisor.run();
+            if let Some(bytes) = child.supervisor.take_terminal_output() {
+                let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
+                child
+                    .output
+                    .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            }
+            let removed = child.supervisor.take_removed_files();
+            let changed = child.supervisor.take_modified_files();
+            let exit = match outcome {
+                Ok(ComputerStatus::Exited(code)) => Some(code & 0xff),
+                Ok(ComputerStatus::Yielded) => None,
+                // A nested supervisor only surfaces Yielded or Exited.
+                Ok(_) | Err(_) => Some(Self::FAULTED_CHILD_STATUS),
+            };
+            for path in removed {
+                self.files.remove(&path);
+                self.modified.remove(&path);
+                self.removed.insert(path);
+            }
+            for (path, bytes) in changed {
+                self.files.insert(path.clone(), bytes.clone());
+                self.removed.remove(&path);
+                self.modified.insert(path, bytes);
+            }
+            let child = &mut self.workspace_children[index];
+            if let Some(code) = exit {
+                child.exit = Some(code);
+                return Ok(());
+            }
+            if !child.supervisor.has_terminal_input() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Launches an independently supervised workspace child.
+    fn spawn_workspace_child(
+        &mut self,
+        package: &str,
+        arguments: Vec<String>,
+        columns: u32,
+        rows: u32,
+    ) -> Result<u32, i32> {
+        if !(1..=1_000).contains(&columns) || !(1..=1_000).contains(&rows) {
+            return Err(STATUS_INVALID);
+        }
+        let Some(program) = self.packages.get(package).cloned() else {
+            return Err(STATUS_NOT_FOUND);
+        };
+        let mut argv = Vec::with_capacity(arguments.len() + 1);
+        argv.push(package.to_owned());
+        argv.extend(arguments);
+        let context =
+            ComputerContext::new(argv, self.environment.clone()).map_err(|_| STATUS_INVALID)?;
+        let mut child = ComputerSupervisor::new_with_backend(
+            &program,
+            context,
+            self.max_gas_per_run,
+            self.backend,
+        )
+        .map_err(|_| STATUS_INVALID)?;
+        // The nested computer shares the Host-authorized package registry so
+        // a shell pane can run editors; it is never granted host.workspace.
+        child.packages = self.packages.clone();
+        child
+            .set_terminal_size(columns, rows)
+            .map_err(|_| STATUS_INVALID)?;
+        child.set_network_enabled(self.network);
+        for (path, bytes) in &self.files {
+            child
+                .mount_file(path, bytes.clone())
+                .map_err(|_| STATUS_LIMIT)?;
+        }
+        let handle = self.next_pid;
+        self.next_pid += 1;
+        self.workspace_children.push(WorkspaceChild {
+            handle,
+            supervisor: Box::new(child),
+            output: Vec::new(),
+            exit: None,
+        });
+        Ok(handle)
     }
 
     /// Resolves a pid to a background slot, enforcing ownership: only the
