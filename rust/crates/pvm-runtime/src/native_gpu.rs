@@ -6,6 +6,9 @@ use std::sync::mpsc;
 
 const FORMAT_RGBA8_UNORM: u16 = 1;
 const EVENT_HEADER_BYTES: usize = 24;
+const MAX_COMPUTE_WORKGROUP_STORAGE_SIZE: u32 = 16 * 1024;
+const MAX_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 8;
+const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 #[derive(Debug)]
 pub struct NativeGpuFrame {
@@ -114,7 +117,7 @@ impl NativeGpuRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("PolkaVM native GPU"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: native_required_limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
@@ -180,7 +183,7 @@ impl NativeGpuRenderer {
         let mut pending_pass: Option<PendingPass> = None;
         let mut pending_compute_pass: Option<PendingComputePass> = None;
         let mut presented = false;
-
+        let mut compute_dispatches = 0usize;
         for (index, command) in batch.commands().enumerate() {
             let mut reader = Reader::new(command.payload);
             match command.opcode {
@@ -534,9 +537,7 @@ impl NativeGpuRenderer {
                 GpuOpcode::DispatchWorkgroups => {
                     let values = reader.u32_array::<3>()?;
                     reader.finish()?;
-                    if values.contains(&0) {
-                        bail!("zero compute dispatch dimension");
-                    }
+                    validate_compute_dispatch(values, &mut compute_dispatches)?;
                     pending_compute(&mut pending_compute_pass)?
                         .operations
                         .push(ComputeOperation::Dispatch(values));
@@ -678,6 +679,7 @@ impl NativeGpuRenderer {
             let min = reader.u64()?;
             let p0 = reader.u32()?;
             let p1 = reader.u32()?;
+            validate_binding_visibility(kind, visibility)?;
             let ty = match kind {
                 1 | 4 | 5 => wgpu::BindingType::Buffer {
                     ty: buffer_binding_type(kind, flags, p0, p1)?,
@@ -1141,26 +1143,26 @@ impl NativeGpuRenderer {
 
 fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
     let limits = [
-        (1u16, 4096u64),
-        (2, 16 * 1024 * 1024),
-        (3, 16),
-        (4, 4),
-        (5, 8),
-        (6, 16),
-        (7, 4),
-        (8, 256 * 1024 * 1024),
-        (9, 64 * 1024 * 1024),
-        (10, 8192),
+        (1u16, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D as u64),
+        (2, gpu_wire::MAX_GPU_BUFFER_BYTES as u64),
+        (3, gpu_wire::MAX_GPU_BINDINGS_PER_GROUP as u64),
+        (4, gpu_wire::MAX_GPU_BIND_GROUPS_PER_PIPELINE as u64),
+        (5, gpu_wire::MAX_GPU_VERTEX_BUFFERS as u64),
+        (6, gpu_wire::MAX_GPU_VERTEX_ATTRIBUTES as u64),
+        (7, gpu_wire::MAX_GPU_COLOR_ATTACHMENTS as u64),
+        (8, gpu_wire::MAX_GPU_TOTAL_TEXTURE_BYTES as u64),
+        (9, gpu_wire::MAX_GPU_TOTAL_BUFFER_BYTES as u64),
+        (10, gpu_wire::MAX_GPU_DRAWS_PER_BATCH as u64),
         (11, gpu_wire::MAX_GPU_BATCH_BYTES as u64),
-        (12, 16 * 1024 * 1024),
-        (13, 16 * 1024 * 1024),
-        (14, 8),
-        (15, 16 * 1024),
+        (12, gpu_wire::MAX_GPU_UPLOAD_BYTES_PER_TICK as u64),
+        (13, gpu_wire::MAX_GPU_BUFFER_BYTES as u64),
+        (14, MAX_STORAGE_BUFFERS_PER_SHADER_STAGE as u64),
+        (15, MAX_COMPUTE_WORKGROUP_STORAGE_SIZE as u64),
         (16, 256),
         (17, 256),
         (18, 256),
         (19, 64),
-        (20, 65_535),
+        (20, MAX_COMPUTE_WORKGROUPS_PER_DIMENSION as u64),
         (21, gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64),
     ];
     let mut bytes = vec![0; 56 + limits.len() * 16];
@@ -1187,6 +1189,38 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
         bytes[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn native_required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_texture_dimension_2d: gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D,
+        max_storage_buffers_per_shader_stage: MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+        max_compute_workgroup_storage_size: MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
+        ..wgpu::Limits::downlevel_defaults()
+    }
+}
+
+fn validate_compute_dispatch(values: [u32; 3], dispatches: &mut usize) -> Result<()> {
+    if values
+        .iter()
+        .any(|value| *value == 0 || *value > MAX_COMPUTE_WORKGROUPS_PER_DIMENSION)
+    {
+        bail!("compute dispatch dimension outside negotiated limits");
+    }
+    *dispatches = dispatches
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("compute dispatch count overflow"))?;
+    if *dispatches > gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH {
+        bail!("too many compute dispatches");
+    }
+    Ok(())
+}
+
+fn validate_binding_visibility(kind: u16, visibility: wgpu::ShaderStages) -> Result<()> {
+    if kind == 5 && visibility.contains(wgpu::ShaderStages::VERTEX) {
+        bail!("writable storage binding visible to the vertex stage");
+    }
+    Ok(())
 }
 
 fn create_surface(
@@ -1502,6 +1536,46 @@ mod tests {
             u64::from_le_bytes(bytes[380..388].try_into().unwrap()),
             gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64
         );
+    }
+
+    #[test]
+    fn native_required_limits_cover_advertised_contract() {
+        let limits = native_required_limits();
+
+        assert!(limits.max_texture_dimension_2d >= gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D);
+        assert!(limits.max_buffer_size >= gpu_wire::MAX_GPU_BUFFER_BYTES as u64);
+        assert!(limits.max_storage_buffer_binding_size >= gpu_wire::MAX_GPU_BUFFER_BYTES as u32);
+        assert!(
+            limits.max_storage_buffers_per_shader_stage >= MAX_STORAGE_BUFFERS_PER_SHADER_STAGE
+        );
+        assert!(limits.max_compute_workgroup_storage_size >= MAX_COMPUTE_WORKGROUP_STORAGE_SIZE);
+        assert!(
+            limits.max_compute_workgroups_per_dimension >= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION
+        );
+    }
+
+    #[test]
+    fn rejects_compute_dispatches_outside_native_contract() {
+        let mut dispatches = 0;
+        validate_compute_dispatch([1, 1, 1], &mut dispatches).unwrap();
+        assert_eq!(dispatches, 1);
+
+        assert!(validate_compute_dispatch([0, 1, 1], &mut dispatches).is_err());
+        assert!(validate_compute_dispatch(
+            [MAX_COMPUTE_WORKGROUPS_PER_DIMENSION + 1, 1, 1],
+            &mut dispatches
+        )
+        .is_err());
+
+        let mut saturated = gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH;
+        assert!(validate_compute_dispatch([1, 1, 1], &mut saturated).is_err());
+    }
+
+    #[test]
+    fn rejects_vertex_visible_writable_storage_layouts() {
+        assert!(validate_binding_visibility(5, wgpu::ShaderStages::VERTEX).is_err());
+        validate_binding_visibility(5, wgpu::ShaderStages::COMPUTE).unwrap();
+        validate_binding_visibility(4, wgpu::ShaderStages::VERTEX).unwrap();
     }
 
     #[test]

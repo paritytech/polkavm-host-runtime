@@ -38,7 +38,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "pvm-gpu-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-gpu-worker.js"),
-        sha256: "ec1066e2b509857473dfd715e4a53db7fb3664e063c0a04c89435587690bba6a",
+        sha256: "13a1d354904667dd288d88ac6cffc17e9bb0401cafb2aee8b5e71d85a7e16c60",
     },
     BrowserAsset {
         path: "pvm-wasm-translated.js",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "1f6740f12d396a2404694eb8df29143c510f1a0898050ef155619a575c6d52fe",
+        sha256: "ce026e6cc3bc1d90769c5dba6dc235958bd3254293325e171fa29e526099f5a2",
     },
 ];
 

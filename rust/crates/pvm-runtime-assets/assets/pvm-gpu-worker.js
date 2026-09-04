@@ -21,6 +21,7 @@ const MAX_RENDER_PASSES_PER_BATCH = 16;
 const MAX_DRAWS_PER_BATCH = 8_192;
 const MAX_COMPUTE_PASSES_PER_BATCH = 64;
 const MAX_DISPATCHES_PER_BATCH = 8_192;
+const GPU_SHADER_STAGE_VERTEX = 1;
 const MAX_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_TEXTURE_BYTES = 256 * 1024 * 1024;
 const resourceLimits = new Map([
@@ -533,7 +534,12 @@ function parseCommand(command) {
         const parameter1 = reader.u32();
         let entry;
         if (kind === 1 || kind === 4 || kind === 5) {
-          if (parameter0 || parameter1 || flags & ~1) {
+          if (
+            parameter0 ||
+            parameter1 ||
+            flags & ~1 ||
+            (kind === 5 && visibility & GPU_SHADER_STAGE_VERTEX)
+          ) {
             throw new ProtocolError(
               "invalid buffer binding layout",
               command.index

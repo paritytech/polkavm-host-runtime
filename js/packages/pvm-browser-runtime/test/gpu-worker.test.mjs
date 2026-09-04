@@ -69,7 +69,7 @@ test("parses writable storage buffer layouts", () => {
   view.setUint32(0, 1, true);
   view.setUint32(4, 1, true);
   view.setUint32(8, 3, true);
-  view.setUint32(12, 3, true);
+  view.setUint32(12, 4, true);
   view.setUint16(16, 5, true);
   view.setBigUint64(24, 16n, true);
 
@@ -77,6 +77,19 @@ test("parses writable storage buffer layouts", () => {
   assert.equal(entry.binding, 3);
   assert.equal(entry.buffer.type, "storage");
   assert.equal(entry.buffer.minBindingSize, 16);
+});
+
+test("rejects writable storage buffer layouts in the vertex stage", () => {
+  const payload = new Uint8Array(40);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, 1, true);
+  view.setUint32(8, 3, true);
+  view.setUint32(12, 1, true);
+  view.setUint16(16, 5, true);
+  view.setBigUint64(24, 16n, true);
+
+  assert.throws(() => parse(7, payload), /invalid buffer binding layout/);
 });
 
 test("validates compute pipeline dispatch batches", () => {
