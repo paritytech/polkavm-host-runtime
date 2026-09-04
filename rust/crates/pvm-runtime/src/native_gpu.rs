@@ -1184,7 +1184,7 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
     for (index, (key, value)) in limits.into_iter().enumerate() {
         let offset = 56 + index * 16;
         bytes[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
-        bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+        bytes[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
     }
     bytes
 }
@@ -1492,6 +1492,16 @@ mod tests {
 
         crate::validate_gpu_capabilities(&bytes).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 21);
+        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[60..68].try_into().unwrap()), 4096);
+        assert_eq!(
+            u16::from_le_bytes(bytes[376..378].try_into().unwrap()),
+            gpu_wire::GpuCapabilityKey::MaxDispatchesPerBatch as u16
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[380..388].try_into().unwrap()),
+            gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64
+        );
     }
 
     #[test]

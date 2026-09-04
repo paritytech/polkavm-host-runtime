@@ -97,39 +97,34 @@ test("validates compute pipeline dispatch batches", () => {
     [28, u32s([1, 1, 1])],
     [29, new Uint8Array()],
   ]);
-  const engine = Object.assign(Object.create(GpuEngine.prototype), {
-    resources: new Map(),
-    handleSlots: new Map(),
-    lastSequence: 0n,
-    limits: [
-      4096,
-      16 * 1024 * 1024,
-      16,
-      4,
-      8,
-      16,
-      4,
-      256 * 1024 * 1024,
-      64 * 1024 * 1024,
-      8192,
-      4 * 1024 * 1024,
-      16 * 1024 * 1024,
-      16 * 1024 * 1024,
-      8,
-      16 * 1024,
-      256,
-      256,
-      256,
-      64,
-      65_535,
-      8192,
-    ],
-    surfaceGeneration: 1,
-  });
+  const engine = validationEngine();
 
   const validated = engine.validate(parseCommands(batch));
 
   assert.equal(validated.commands.at(-2).opcode, 28);
+});
+
+test("rejects nested render pass inside compute pass", () => {
+  const batch = commands([
+    [25, new Uint8Array()],
+    [
+      12,
+      u32s([
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0x3f800000,
+        0x3f800000,
+      ]),
+    ],
+  ]);
+  const engine = validationEngine();
+
+  assert.throws(() => engine.validate(parseCommands(batch)), /nested GPU pass/);
 });
 
 test("completes a validated batch without render commands", async () => {
@@ -178,6 +173,38 @@ function u32s(values) {
   const view = new DataView(bytes.buffer);
   values.forEach((value, index) => view.setUint32(index * 4, value, true));
   return bytes;
+}
+
+function validationEngine() {
+  return Object.assign(Object.create(GpuEngine.prototype), {
+    resources: new Map(),
+    handleSlots: new Map(),
+    lastSequence: 0n,
+    limits: [
+      4096,
+      16 * 1024 * 1024,
+      16,
+      4,
+      8,
+      16,
+      4,
+      256 * 1024 * 1024,
+      64 * 1024 * 1024,
+      8192,
+      4 * 1024 * 1024,
+      16 * 1024 * 1024,
+      16 * 1024 * 1024,
+      8,
+      16 * 1024,
+      256,
+      256,
+      256,
+      64,
+      65_535,
+      8192,
+    ],
+    surfaceGeneration: 1,
+  });
 }
 
 function commands(items) {

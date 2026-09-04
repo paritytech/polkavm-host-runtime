@@ -1275,8 +1275,8 @@ class GpuEngine {
           break;
         }
         case 12:
-          if (pass) {
-            throw new ProtocolError("nested render pass", index);
+          if (pass || computePass) {
+            throw new ProtocolError("nested GPU pass", index);
           }
           if (command.surfaceGeneration !== this.surfaceGeneration) {
             throw new ProtocolError(
