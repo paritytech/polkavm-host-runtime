@@ -159,6 +159,7 @@ pub(crate) struct ComputerDevices {
     tty_mode: u32,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeSet<String>,
+    removed: BTreeSet<String>,
     open_files: BTreeMap<u32, OpenComputerFile>,
     network_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -180,6 +181,7 @@ impl ComputerDevices {
             tty_mode: TTY_MODE_ECHO,
             files: BTreeMap::new(),
             modified: BTreeSet::new(),
+            removed: BTreeSet::new(),
             open_files: BTreeMap::new(),
             network_enabled: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -362,6 +364,7 @@ impl ComputerDevices {
             bail!("computer filesystem file limit exceeded");
         }
         self.files.insert(path.to_owned(), bytes);
+        self.removed.remove(path);
         Ok(())
     }
 
@@ -374,6 +377,10 @@ impl ComputerDevices {
                 Some((path, bytes))
             })
             .collect()
+    }
+
+    fn take_removed_files(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.removed).into_iter().collect()
     }
 
     pub(crate) fn has_terminal_input(&self) -> bool {
@@ -463,6 +470,7 @@ impl ComputerDevices {
         if !self.files.contains_key(path) || (writable && flags & FS_OPEN_TRUNCATE != 0) {
             self.files.insert(path.to_owned(), Vec::new());
             self.modified.insert(path.to_owned());
+            self.removed.remove(path);
         }
         self.open_files.insert(
             handle,
@@ -575,6 +583,21 @@ impl ComputerDevices {
         } else {
             STATUS_BAD_HANDLE
         }
+    }
+
+    pub(crate) fn fs_remove(&mut self, path: &str) -> i32 {
+        let Some(path) = validate_computer_path(path) else {
+            return STATUS_INVALID;
+        };
+        if self.open_files.values().any(|open| open.path == path) {
+            return STATUS_DENIED;
+        }
+        if self.files.remove(path).is_none() {
+            return STATUS_NOT_FOUND;
+        }
+        self.modified.remove(path);
+        self.removed.insert(path.to_owned());
+        0
     }
 
     /// Encodes the mounted file paths as a length-delimited record.
@@ -819,6 +842,11 @@ impl ComputerRuntime {
         self.vm.computer.take_modified_files()
     }
 
+    /// Drains paths removed by the guest since the previous call.
+    pub fn take_removed_files(&mut self) -> Vec<String> {
+        self.vm.computer.take_removed_files()
+    }
+
     /// Returns the recorded exit status, when the guest has exited.
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
@@ -860,6 +888,7 @@ pub struct ComputerSupervisor {
     pending_output: Vec<u8>,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeMap<String, Vec<u8>>,
+    removed: BTreeSet<String>,
     backend: polkavm::BackendKind,
     max_gas_per_run: u64,
     columns: u32,
@@ -896,6 +925,7 @@ impl ComputerSupervisor {
             environment,
             files: BTreeMap::new(),
             modified: BTreeMap::new(),
+            removed: BTreeSet::new(),
             backend,
             max_gas_per_run,
             columns: 80,
@@ -927,6 +957,7 @@ impl ComputerSupervisor {
     pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
         self.foreground().mount_file(path, bytes.clone())?;
         self.files.insert(path.to_owned(), bytes);
+        self.removed.remove(path);
         Ok(())
     }
 
@@ -984,6 +1015,11 @@ impl ComputerSupervisor {
     /// Drains files modified by any process since the previous call.
     pub fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
         core::mem::take(&mut self.modified).into_iter().collect()
+    }
+
+    /// Drains paths removed by any process since the previous call.
+    pub fn take_removed_files(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.removed).into_iter().collect()
     }
 
     /// Exit status reported for a child that faulted (trap, gas, segfault).
@@ -1112,9 +1148,15 @@ impl ComputerSupervisor {
     }
 
     fn collect_modified(&mut self) {
+        for path in self.foreground().take_removed_files() {
+            self.files.remove(&path);
+            self.modified.remove(&path);
+            self.removed.insert(path);
+        }
         let changed = self.foreground().take_modified_files();
         for (path, bytes) in changed {
             self.files.insert(path.clone(), bytes.clone());
+            self.removed.remove(&path);
             self.modified.insert(path, bytes);
         }
     }
@@ -1230,8 +1272,14 @@ impl ComputerSupervisor {
                     .output
                     .extend_from_slice(&bytes[..bytes.len().min(available)]);
             }
+            for path in child.runtime.take_removed_files() {
+                self.files.remove(&path);
+                self.modified.remove(&path);
+                self.removed.insert(path);
+            }
             for (path, bytes) in child.runtime.take_modified_files() {
                 self.files.insert(path.clone(), bytes.clone());
+                self.removed.remove(&path);
                 self.modified.insert(path, bytes);
             }
             let child = &mut self.background[index];
@@ -1442,6 +1490,7 @@ mod tests {
         assert_eq!(&buffer[..5], b"hello");
         assert_eq!(devices.fs_stat("/home/hello.c"), Some(5));
         assert_eq!(devices.fs_sync(handle), 0);
+        assert_eq!(devices.fs_remove("/home/hello.c"), STATUS_DENIED);
         assert_eq!(devices.fs_close(handle), 0);
         assert_eq!(devices.fs_close(handle), STATUS_BAD_HANDLE);
 
@@ -1451,6 +1500,13 @@ mod tests {
             vec![("/home/hello.c".to_owned(), b"hello".to_vec())]
         );
         assert!(devices.take_modified_files().is_empty());
+        assert_eq!(devices.fs_remove("/home/hello.c"), 0);
+        assert_eq!(devices.fs_stat("/home/hello.c"), None);
+        assert_eq!(
+            devices.take_removed_files(),
+            vec!["/home/hello.c".to_owned()]
+        );
+        assert_eq!(devices.fs_remove("/home/hello.c"), STATUS_NOT_FOUND);
     }
 
     #[test]
