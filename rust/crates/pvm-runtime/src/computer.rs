@@ -52,6 +52,8 @@ pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
 pub(crate) const FIRST_FILE_HANDLE: u32 = 16;
 /// Maximum accepted network address length in bytes.
 pub const MAX_NET_ADDRESS_BYTES: usize = 256;
+/// Maximum random bytes filled by one hostcall.
+pub const MAX_RANDOM_BYTES: usize = 4 * 1024;
 
 pub(crate) const STATUS_WOULD_BLOCK: i32 = -1;
 pub(crate) const STATUS_BAD_HANDLE: i32 = -2;
@@ -160,6 +162,8 @@ pub(crate) struct ComputerDevices {
     open_files: BTreeMap<u32, OpenComputerFile>,
     network_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
+    monotonic_epoch: std::time::Instant,
+    #[cfg(not(target_arch = "wasm32"))]
     sockets: BTreeMap<u32, std::net::TcpStream>,
     #[cfg(not(target_arch = "wasm32"))]
     next_socket: u32,
@@ -179,10 +183,57 @@ impl ComputerDevices {
             open_files: BTreeMap::new(),
             network_enabled: false,
             #[cfg(not(target_arch = "wasm32"))]
+            monotonic_epoch: std::time::Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
             sockets: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             next_socket: FIRST_SOCKET_HANDLE,
         }
+    }
+
+    /* ── Core clocks and entropy ──────────────────────────────────── */
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_clock_monotonic(&self) -> u64 {
+        self.monotonic_epoch
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_clock_monotonic(&self) -> u64 {
+        0
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_clock_wall(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_clock_wall(&self) -> u64 {
+        0
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_random(&self, bytes: &mut [u8]) -> i32 {
+        if bytes.is_empty() {
+            return STATUS_INVALID;
+        }
+        match getrandom::fill(bytes) {
+            Ok(()) => 0,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_random(&self, _bytes: &mut [u8]) -> i32 {
+        STATUS_DENIED
     }
 
     /* ── Network boundary (host.net v0: outbound TCP only) ─────────── */

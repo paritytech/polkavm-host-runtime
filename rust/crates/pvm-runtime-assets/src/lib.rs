@@ -62,13 +62,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "pvm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-computer.js"),
-        sha256: "3fbb9b36d9c3c3de2cd04e008a4a93bf518043f8a63a22e5d0be7e8eac4c74a9",
+        sha256: "353d9810db3af61d1d3d1015e147975a2fe05f1dc831697f3feca3339af93082",
     },
     BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "58e1176d53ed4e6add38cd5ea2824cfca705c6ace5c2578403ae2a0ef6f75fff",
+        sha256: "6b07b163c54e9c4fd32b89d208ccb9d4f62869f4df76509136c463e769664e53",
     },
 ];
 
