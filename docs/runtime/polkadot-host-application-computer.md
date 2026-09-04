@@ -421,7 +421,7 @@ see the changes — both standalone and as a sandboxed child of the shell.
 `:!` filters remain stubbed pending a `mch_call_shell` mapping onto the pipe
 capability. Full matrix: [vim-tiny-compatibility.md](vim-tiny-compatibility.md).
 
-SSH (phase 4) is assessed: Dropbear's dbclient plus its bundled crypto stack
+SSH is assessed: Dropbear's dbclient plus its bundled crypto stack
 compiles cleanly against the same toolchain; the single missing host
 capability is entropy (`core_random`). Matrix and vertical-slice plan:
 [ssh-client-compatibility.md](ssh-client-compatibility.md).
@@ -437,6 +437,61 @@ tty/fs devices, supervisor, pipes, spawn gating, and network denial - and runs
 the identical `.polkavm` conformance fixtures in the browser test suite.
 Translated shell and Vim guests run unmodified under it, so the computer is a
 client-side web product, not a native-only CLI.
+
+### Priority 1: Lynx
+
+Lynx is the first remaining product milestone. It deliberately precedes SSH:
+both need generic DNS, TCP, poll, cryptographic random, and clocks, while Lynx
+also exercises the existing terminal and virtual filesystem through an
+immediately visible application. The Host MUST NOT implement HTTP, TLS, or
+Lynx-specific calls. Lynx owns HTTP and TLS over a Host-provided opaque TCP
+stream. Native Hosts connect directly; browser Hosts use a generic
+WebSocket/WebTransport-to-TCP connector. The connector is not browser or SSH
+support and can serve any byte-stream protocol.
+
+Success means the same `lynx.polkavm` binary:
+
+1. launches standalone and through open DotNS spawn from the computer shell;
+2. opens an HTTPS page, follows a link, and navigates back;
+3. downloads a file into the Host-provided virtual `/home`;
+4. persists bookmarks, configuration, and downloads across relaunch;
+5. runs unchanged on native and browser Hosts.
+
+Shell escapes, external mail/news commands, printer commands, and protocols
+other than HTTP/HTTPS remain disabled in the first port.
+
+### Priority 2: Doom as a workspace child
+
+After Lynx, implement the first mixed-surface workspace rather than another
+terminal program. A `workspace.polkavm` root launches independently sandboxed
+children whose existing contracts remain unchanged:
+
+```text
+workspace.polkavm
++-- shell.polkavm  -> text surface
++-- kilo.polkavm   -> text surface
++-- doom.polkavm   -> frame surface
+```
+
+The Host owns every VM, surface, capability grant, resource bound, and input
+route. The workspace owns only layout, focus, resize requests, and launch/close
+requests. Success means Doom renders and receives input beside terminal
+children, a child fault does not terminate the workspace, and no child can
+read another child's memory or widen its capabilities.
+
+### Remaining priority
+
+After Lynx and the Doom workspace child, proceed in this order:
+
+1. SQLite for random-access durability, atomic replacement, and locking;
+2. Lua for useful scripting over existing Host capabilities;
+3. BusyBox/Toybox applets (not a speculative full `fork`-based shell);
+4. SSH, reusing Lynx's DNS/TCP/random/clock substrate with all SSH protocol and
+   cryptography remaining in the guest;
+5. tmux for multiple TTY handles, polling, and retained sessions;
+6. Git for the combined filesystem/process/network integration test;
+7. terminal Emacs as a late libc/terminal/process compatibility stress test;
+8. Servo as a long-term full-platform stress test, not a prerequisite.
 
 ### Targeted POSIX compatibility
 
@@ -503,28 +558,31 @@ stress test.
 
 ## Package model
 
-A package eventually contains a manifest, PolkaVM executable, assets, requested
-capabilities, entrypoint, ABI requirements, and metadata.
+Every launchable program is a normal DotNS application with its own App
+Manifest, content-addressed archive, entrypoint, and requested Host contract.
+`process_spawn("vim", ...)` is open resolution, not a parent-manifest
+allowlist: the Host resolves `vim`, verifies the child's own signed executable
+record against the fetched archive, checks that it speaks a supported contract,
+and creates an independently sandboxed VM. The child's effective grant cannot
+exceed the parent's.
 
-```toml
-name = "vim"
-version = "9.x"
-entrypoint = "vim.polkavm"
+An application MAY carry name-to-CID pins for deterministic/offline operation.
+Pins are lockfile data, never authorization: an unpinned published app remains
+launchable when Host policy permits registry access, and a pinned app receives
+no additional authority.
 
-[[interfaces]]
-name = "polkadot-host-computer/core"
-version = "0.1"
+The manifest never names a real host resource. Filesystem operations address
+only namespaces the Host chooses to mount into the process (`/home` in 0.1);
+the backing store is unobservable Host policy. The same rule applies to
+terminal, socket, process, and surface handles.
 
-[capabilities]
-terminal = true
+A `.polkavm` optional custom section MAY mirror contract metadata for tooling
+or archive-local fixtures, but DotNS executable records remain the pre-fetch
+trust anchor for published applications.
 
-[filesystem]
-documents = "read-write"
-```
-
-Applications declare required modular interfaces rather than assume one global
-Host version. A machine-readable IDL should generate Rust and C bindings plus
-Host stubs once the prototype signatures settle.
+Applications declare a Host contract before fetch; the blob's exact import
+table is checked before execution. A machine-readable IDL should generate Rust
+and C bindings plus Host stubs once the prototype signatures settle.
 
 ## Repository ownership
 
