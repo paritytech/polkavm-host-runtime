@@ -117,8 +117,12 @@ impl AppDescriptor {
         if !(manifest.app_version.len() == 3 || manifest.app_version.len() == 4) {
             bail!("App version must contain three or four components");
         }
-        if manifest.runtime.kind != "polkavm" || manifest.runtime.abi_version != 1 {
-            bail!("App runtime must be PolkaVM ABI version 1");
+        if manifest.runtime.kind != "polkavm" || manifest.runtime.abi_version != crate::ABI_VERSION
+        {
+            bail!(
+                "App runtime must be PolkaVM ABI version {}",
+                crate::ABI_VERSION
+            );
         }
         validate_path(&manifest.runtime.entrypoint)?;
         if !manifest.runtime.entrypoint.ends_with(".polkavm") {
@@ -192,9 +196,9 @@ mod tests {
     use super::AppDescriptor;
     use crate::PresentationProfile;
 
-    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
-    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
-    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
+    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
+    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
+    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
 
     #[test]
     fn omitted_required_features_default_to_empty() {
@@ -216,6 +220,14 @@ mod tests {
         assert_eq!(descriptor.presentation, PresentationProfile::Framebuffer);
         assert_eq!(descriptor.program_path, "app.polkavm");
         assert!(descriptor.audio_enabled);
+    }
+
+    #[test]
+    fn rejects_previous_runtime_abi() {
+        let previous = String::from_utf8(FRAMEBUFFER.to_vec())
+            .unwrap()
+            .replace("\"abiVersion\":2", "\"abiVersion\":1");
+        assert!(AppDescriptor::parse_exact(previous.as_bytes(), previous.as_bytes()).is_err());
     }
 
     #[test]

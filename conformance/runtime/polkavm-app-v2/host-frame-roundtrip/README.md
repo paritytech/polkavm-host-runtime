@@ -1,6 +1,6 @@
 # Host-frame round-trip conformance guest
 
-This guest proves the PolkaVM application ABI v1 host-frame transport without
+This guest proves the PolkaVM application ABI v2 host-frame transport without
 interpreting the opaque frame bytes.
 
 Expected sequence:

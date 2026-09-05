@@ -2737,7 +2737,7 @@
           ? { instance: new WebAssembly.Instance(runtimeWasm, {}) }
           : await WebAssembly.instantiate(runtimeWasm, {});
       const exports = instance.exports;
-      if (exports.polkavm_browser_abi_version() !== 1) {
+      if (exports.polkavm_browser_abi_version() !== 2) {
         throw new Error("PolkaVM browser runtime ABI mismatch");
       }
       return new ComputerTranslator(exports);

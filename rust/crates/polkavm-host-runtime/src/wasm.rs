@@ -105,7 +105,7 @@ fn status(operation: impl FnOnce(&mut BrowserHost) -> Result<()>) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn polkavm_browser_abi_version() -> u32 {
-    1
+    2
 }
 
 #[no_mangle]

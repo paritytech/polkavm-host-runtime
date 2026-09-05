@@ -63,7 +63,7 @@ pub use ui::{
     MAX_UI_SEMANTIC_STRING_BYTES, MAX_UI_TEXT_BYTES,
 };
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
@@ -234,7 +234,7 @@ pub const POINTER_CAPTURE_INVALID_REQUEST: i32 = -2;
 
 /// Host pointer-capture policy shared with the guest.
 ///
-/// ABI v1 keeps capture as Host policy: the guest may arm it, the Host decides
+/// ABI v2 keeps capture as Host policy: the guest may arm it, the Host decides
 /// when an activation is eligible, and the user can always end it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PointerCaptureState {

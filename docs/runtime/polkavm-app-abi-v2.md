@@ -1,10 +1,10 @@
 ---
-title: "PolkaVM application runtime ABI v1"
+title: "PolkaVM application runtime ABI v2"
 type: runtime-contract
 status: draft
 ---
 
-# PolkaVM application runtime ABI v1
+# PolkaVM application runtime ABI v2
 
 ## Scope
 
@@ -15,7 +15,7 @@ manifest with:
 {
   "runtime": {
     "kind": "polkavm",
-    "abiVersion": 1
+    "abiVersion": 2
   }
 }
 ```
@@ -34,7 +34,7 @@ it is advertised as a portable Product runtime.
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be
 interpreted as described in RFC 2119.
 
-A Host advertises PolkaVM application ABI v1 only when its observable behavior
+A Host advertises PolkaVM application ABI v2 only when its observable behavior
 conforms to this document and the conformance fixtures associated with it.
 
 ## Program model
@@ -55,7 +55,7 @@ Host MUST NOT enter the same program concurrently.
 
 The Host selects and enforces a nonzero gas budget for each call. A trap, gas
 exhaustion, invalid guest-memory access, or Host-call budget failure fails the
-current execution. ABI v1 does not restart a failed program transparently.
+current execution. ABI v2 does not restart a failed program transparently.
 
 The Host owns scheduling and presentation. Returning from `update` yields
 control to the Host; it does not imply that a frame was presented.
@@ -113,7 +113,7 @@ host_tri2d_submit(pointer: u32, length: u32) -> u32
 ```
 
 The call submits one complete Tri2D command stream. The selected graphics
-profile MUST be `tri2d`. ABI v1 accepts at most one Tri2D submission during one
+profile MUST be `tri2d`. ABI v2 accepts at most one Tri2D submission during one
 `init` or `update` call.
 
 Return values:
@@ -159,7 +159,7 @@ passed synchronous Host validation and was queued; it does not imply shader
 compilation or GPU completion. A `webgpu-raster` Host MUST reject compute
 commands. A `webgpu` Host accepts both raster and compute commands.
 
-Return values are defined by the selected WebGPU contract. ABI v1 reserves:
+Return values are defined by the selected WebGPU contract. ABI v2 reserves:
 
 ```text
  0  accepted
@@ -189,7 +189,7 @@ The call reads the oldest queued WebGPU event.
 
 ### Host-frame transport
 
-Every ABI v1 application receives a bounded transport for opaque request and
+Every ABI v2 application receives a bounded transport for opaque request and
 response frames. The runtime does not define frame encoding or service
 semantics.
 
@@ -220,7 +220,7 @@ that response from the queue.
      remains queued
 ```
 
-Request and response queues are independent. ABI v1 allows frames up to
+Request and response queues are independent. ABI v2 allows frames up to
 1 MiB, at most 32 queued frames, and at most 4 MiB of queued frame bytes in
 each direction. The Host MUST reject an empty or over-limit response before it
 becomes visible to the guest.
@@ -251,7 +251,7 @@ offset  type  field
 6       u16   zero
 ```
 
-ABI v1 event types are:
+ABI v2 event types are:
 
 ```text
 1   key down
@@ -572,13 +572,13 @@ this ABI.
 host_log(pointer: u32, length: u32) -> ()
 ```
 
-The Host copies at most the v1 log-byte limit and decodes the bytes as lossy
+The Host copies at most the v2 log-byte limit and decodes the bytes as lossy
 UTF-8 for diagnostics. Logs are not application storage and MUST NOT affect
 application behavior.
 
-## ABI v1 resource bounds
+## ABI v2 resource bounds
 
-The initial v1 implementation applies the following ceilings:
+The initial v2 implementation applies the following ceilings:
 
 ```text
 program bytes                         64 MiB
@@ -621,7 +621,7 @@ Host stops the execution on an unhandled guest trap, gas exhaustion, invalid
 memory access, unrecoverable profile error, or Host transport failure.
 
 The Host may stop an execution when its App surface closes, the Product is
-replaced, or platform lifecycle policy requires termination. ABI v1 does not
+replaced, or platform lifecycle policy requires termination. ABI v2 does not
 promise transparent restoration of guest memory or graphics resources after a
 stop.
 
@@ -631,8 +631,8 @@ be reused.
 
 ## Version compatibility
 
-A Host that does not implement PolkaVM application ABI v1 MUST NOT launch an
-App requesting it. A program compiled for ABI v1 imports only the symbols and
+A Host that does not implement PolkaVM application ABI v2 MUST NOT launch an
+App requesting it. A program compiled for ABI v2 imports only the symbols and
 uses only the behavior defined by this document and its selected capability
 contracts.
 

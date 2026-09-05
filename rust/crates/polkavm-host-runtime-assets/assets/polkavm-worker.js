@@ -2255,7 +2255,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({ type: "startup", stage: "runtime-instantiating" });
     const instantiated = await WebAssembly.instantiate(message.runtime, {});
     pvm = instantiated.instance.exports;
-    if (pvm.polkavm_browser_abi_version() !== 1) {
+    if (pvm.polkavm_browser_abi_version() !== 2) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
     postMessage({ type: "startup", stage: "runtime-instantiated" });
