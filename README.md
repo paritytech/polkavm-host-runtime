@@ -24,6 +24,8 @@ Native UniFFI hosts mediate opaque TrUAPI frames through
 `take_host_frame_request()` and `send_host_frame_response()`; the runtime keeps
 the guest-facing `host_frame_send` / `host_frame_poll` queues bounded.
 
+The browser compiler emits real Wasm instructions in groups of up to 128 basic blocks rather than a Wasm function for every block. Straight-line blocks are split at 16 instructions without adding gas charges, and indirect jump targets use bounded resolver groups. This bounds individual function bodies and avoids browser function-count limits for large guests while preserving the exported execution ABI, hostcall continuations, and gas-resume checkpoints.
+
 ## Build and test
 
 ```bash
