@@ -956,7 +956,7 @@ pub const MAX_COMPUTER_PROCESSES: usize = 4;
 pub const MAX_BACKGROUND_PROCESSES: usize = 4;
 
 /// Maximum simultaneously live workspace children.
-pub const MAX_WORKSPACE_CHILDREN: usize = 4;
+pub const MAX_WORKSPACE_CHILDREN: usize = 9;
 
 /// A piped background process: no terminal ownership; the parent exchanges
 /// bytes with it through the pipe hostcalls.
