@@ -473,6 +473,11 @@
       if (socket === undefined) {
         return { status: STATUS_BAD_HANDLE, bytes: new Uint8Array() };
       }
+      // The embedder's socket provider sets `denied = true` on a
+      // permission-gated socket whose connect request was refused.
+      if (socket.denied === true) {
+        return { status: STATUS_DENIED, bytes: new Uint8Array() };
+      }
       try {
         const bytes = socket.read(capacity);
         if (bytes === null) {
@@ -491,6 +496,9 @@
       const socket = this.sockets.get(handle);
       if (socket === undefined) {
         return STATUS_BAD_HANDLE;
+      }
+      if (socket.denied === true) {
+        return STATUS_DENIED;
       }
       try {
         const written = socket.write(bytes);
