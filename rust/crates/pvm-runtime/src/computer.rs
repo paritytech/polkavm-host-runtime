@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::corevm::{Interruption, Vm};
+use crate::filesystem::{lock, FileSession, FilesystemMetadata};
 use anyhow::{anyhow, bail, Context, Result};
 use polkavm::ProgramBlob;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -31,6 +32,10 @@ pub const FS_OPEN_WRITE: u32 = 2;
 pub const FS_OPEN_CREATE: u32 = 4;
 /// Open flag truncating an existing writable file.
 pub const FS_OPEN_TRUNCATE: u32 = 8;
+/// Open flag requiring atomic creation of a new writable file.
+pub const FS_OPEN_EXCLUSIVE: u32 = 16;
+/// Open flag positioning every write at the shared file's current end.
+pub const FS_OPEN_APPEND: u32 = 32;
 
 /// Maximum bytes queued toward the guest terminal.
 pub const MAX_TTY_INPUT_BYTES: usize = 64 * 1024;
@@ -38,6 +43,8 @@ pub const MAX_TTY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_TTY_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Maximum files in the mounted computer filesystem.
 pub const MAX_COMPUTER_FILES: usize = 64;
+/// Maximum directories, excluding the implicit `/home` root.
+pub const MAX_COMPUTER_DIRECTORIES: usize = 256;
 /// Maximum size of one mounted file.
 pub const MAX_COMPUTER_FILE_BYTES: usize = 1024 * 1024;
 /// Maximum simultaneously open computer file handles.
@@ -62,6 +69,10 @@ pub(crate) const STATUS_INVALID: i32 = -3;
 pub(crate) const STATUS_NOT_FOUND: i32 = -4;
 pub(crate) const STATUS_DENIED: i32 = -5;
 pub(crate) const STATUS_LIMIT: i32 = -6;
+pub(crate) const STATUS_EXISTS: i32 = -7;
+pub(crate) const STATUS_NOT_DIRECTORY: i32 = -8;
+pub(crate) const STATUS_IS_DIRECTORY: i32 = -9;
+pub(crate) const STATUS_NOT_EMPTY: i32 = -10;
 
 /// Launch context exposed through `polkadot-host-computer/0.1/core`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,13 +157,6 @@ pub enum ComputerStatus {
     PackageRequested,
 }
 
-struct OpenComputerFile {
-    path: String,
-    position: usize,
-    readable: bool,
-    writable: bool,
-}
-
 /// Terminal, filesystem, and network devices granted to one computer guest.
 pub(crate) struct ComputerDevices {
     tty_input: VecDeque<u8>,
@@ -161,10 +165,7 @@ pub(crate) struct ComputerDevices {
     tty_columns: u32,
     tty_rows: u32,
     tty_mode: u32,
-    files: BTreeMap<String, Vec<u8>>,
-    modified: BTreeSet<String>,
-    removed: BTreeSet<String>,
-    open_files: BTreeMap<u32, OpenComputerFile>,
+    pub(crate) filesystem: FileSession,
     network_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
     monotonic_epoch: std::time::Instant,
@@ -183,10 +184,7 @@ impl ComputerDevices {
             tty_columns: 80,
             tty_rows: 24,
             tty_mode: TTY_MODE_ECHO,
-            files: BTreeMap::new(),
-            modified: BTreeSet::new(),
-            removed: BTreeSet::new(),
-            open_files: BTreeMap::new(),
+            filesystem: FileSession::new(),
             network_enabled: false,
             #[cfg(not(target_arch = "wasm32"))]
             monotonic_epoch: std::time::Instant::now(),
@@ -358,33 +356,15 @@ impl ComputerDevices {
     }
 
     fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
-        if validate_computer_path(path).is_none() {
-            bail!("invalid computer file path {path:?}");
-        }
-        if bytes.len() > MAX_COMPUTER_FILE_BYTES {
-            bail!("mounted file {path:?} exceeds {MAX_COMPUTER_FILE_BYTES} bytes");
-        }
-        if !self.files.contains_key(path) && self.files.len() == MAX_COMPUTER_FILES {
-            bail!("computer filesystem file limit exceeded");
-        }
-        self.files.insert(path.to_owned(), bytes);
-        self.removed.remove(path);
-        Ok(())
+        lock(&self.filesystem.shared).mount_file(path, bytes)
     }
 
     fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
-        let modified = core::mem::take(&mut self.modified);
-        modified
-            .into_iter()
-            .filter_map(|path| {
-                let bytes = self.files.get(&path)?.clone();
-                Some((path, bytes))
-            })
-            .collect()
+        lock(&self.filesystem.shared).take_modified_files()
     }
 
     fn take_removed_files(&mut self) -> Vec<String> {
-        core::mem::take(&mut self.removed).into_iter().collect()
+        lock(&self.filesystem.shared).take_removed_files()
     }
 
     pub(crate) fn has_terminal_input(&self) -> bool {
@@ -445,189 +425,46 @@ impl ComputerDevices {
     }
 
     pub(crate) fn fs_open(&mut self, path: &str, flags: u32) -> i32 {
-        let Some(path) = validate_computer_path(path) else {
-            return STATUS_INVALID;
-        };
-        let readable = flags & FS_OPEN_READ != 0;
-        let writable = flags & FS_OPEN_WRITE != 0;
-        if !readable && !writable {
-            return STATUS_INVALID;
-        }
-        if self.open_files.len() == MAX_OPEN_COMPUTER_FILES {
-            return STATUS_LIMIT;
-        }
-        if !self.files.contains_key(path) {
-            if !(writable && flags & FS_OPEN_CREATE != 0) {
-                return STATUS_NOT_FOUND;
-            }
-            if self.files.len() == MAX_COMPUTER_FILES {
-                return STATUS_LIMIT;
-            }
-        }
-        // Recycle the lowest free handle. Because at most
-        // MAX_OPEN_COMPUTER_FILES handles are live, this always terminates
-        // far below FIRST_SOCKET_HANDLE, keeping the spaces disjoint.
-        let handle = (FIRST_FILE_HANDLE..)
-            .find(|handle| !self.open_files.contains_key(handle))
-            .expect("a free file handle always exists below the open-file cap");
-        // Mutations happen only after every failure path has been ruled out.
-        if !self.files.contains_key(path) || (writable && flags & FS_OPEN_TRUNCATE != 0) {
-            self.files.insert(path.to_owned(), Vec::new());
-            self.modified.insert(path.to_owned());
-            self.removed.remove(path);
-        }
-        self.open_files.insert(
-            handle,
-            OpenComputerFile {
-                path: path.to_owned(),
-                position: 0,
-                readable,
-                writable,
-            },
-        );
-        handle as i32
+        self.filesystem.open(path, flags)
     }
 
     pub(crate) fn fs_read(&mut self, handle: u32, buffer: &mut [u8]) -> i32 {
-        let Some(open) = self.open_files.get_mut(&handle) else {
-            return STATUS_BAD_HANDLE;
-        };
-        if !open.readable {
-            return STATUS_DENIED;
-        }
-        let Some(file) = self.files.get(&open.path) else {
-            return STATUS_NOT_FOUND;
-        };
-        let start = open.position.min(file.len());
-        let length = buffer.len().min(file.len() - start);
-        buffer[..length].copy_from_slice(&file[start..start + length]);
-        open.position = start + length;
-        length as i32
+        self.filesystem.read(handle, buffer)
     }
 
     pub(crate) fn fs_write(&mut self, handle: u32, bytes: &[u8]) -> i32 {
-        let Some(open) = self.open_files.get_mut(&handle) else {
-            return STATUS_BAD_HANDLE;
-        };
-        if !open.writable {
-            return STATUS_DENIED;
-        }
-        let Some(file) = self.files.get_mut(&open.path) else {
-            return STATUS_NOT_FOUND;
-        };
-        let end = open.position.saturating_add(bytes.len());
-        if end > MAX_COMPUTER_FILE_BYTES {
-            return STATUS_LIMIT;
-        }
-        if file.len() < end {
-            file.resize(end, 0);
-        }
-        file[open.position..end].copy_from_slice(bytes);
-        open.position = end;
-        self.modified.insert(open.path.clone());
-        bytes.len() as i32
+        self.filesystem.write(handle, bytes)
     }
 
     pub(crate) fn fs_seek(&mut self, handle: u32, offset: i32, whence: u32) -> i32 {
-        let Some(open) = self.open_files.get_mut(&handle) else {
-            return STATUS_BAD_HANDLE;
-        };
-        let Some(file) = self.files.get(&open.path) else {
-            return STATUS_NOT_FOUND;
-        };
-        let base = match whence {
-            0 => 0i64,
-            1 => open.position as i64,
-            2 => file.len() as i64,
-            _ => return STATUS_INVALID,
-        };
-        let position = base + i64::from(offset);
-        if !(0..=MAX_COMPUTER_FILE_BYTES as i64).contains(&position) {
-            return STATUS_INVALID;
-        }
-        open.position = position as usize;
-        position as i32
+        self.filesystem.seek(handle, offset, whence)
     }
 
     pub(crate) fn fs_truncate(&mut self, handle: u32, length: u32) -> i32 {
-        let length = length as usize;
-        if length > MAX_COMPUTER_FILE_BYTES {
-            return STATUS_LIMIT;
-        }
-        let Some(open) = self.open_files.get_mut(&handle) else {
-            return STATUS_BAD_HANDLE;
-        };
-        if !open.writable {
-            return STATUS_DENIED;
-        }
-        let Some(file) = self.files.get_mut(&open.path) else {
-            return STATUS_NOT_FOUND;
-        };
-        file.resize(length, 0);
-        self.modified.insert(open.path.clone());
-        0
+        self.filesystem.truncate(handle, length)
     }
 
     pub(crate) fn fs_stat(&self, path: &str) -> Option<u32> {
-        let path = validate_computer_path(path)?;
-        self.files.get(path).map(|file| file.len() as u32)
+        self.filesystem.stat(path)
     }
 
+    /// Makes shared writes visible; does not guarantee durable persistence.
     pub(crate) fn fs_sync(&mut self, handle: u32) -> i32 {
-        if self.open_files.contains_key(&handle) {
-            0
-        } else {
-            STATUS_BAD_HANDLE
-        }
+        self.filesystem.sync(handle)
     }
 
     pub(crate) fn fs_close(&mut self, handle: u32) -> i32 {
-        if self.open_files.remove(&handle).is_some() {
-            0
-        } else {
-            STATUS_BAD_HANDLE
-        }
+        self.filesystem.close(handle)
     }
 
     pub(crate) fn fs_remove(&mut self, path: &str) -> i32 {
-        let Some(path) = validate_computer_path(path) else {
-            return STATUS_INVALID;
-        };
-        if self.open_files.values().any(|open| open.path == path) {
-            return STATUS_DENIED;
-        }
-        if self.files.remove(path).is_none() {
-            return STATUS_NOT_FOUND;
-        }
-        self.modified.remove(path);
-        self.removed.insert(path.to_owned());
-        0
+        self.filesystem.remove(path)
     }
 
-    /// Encodes the mounted file paths as a length-delimited record.
+    /// Encodes all file paths (not directories), preserving the original ABI.
     pub(crate) fn fs_list_record(&self) -> Vec<u8> {
-        let mut record = Vec::with_capacity(64);
-        record.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
-        for path in self.files.keys() {
-            record.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            record.extend_from_slice(path.as_bytes());
-        }
-        record
+        self.filesystem.list()
     }
-}
-
-fn validate_computer_path(path: &str) -> Option<&str> {
-    if path.len() > MAX_COMPUTER_PATH_BYTES
-        || !path.starts_with("/home/")
-        || path.ends_with('/')
-        || path.bytes().any(|byte| byte == 0)
-        || path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    {
-        return None;
-    }
-    Some(path)
 }
 
 /// A spawn/wait/pipe operation awaiting supervisor resolution.
@@ -841,7 +678,7 @@ impl ComputerRuntime {
     }
 
     fn dispose(&mut self) {
-        self.vm.computer.open_files.clear();
+        self.vm.computer.filesystem.close_all();
         self.set_network_enabled(false);
         self.exit_status.get_or_insert(130);
     }
@@ -943,6 +780,24 @@ impl ComputerRuntime {
         self.vm.computer.take_removed_files()
     }
 
+    /// Exports stable identities and times; persist with both byte delta drains.
+    pub fn export_filesystem_metadata(&self) -> FilesystemMetadata {
+        lock(&self.vm.computer.filesystem.shared).export_metadata()
+    }
+
+    /// Drains metadata only after a guest namespace or content mutation.
+    pub fn take_filesystem_metadata(&mut self) -> Option<FilesystemMetadata> {
+        lock(&self.vm.computer.filesystem.shared).take_metadata()
+    }
+
+    /// Restores metadata after mounting bytes, before sharing with children.
+    pub fn import_filesystem_metadata(&mut self, metadata: FilesystemMetadata) -> Result<()> {
+        if Arc::strong_count(&self.vm.computer.filesystem.shared) != 1 {
+            bail!("cannot restore filesystem metadata while child processes exist");
+        }
+        lock(&self.vm.computer.filesystem.shared).import_metadata(metadata)
+    }
+
     /// Returns the recorded exit status, when the guest has exited.
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
@@ -970,9 +825,8 @@ struct BackgroundChild {
     exit: Option<i32>,
 }
 
-/// An independently supervised workspace child: a complete nested computer
-/// (its own foreground stack, piped children, and `/home` view) whose
-/// terminal endpoint is the parent-held handle instead of the Host terminal.
+/// An independently supervised workspace child sharing the same filesystem.
+/// Its terminal endpoint is the parent-held handle instead of the Host terminal.
 struct WorkspaceChild {
     handle: u32,
     supervisor: Box<ComputerSupervisor>,
@@ -996,9 +850,6 @@ pub struct ComputerSupervisor {
     environment: Vec<(String, String)>,
     next_pid: u32,
     pending_output: Vec<u8>,
-    files: BTreeMap<String, Vec<u8>>,
-    modified: BTreeMap<String, Vec<u8>>,
-    removed: BTreeSet<String>,
     backend: polkavm::BackendKind,
     max_gas_per_run: u64,
     columns: u32,
@@ -1060,9 +911,6 @@ impl ComputerSupervisor {
             next_pid: 2,
             pending_output: Vec::new(),
             environment,
-            files: BTreeMap::new(),
-            modified: BTreeMap::new(),
-            removed: BTreeSet::new(),
             backend,
             max_gas_per_run,
             columns: 80,
@@ -1190,26 +1038,10 @@ impl ComputerSupervisor {
         self.backend
     }
 
-    /// Mounts one persistent file into the shared `/home` store. The mount
-    /// reaches every live process: the foreground stack, piped background
-    /// children, and workspace children (whose own `/home` views merge back
-    /// on every drive), so a file provided after a child spawned — e.g. the
-    /// seed files of an open-resolved package — is visible tree-wide.
+    /// Mounts one persistent file into the authoritative tree-wide `/home` store.
+    /// Open destinations are rejected without changing any process's view.
     pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
-        self.foreground().mount_file(path, bytes.clone())?;
-        for child in &mut self.background {
-            if child.exit.is_none() {
-                child.runtime.mount_file(path, bytes.clone())?;
-            }
-        }
-        for child in &mut self.workspace_children {
-            if child.exit.is_none() {
-                child.supervisor.mount_file(path, bytes.clone())?;
-            }
-        }
-        self.files.insert(path.to_owned(), bytes);
-        self.removed.remove(path);
-        Ok(())
+        self.foreground().mount_file(path, bytes)
     }
 
     /// Sets the terminal size observed by every process.
@@ -1274,12 +1106,27 @@ impl ComputerSupervisor {
 
     /// Drains files modified by any process since the previous call.
     pub fn take_modified_files(&mut self) -> Vec<(String, Vec<u8>)> {
-        core::mem::take(&mut self.modified).into_iter().collect()
+        self.foreground().take_modified_files()
     }
 
     /// Drains paths removed by any process since the previous call.
     pub fn take_removed_files(&mut self) -> Vec<String> {
-        core::mem::take(&mut self.removed).into_iter().collect()
+        self.foreground().take_removed_files()
+    }
+
+    /// Exports the whole shared namespace with stable identities and times.
+    pub fn export_filesystem_metadata(&self) -> FilesystemMetadata {
+        self.stack[0].export_filesystem_metadata()
+    }
+
+    /// Drains metadata changes from the same store as both byte delta drains.
+    pub fn take_filesystem_metadata(&mut self) -> Option<FilesystemMetadata> {
+        self.foreground().take_filesystem_metadata()
+    }
+
+    /// Restores mounted metadata before any child or open file exists.
+    pub fn import_filesystem_metadata(&mut self, metadata: FilesystemMetadata) -> Result<()> {
+        self.stack[0].import_filesystem_metadata(metadata)
     }
 
     /// Exit status reported for a child that faulted (trap, gas, segfault).
@@ -1321,6 +1168,7 @@ impl ComputerSupervisor {
                     self.collect_modified();
                     if self.stack.len() == 1 {
                         self.background.clear();
+                        self.workspace_children.clear();
                         return Err(error);
                     }
                     fault_pops += 1;
@@ -1335,7 +1183,6 @@ impl ComputerSupervisor {
                     continue;
                 }
             };
-            self.collect_modified();
             match status {
                 ComputerStatus::Yielded => {
                     // Surface a suspended workspace child's resolution once
@@ -1381,6 +1228,7 @@ impl ComputerSupervisor {
                     // remain valid; rerunning it reports the same status.
                     if self.stack.len() == 1 {
                         self.background.clear();
+                        self.workspace_children.clear();
                         return Ok(ComputerStatus::Exited(code));
                     }
                     // Mask to the POSIX exit-code byte: negative statuses
@@ -1396,8 +1244,7 @@ impl ComputerSupervisor {
     }
 
     /// Discards the foreground child: forwards its remaining terminal
-    /// output, reaps its orphaned background children, resolves the parent
-    /// with `status`, and rebases the shared `/home` view.
+    /// output, reaps its orphaned background children, and resolves the parent.
     fn pop_foreground(&mut self, status: i32) -> Result<()> {
         debug_assert!(
             self.stack.len() >= 2,
@@ -1424,20 +1271,7 @@ impl ComputerSupervisor {
         let depth = self.stack.len();
         self.background.retain(|child| child.owner <= depth);
         self.foreground().resolve_spawn(status);
-        self.rebase_foreground()?;
-        Ok(())
-    }
 
-    fn rebase_foreground(&mut self) -> Result<()> {
-        let files = self.files.clone();
-        let devices = &mut self.foreground().vm.computer;
-        devices.files.retain(|path, _| files.contains_key(path));
-        devices
-            .open_files
-            .retain(|_, open| files.contains_key(&open.path));
-        for (path, bytes) in files {
-            devices.mount_file(&path, bytes)?;
-        }
         Ok(())
     }
 
@@ -1446,7 +1280,6 @@ impl ComputerSupervisor {
     /// A child is discarded and its parent resumes with status 130
     /// (interrupted). Terminating the root ends the whole computer.
     pub fn terminate_foreground(&mut self) -> Result<ComputerStatus> {
-        self.collect_modified();
         if self.stack.len() == 1 {
             // Record the exit so subsequent run() calls stay terminated; a
             // root that already exited keeps its genuine status.
@@ -1465,20 +1298,6 @@ impl ComputerSupervisor {
         self.stack
             .last_mut()
             .expect("supervisor stack is never empty")
-    }
-
-    fn collect_modified(&mut self) {
-        for path in self.foreground().take_removed_files() {
-            self.files.remove(&path);
-            self.modified.remove(&path);
-            self.removed.insert(path);
-        }
-        let changed = self.foreground().take_modified_files();
-        for (path, bytes) in changed {
-            self.files.insert(path.clone(), bytes.clone());
-            self.removed.remove(&path);
-            self.modified.insert(path, bytes);
-        }
     }
 
     /// Executes one spawn/wait/pipe request and resolves it into the caller.
@@ -1684,7 +1503,7 @@ impl ComputerSupervisor {
                     self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
                     return Ok(());
                 };
-                // File changes were merged after every drive; drop the child.
+                // Shared writes remain visible; dropping the child releases its handles.
                 self.workspace_children.remove(index);
                 self.foreground().resolve_spawn(0);
             }
@@ -1701,7 +1520,7 @@ impl ComputerSupervisor {
     }
 
     /// Runs a workspace child until it exits or blocks awaiting input,
-    /// merging its terminal output and `/home` changes into the parent.
+    /// collecting its terminal output. Files are already shared.
     ///
     /// Cooperative scheduling: workspace children only execute while the
     /// workspace guest is suspended inside a workspace hostcall.
@@ -1721,8 +1540,6 @@ impl ComputerSupervisor {
                     .output
                     .extend_from_slice(&bytes[..bytes.len().min(available)]);
             }
-            let removed = child.supervisor.take_removed_files();
-            let changed = child.supervisor.take_modified_files();
             let exit = match outcome {
                 Ok(ComputerStatus::Exited(code)) => Some(code & 0xff),
                 Ok(ComputerStatus::Yielded) => None,
@@ -1732,18 +1549,13 @@ impl ComputerSupervisor {
                 // A nested supervisor only surfaces Yielded or Exited.
                 Ok(_) | Err(_) => Some(Self::FAULTED_CHILD_STATUS),
             };
-            for path in removed {
-                self.files.remove(&path);
-                self.modified.remove(&path);
-                self.removed.insert(path);
-            }
-            for (path, bytes) in changed {
-                self.files.insert(path.clone(), bytes.clone());
-                self.removed.remove(&path);
-                self.modified.insert(path, bytes);
-            }
             let child = &mut self.workspace_children[index];
             if let Some(code) = exit {
+                for process in &mut child.supervisor.stack {
+                    process.vm.computer.filesystem.close_all();
+                }
+                child.supervisor.background.clear();
+                child.supervisor.workspace_children.clear();
                 child.exit = Some(code);
                 return Ok(());
             }
@@ -1788,11 +1600,8 @@ impl ComputerSupervisor {
             .map_err(|_| STATUS_INVALID)?;
         child.set_network_enabled(self.network);
         child.package_resolution = self.package_resolution;
-        for (path, bytes) in &self.files {
-            child
-                .mount_file(path, bytes.clone())
-                .map_err(|_| STATUS_LIMIT)?;
-        }
+        let shared = self.stack[0].vm.computer.filesystem.shared.clone();
+        child.stack[0].vm.computer.filesystem.share(shared);
         let handle = self.next_pid;
         self.next_pid += 1;
         self.workspace_children.push(WorkspaceChild {
@@ -1825,24 +1634,14 @@ impl ComputerSupervisor {
                 return Ok(());
             }
             // A faulted piped child fails alone; the parent observes the
-            // fault status through wait. Its final output and file writes
-            // are still collected below.
+            // fault status through wait. Shared writes remain visible and
+            // its final terminal output is collected below.
             let outcome = child.runtime.run().ok();
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
                 child
                     .output
                     .extend_from_slice(&bytes[..bytes.len().min(available)]);
-            }
-            for path in child.runtime.take_removed_files() {
-                self.files.remove(&path);
-                self.modified.remove(&path);
-                self.removed.insert(path);
-            }
-            for (path, bytes) in child.runtime.take_modified_files() {
-                self.files.insert(path.clone(), bytes.clone());
-                self.removed.remove(&path);
-                self.modified.insert(path, bytes);
             }
             let child = &mut self.background[index];
             let Some(status) = outcome else {
@@ -1880,10 +1679,10 @@ impl ComputerSupervisor {
         Ok(())
     }
 
-    /// Reclaims an exited background child, publishing its file changes.
+    /// Reclaims an exited background child and its process-local resources.
     fn reap_background(&mut self, index: usize) -> Result<()> {
         self.background.remove(index);
-        self.rebase_foreground()?;
+
         Ok(())
     }
 
@@ -1926,11 +1725,11 @@ impl ComputerSupervisor {
             .set_terminal_size(self.columns, self.rows)
             .map_err(|_| STATUS_INVALID)?;
         child.set_network_enabled(self.network);
-        for (path, bytes) in &self.files {
-            child
-                .mount_file(path, bytes.clone())
-                .map_err(|_| STATUS_LIMIT)?;
-        }
+        child
+            .vm
+            .computer
+            .filesystem
+            .share(self.stack[0].vm.computer.filesystem.shared.clone());
         Ok(child)
     }
 }
@@ -1975,6 +1774,147 @@ fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXITING_GUEST: &[u8] = include_bytes!("../tests/fixtures/computer-core-services.polkavm");
+
+    fn filesystem_supervisor() -> ComputerSupervisor {
+        let mut supervisor = ComputerSupervisor::new_with_backend(
+            EXITING_GUEST,
+            ComputerContext::default(),
+            50_000_000,
+            polkavm::BackendKind::Interpreter,
+        )
+        .unwrap();
+        supervisor
+            .register_package("child", EXITING_GUEST.to_vec())
+            .unwrap();
+        supervisor
+    }
+
+    #[test]
+    fn cancelled_foreground_preserves_shared_writes_and_releases_open_paths() {
+        let mut supervisor = filesystem_supervisor();
+        supervisor
+            .mount_file("/home/dest", b"old".to_vec())
+            .unwrap();
+        let child = supervisor.spawn_child("child", vec![]).unwrap();
+        supervisor.stack.push(child);
+        let handle = supervisor.foreground().vm.computer.fs_open(
+            "/home/lock",
+            FS_OPEN_WRITE | FS_OPEN_CREATE | FS_OPEN_EXCLUSIVE,
+        ) as u32;
+        assert_eq!(
+            supervisor.foreground().vm.computer.fs_write(handle, b"new"),
+            3
+        );
+        assert_eq!(
+            supervisor.stack[0]
+                .vm
+                .computer
+                .filesystem
+                .rename("/home/lock", "/home/dest"),
+            STATUS_DENIED
+        );
+        assert_eq!(
+            supervisor.terminate_foreground().unwrap(),
+            ComputerStatus::Yielded
+        );
+        assert_eq!(
+            supervisor
+                .foreground()
+                .vm
+                .computer
+                .filesystem
+                .rename("/home/lock", "/home/dest"),
+            0
+        );
+        assert_eq!(
+            supervisor.take_modified_files(),
+            vec![("/home/dest".into(), b"new".to_vec())]
+        );
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/lock"]);
+        assert!(supervisor.take_filesystem_metadata().is_some());
+        assert!(supervisor.take_filesystem_metadata().is_none());
+    }
+
+    #[test]
+    fn piped_and_workspace_processes_observe_one_store_without_scheduling_drains() {
+        let mut supervisor = filesystem_supervisor();
+        supervisor.spawn_piped("child", vec![]).unwrap();
+        let workspace = supervisor
+            .spawn_workspace_child("child", vec![], 80, 24)
+            .unwrap();
+        let flags = FS_OPEN_WRITE | FS_OPEN_CREATE | FS_OPEN_APPEND;
+        let piped_handle = supervisor.background[0]
+            .runtime
+            .vm
+            .computer
+            .fs_open("/home/log", flags) as u32;
+        assert_eq!(
+            supervisor.background[0]
+                .runtime
+                .vm
+                .computer
+                .fs_write(piped_handle, b"pipe"),
+            4
+        );
+        let pane = &mut supervisor.workspace_children[0].supervisor.stack[0]
+            .vm
+            .computer;
+        assert_eq!(pane.fs_stat("/home/log"), Some(4));
+        let pane_handle = pane.fs_open("/home/log", flags) as u32;
+        assert_eq!(pane.fs_write(pane_handle, b"pane"), 4);
+        supervisor.drive_background(0).unwrap();
+        assert_eq!(
+            supervisor.take_modified_files(),
+            vec![("/home/log".into(), b"pipepane".to_vec())]
+        );
+        assert_eq!(
+            supervisor.foreground().vm.computer.fs_remove("/home/log"),
+            STATUS_DENIED
+        );
+        supervisor
+            .handle_workspace_request(ChildProcessRequest::WorkspaceClose { handle: workspace })
+            .unwrap();
+        // The exited background runtime is retained for wait/output, but owns no open paths.
+        assert_eq!(
+            supervisor.foreground().vm.computer.fs_remove("/home/log"),
+            0
+        );
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/log"]);
+    }
+
+    #[test]
+    fn retained_exited_and_faulted_runtimes_release_their_file_handles() {
+        for gas in [1, 50_000_000] {
+            let mut runtime = ComputerRuntime::new_with_backend(
+                EXITING_GUEST,
+                ComputerContext::default(),
+                gas,
+                polkavm::BackendKind::Interpreter,
+            )
+            .unwrap();
+            let handle = runtime
+                .vm
+                .computer
+                .fs_open("/home/open", FS_OPEN_WRITE | FS_OPEN_CREATE)
+                as u32;
+            assert_eq!(runtime.vm.computer.fs_write(handle, b"kept"), 4);
+            let mut observer = FileSession::new();
+            observer.share(runtime.vm.computer.filesystem.shared.clone());
+            assert_eq!(observer.remove("/home/open"), STATUS_DENIED);
+            if gas == 1 {
+                assert!(runtime.run().is_err());
+            } else {
+                assert_eq!(runtime.run().unwrap(), ComputerStatus::Exited(31));
+            }
+            assert_eq!(
+                runtime.take_modified_files(),
+                vec![("/home/open".into(), b"kept".to_vec())]
+            );
+            assert_eq!(observer.remove("/home/open"), 0);
+        }
+    }
 
     #[test]
     fn child_removal_rebases_the_resumed_parent_namespace() {
