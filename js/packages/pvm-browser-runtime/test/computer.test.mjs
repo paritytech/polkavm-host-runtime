@@ -572,7 +572,7 @@ test("workspace revocation cancels direct and routed pending resolutions", () =>
   direct.setWorkspaceEnabled(false);
   assert.equal(direct.pendingPackage(), null);
   assert.throws(() => direct.providePackage(workspacePane));
-  assert.equal(runDriver(direct).code, 41);
+  assert.equal(runDriver(direct).code, 42);
 
   const routed = new ComputerSupervisor(
     workspaceDriver,
