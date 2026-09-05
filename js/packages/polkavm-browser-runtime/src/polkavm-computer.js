@@ -1934,15 +1934,15 @@
           ? { instance: new WebAssembly.Instance(runtimeWasm, {}) }
           : await WebAssembly.instantiate(runtimeWasm, {});
       const exports = instance.exports;
-      if (exports.pvm_browser_abi_version() !== 1) {
+      if (exports.polkavm_browser_abi_version() !== 1) {
         throw new Error("PolkaVM browser runtime ABI mismatch");
       }
       return new ComputerTranslator(exports);
     }
 
     #errorText() {
-      const pointer = this.pvm.pvm_browser_error_pointer();
-      const length = this.pvm.pvm_browser_error_length();
+      const pointer = this.pvm.polkavm_browser_error_pointer();
+      const length = this.pvm.polkavm_browser_error_length();
       return new TextDecoder().decode(
         new Uint8Array(this.pvm.memory.buffer, pointer, length),
       );
@@ -1953,18 +1953,18 @@
         programBytes instanceof Uint8Array
           ? programBytes
           : new Uint8Array(programBytes);
-      const pointer = this.pvm.pvm_browser_staging_reserve(source.byteLength);
+      const pointer = this.pvm.polkavm_browser_staging_reserve(source.byteLength);
       if (!pointer) {
         throw new Error(`reserve staging memory: ${this.#errorText()}`);
       }
       new Uint8Array(this.pvm.memory.buffer, pointer, source.byteLength).set(
         source,
       );
-      if (this.pvm.pvm_browser_translate_staged() !== 0) {
+      if (this.pvm.polkavm_browser_translate_staged() !== 0) {
         throw new Error(`translate computer guest: ${this.#errorText()}`);
       }
-      const output = this.pvm.pvm_browser_translation_pointer();
-      const length = this.pvm.pvm_browser_translation_length();
+      const output = this.pvm.polkavm_browser_translation_pointer();
+      const length = this.pvm.polkavm_browser_translation_length();
       const bytes = new Uint8Array(
         this.pvm.memory.buffer,
         output,
