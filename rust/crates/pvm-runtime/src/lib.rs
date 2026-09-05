@@ -216,6 +216,78 @@ pub enum InputEventType {
     SurfaceMetrics = 7,
 }
 
+/// Import through which a guest arms or releases Host pointer capture.
+pub const POINTER_CAPTURE_IMPORT: &str = "host_pointer_capture";
+/// The guest asks the Host to release capture and stop arming it.
+pub const POINTER_CAPTURE_RELEASE: u32 = 0;
+/// The guest arms capture for the next eligible primary activation.
+pub const POINTER_CAPTURE_ARM: u32 = 1;
+/// Capture is neither armed nor active.
+pub const POINTER_CAPTURE_RELEASED: i32 = 0;
+/// Capture is armed and waits for the next eligible primary activation.
+pub const POINTER_CAPTURE_ARMED: i32 = 1;
+/// The Host currently captures the pointer.
+pub const POINTER_CAPTURE_ACTIVE: i32 = 2;
+/// The Host has no pointer-capture policy on this platform.
+pub const POINTER_CAPTURE_UNSUPPORTED: i32 = -1;
+/// The request value is not a defined pointer-capture request.
+pub const POINTER_CAPTURE_INVALID_REQUEST: i32 = -2;
+
+/// Host pointer-capture policy shared with the guest.
+///
+/// ABI v1 keeps capture as Host policy: the guest may arm it, the Host decides
+/// when an activation is eligible, and the user can always end it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PointerCaptureState {
+    supported: bool,
+    armed: bool,
+    active: bool,
+    request: Option<bool>,
+}
+
+impl PointerCaptureState {
+    fn status(&self) -> i32 {
+        if self.active {
+            POINTER_CAPTURE_ACTIVE
+        } else if self.armed {
+            POINTER_CAPTURE_ARMED
+        } else {
+            POINTER_CAPTURE_RELEASED
+        }
+    }
+
+    fn request(&mut self, value: u32) -> i32 {
+        if !self.supported {
+            return POINTER_CAPTURE_UNSUPPORTED;
+        }
+        match value {
+            POINTER_CAPTURE_ARM => {
+                self.armed = true;
+                self.request = Some(true);
+            }
+            POINTER_CAPTURE_RELEASE => {
+                self.armed = false;
+                self.request = Some(false);
+            }
+            _ => return POINTER_CAPTURE_INVALID_REQUEST,
+        }
+        self.status()
+    }
+
+    /// Records the capture state the Host actually reached, returning true when
+    /// the guest must be told about the transition.
+    fn set_active(&mut self, active: bool) -> bool {
+        if self.active == active {
+            return false;
+        }
+        self.active = active;
+        if active {
+            self.armed = false;
+        }
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputEvent {
     pub event_type: InputEventType,
@@ -403,6 +475,8 @@ struct HostState {
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
     motion: MotionState,
+    pointer_capture: PointerCaptureState,
+    uses_pointer_capture: bool,
     uses_motion: bool,
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
@@ -422,6 +496,7 @@ impl HostState {
         presentation: PresentationProfile,
         audio_enabled: bool,
         uses_motion: bool,
+        uses_pointer_capture: bool,
     ) -> Self {
         Self {
             frame: None,
@@ -445,6 +520,8 @@ impl HostState {
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
             motion: MotionState::new(),
+            pointer_capture: PointerCaptureState::default(),
+            uses_pointer_capture,
             uses_motion,
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
@@ -639,11 +716,15 @@ impl Runtime {
         max_gas_per_update: u64,
         backend: BackendKind,
     ) -> Result<Self> {
-        let uses_motion = blob
-            .imports()
+        let imports = blob.imports();
+        let uses_motion = imports
             .iter()
             .flatten()
             .any(|import| import.as_bytes() == motion_wire::MOTION_READ_IMPORT.as_bytes());
+        let uses_pointer_capture = imports
+            .iter()
+            .flatten()
+            .any(|import| import.as_bytes() == POINTER_CAPTURE_IMPORT.as_bytes());
         let mut engine_config = Config::new();
         // macOS requires PolkaVM's experimental generic sandbox for native
         // recompilation. Keep sandboxing enabled while opting into that boundary.
@@ -1026,6 +1107,16 @@ impl Runtime {
 
         linker
             .define_typed(
+                POINTER_CAPTURE_IMPORT,
+                |caller: polkavm::Caller<'_, HostState>, request: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    Ok(caller.user_data.pointer_capture.request(request))
+                },
+            )
+            .context("define host_pointer_capture")?;
+
+        linker
+            .define_typed(
                 "host_time_ms",
                 |caller: polkavm::Caller<'_, HostState>| -> Result<u64> {
                     caller.user_data.charge_hostcall(0)?;
@@ -1174,7 +1265,13 @@ impl Runtime {
 
         Ok(Self {
             instance,
-            state: HostState::new(assets, presentation, audio_enabled, uses_motion),
+            state: HostState::new(
+                assets,
+                presentation,
+                audio_enabled,
+                uses_motion,
+                uses_pointer_capture,
+            ),
             max_gas_per_update,
             last_gas_used: 0,
             backend,
@@ -1260,6 +1357,42 @@ impl Runtime {
 
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
         self.state.motion.set_availability(availability);
+    }
+
+    /// True when the guest imports the pointer-capture hostcall.
+    pub fn uses_pointer_capture(&self) -> bool {
+        self.state.uses_pointer_capture
+    }
+
+    /// Declares whether this Host can capture the pointer at all. Revoking
+    /// support drops any request the guest has not been served yet, so the Host
+    /// never arms capture it has just said it cannot perform.
+    pub fn set_pointer_capture_supported(&mut self, supported: bool) {
+        self.state.pointer_capture.supported = supported;
+        if !supported {
+            self.state.pointer_capture.armed = false;
+            self.state.pointer_capture.request = None;
+        }
+    }
+
+    /// Reports the capture state the Host reached, including capture the user
+    /// ended, and tells the guest about every transition. The transition is
+    /// committed only once the guest has been told, so a rejected record leaves
+    /// the Host free to report the same state again.
+    pub fn set_pointer_capture_active(&mut self, active: bool) -> Result<()> {
+        if self.state.pointer_capture.active == active {
+            return Ok(());
+        }
+        self.state
+            .queue_input_record(ui::pointer_capture_record(active))?;
+        self.state.pointer_capture.set_active(active);
+        Ok(())
+    }
+
+    /// Takes the newest guest capture request: `true` arms capture for the next
+    /// eligible primary activation, `false` releases it.
+    pub fn take_pointer_capture_request(&mut self) -> Option<bool> {
+        self.state.pointer_capture.request.take()
     }
 
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1578,6 +1711,102 @@ mod tests {
         builder.into_vec().unwrap()
     }
 
+    /// Guest that arms capture during `init` and stores the returned status.
+    fn pointer_capture_test_program(request: u32) -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4 * 1024);
+        builder.add_import(POINTER_CAPTURE_IMPORT.as_bytes());
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, request as i32),
+                asm::ecalli(0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        builder.into_vec().unwrap()
+    }
+
+    fn pointer_capture_runtime(request: u32) -> Runtime {
+        Runtime::new_with_backend(
+            &pointer_capture_test_program(request),
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pointer_capture_import_usage_is_reported() {
+        assert!(pointer_capture_runtime(POINTER_CAPTURE_ARM).uses_pointer_capture());
+        let plain = Runtime::new_with_backend(
+            &no_motion_test_program(),
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(!plain.uses_pointer_capture());
+    }
+
+    #[test]
+    fn a_guest_arms_capture_only_where_the_host_supports_it() {
+        let mut runtime = pointer_capture_runtime(POINTER_CAPTURE_ARM);
+        runtime.init().unwrap();
+        assert_eq!(runtime.take_pointer_capture_request(), None);
+
+        runtime.set_pointer_capture_supported(true);
+        runtime.update().unwrap();
+        assert_eq!(runtime.take_pointer_capture_request(), Some(true));
+        assert_eq!(runtime.take_pointer_capture_request(), None);
+    }
+
+    #[test]
+    fn a_guest_releases_capture_through_the_same_call() {
+        let mut runtime = pointer_capture_runtime(POINTER_CAPTURE_RELEASE);
+        runtime.set_pointer_capture_supported(true);
+        runtime.init().unwrap();
+        assert_eq!(runtime.take_pointer_capture_request(), Some(false));
+    }
+
+    #[test]
+    fn capture_transitions_reach_the_guest_once() {
+        let mut runtime = pointer_capture_runtime(POINTER_CAPTURE_ARM);
+        runtime.set_pointer_capture_supported(true);
+        runtime.set_pointer_capture_active(true).unwrap();
+        runtime.set_pointer_capture_active(true).unwrap();
+        runtime.set_pointer_capture_active(false).unwrap();
+        let records: Vec<_> = runtime.state.input.iter().copied().collect();
+        assert_eq!(
+            records,
+            vec![
+                ui::pointer_capture_record(true),
+                ui::pointer_capture_record(false)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_invalid_capture_request_is_rejected() {
+        let mut state = PointerCaptureState {
+            supported: true,
+            ..PointerCaptureState::default()
+        };
+        assert_eq!(state.request(7), POINTER_CAPTURE_INVALID_REQUEST);
+        assert_eq!(state.request, None);
+        assert_eq!(state.request(POINTER_CAPTURE_ARM), POINTER_CAPTURE_ARMED);
+        state.set_active(true);
+        assert_eq!(state.status(), POINTER_CAPTURE_ACTIVE);
+        assert!(!state.armed);
+    }
+
     fn gpu_single_command(opcode: gpu_wire::GpuOpcode, payload: &[u8]) -> Vec<u8> {
         let command_length = gpu_wire::GPU_COMMAND_HEADER_BYTES + payload.len();
         let batch_length = gpu_wire::GPU_BATCH_HEADER_BYTES + command_length;
@@ -1755,6 +1984,7 @@ mod tests {
             PresentationProfile::Framebuffer,
             false,
             false,
+            false,
         );
         for coordinate in 0..10_000u16 {
             state.queue_input(InputEvent {
@@ -1830,6 +2060,7 @@ mod tests {
         let mut state = HostState::new(
             HashMap::new(),
             PresentationProfile::Framebuffer,
+            false,
             false,
             false,
         );

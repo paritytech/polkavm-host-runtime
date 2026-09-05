@@ -266,6 +266,41 @@ pub extern "C" fn pvm_browser_uses_motion() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn pvm_browser_uses_pointer_capture() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => u32::from(runtime.uses_pointer_capture()),
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_set_pointer_capture_supported(supported: u32) -> u32 {
+    status(|host| {
+        host.running()?
+            .set_pointer_capture_supported(supported != 0);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_set_pointer_capture_active(active: u32) -> u32 {
+    status(|host| host.running()?.set_pointer_capture_active(active != 0))
+}
+
+/// Returns 0 when the guest asked for nothing, 1 to arm capture, 2 to release.
+#[no_mangle]
+pub extern "C" fn pvm_browser_take_pointer_capture_request() -> u32 {
+    HOST.with(|host| match &mut host.borrow_mut().phase {
+        Phase::Running(runtime) => match runtime.take_pointer_capture_request() {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        _ => 0,
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 {
     status(|host| {
         let availability = crate::motion_wire::MotionAvailability::try_from(availability)

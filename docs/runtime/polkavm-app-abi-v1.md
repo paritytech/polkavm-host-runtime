@@ -268,20 +268,64 @@ ABI v1 event types are:
 12  IME disabled or cancelled
 13  focus (`code` is 0 or 1)
 14  wheel delta (`x` and `y` are signed i16)
+15  pointer capture (`code` is 0 or 1)
 ```
 
 Pointer button, position, and delta records are baseline optional input. An App
 does not list `pointer` in `deviceInput.requiredFeatures`: a Host with no
 pointer source simply emits no pointer records, and that absence is not a
-launch failure. Pointer capture is Host policy in ABI v1 and is not selected by
-the manifest. A later ABI can let the guest arm capture for the next eligible
-primary activation without turning capture into a package capability.
+launch failure. Pointer capture is Host policy and is never selected by the
+manifest. The guest arms capture through the pointer-capture hostcall below,
+and the Host decides when an activation is eligible.
 
 Text and IME records use `code` bits 0–2 as a payload length from zero through
 six, bit 6 for the first chunk, and bit 7 for the last chunk. Bytes 2–7 contain
 the chunk and zero padding. A complete text event is at most 4 KiB. The Host
 MUST queue all chunks of one event atomically; the guest MUST reject malformed
 flag sequences or invalid UTF-8.
+
+### Pointer capture
+
+```text
+host_pointer_capture(request: u32) -> i32
+```
+
+The hostcall is part of the base ABI and MUST always resolve. `request` is 1 to
+arm capture for the next eligible primary activation and 0 to release capture
+and disarm it. A Host without capture support returns `-1` for every value; a
+Host with capture support returns `-2` for every other value.
+
+The call returns the resulting policy state:
+
+```text
+ 0  released: capture is neither armed nor active
+ 1  armed: capture starts at the next eligible primary activation
+ 2  active: the Host currently captures the pointer
+-1  unsupported: this Host has no pointer-capture policy
+-2  invalid request
+```
+
+Arming is a request, never a guarantee: the Host owns activation eligibility,
+platform permission, and the escape affordance. A Host MUST emit a pointer
+capture record for every transition it makes, including capture the user ended,
+so a guest that arms capture learns when capture actually started and stopped.
+A Host that stops supporting capture MUST report the release first, so `-1` is
+never returned while the guest still believes capture is active, and it MUST
+discard the arming request it has not served yet.
+
+A request answered with `-1` is not remembered. A Host MAY gain capture support
+after the guest initialised, so a guest that still wants capture MUST re-issue
+the request on a later update rather than arming once during `init`.
+
+While capture is active the Host delivers pointer delta records; the guest
+releases capture whenever it shows a cursor-driven surface such as a menu.
+
+This hostcall is provisional. It is implemented by the reference runtime and
+the reference Hosts so that first-party applications can replace Host-guessed
+capture, and it is a candidate for the RFC that standardises this ABI. Until
+that RFC is accepted, the import name, request values, return codes, and record
+type MAY change with this draft, and no third-party Host is expected to
+advertise it as a stable contract.
 
 ### UI semantics
 
@@ -627,3 +671,6 @@ sample applications are integration evidence rather than normative fixtures.
   ABI?
 - How is the CoreVM compatibility path named and versioned independently from
   this cooperative ABI?
+- Does guest-armed pointer capture belong in the base ABI as `host_pointer_capture`,
+  or in a versioned input extension negotiated separately? The call ships
+  provisionally and needs the standardisation RFC before Hosts advertise it.

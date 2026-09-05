@@ -16,6 +16,7 @@ pub const INPUT_IME_ENABLED: u8 = 11;
 pub const INPUT_IME_DISABLED: u8 = 12;
 pub const INPUT_FOCUS: u8 = 13;
 pub const INPUT_WHEEL: u8 = 14;
+pub const INPUT_POINTER_CAPTURE: u8 = 15;
 
 const CHUNK_LENGTH_MASK: u8 = 0x07;
 const CHUNK_FIRST: u8 = 0x40;
@@ -91,6 +92,15 @@ pub fn wheel_record(delta_x: i16, delta_y: i16) -> [u8; INPUT_EVENT_BYTES] {
     record
 }
 
+/// Announces that the Host started or ended pointer capture, including capture
+/// the user ended with the platform escape affordance.
+pub fn pointer_capture_record(active: bool) -> [u8; INPUT_EVENT_BYTES] {
+    let mut record = [0u8; INPUT_EVENT_BYTES];
+    record[0] = INPUT_POINTER_CAPTURE;
+    record[1] = u8::from(active);
+    record
+}
+
 pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<()> {
     match record[0] {
         1..=7 => {
@@ -120,6 +130,11 @@ pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<
         INPUT_WHEEL => {
             if record[1] != 0 || record[6..] != [0, 0] {
                 bail!("wheel record is malformed");
+            }
+        }
+        INPUT_POINTER_CAPTURE => {
+            if record[1] > 1 || record[2..].iter().any(|byte| *byte != 0) {
+                bail!("pointer capture record is malformed");
             }
         }
         _ => bail!("unsupported input record type {}", record[0]),

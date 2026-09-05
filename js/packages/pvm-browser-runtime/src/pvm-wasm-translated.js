@@ -18,6 +18,15 @@
   const MOTION_ERROR_PERMISSION_DENIED = -2;
   const MOTION_ERROR_INVALID_GUEST_RANGE = -3;
   const MOTION_ERROR_BUFFER_TOO_SMALL = -4;
+  const INPUT_POINTER_CAPTURE = 15;
+  const POINTER_CAPTURE_IMPORT = "host_pointer_capture";
+  const POINTER_CAPTURE_RELEASE = 0;
+  const POINTER_CAPTURE_ARM = 1;
+  const POINTER_CAPTURE_RELEASED = 0;
+  const POINTER_CAPTURE_ARMED = 1;
+  const POINTER_CAPTURE_ACTIVE = 2;
+  const POINTER_CAPTURE_UNSUPPORTED = -1;
+  const POINTER_CAPTURE_INVALID_REQUEST = -2;
   const MAX_INPUT_EVENTS = 4096;
   const MAX_HOSTCALLS_PER_INIT = 1024 * 1024;
   const MAX_HOSTCALLS_PER_UPDATE = 65536;
@@ -523,6 +532,12 @@
       this.pointer = null;
       this.setMotionAvailability(motionAvailability);
       this.motionSample = null;
+      this.pointerCapture = {
+        supported: false,
+        armed: false,
+        active: false,
+        request: null,
+      };
       this.timeMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
@@ -565,6 +580,59 @@
 
     usesMotion() {
       return this.imports.includes("host_motion_read");
+    }
+
+    usesPointerCapture() {
+      return this.imports.includes(POINTER_CAPTURE_IMPORT);
+    }
+
+    setPointerCaptureSupported(supported) {
+      this.pointerCapture.supported = supported === true;
+      if (!this.pointerCapture.supported) {
+        this.pointerCapture.armed = false;
+        this.pointerCapture.request = null;
+      }
+    }
+
+    setPointerCaptureActive(active) {
+      const next = active === true;
+      if (this.pointerCapture.active === next) {
+        return;
+      }
+      this.pointerCapture.active = next;
+      if (next) {
+        this.pointerCapture.armed = false;
+      }
+      const record = new Uint8Array(INPUT_EVENT_BYTES);
+      record[0] = INPUT_POINTER_CAPTURE;
+      record[1] = next ? 1 : 0;
+      this.sendInput(record);
+    }
+
+    takePointerCaptureRequest() {
+      const request = this.pointerCapture.request;
+      this.pointerCapture.request = null;
+      return request;
+    }
+
+    #requestPointerCapture(request) {
+      const state = this.pointerCapture;
+      if (!state.supported) {
+        return POINTER_CAPTURE_UNSUPPORTED;
+      }
+      if (request === POINTER_CAPTURE_ARM) {
+        state.armed = true;
+        state.request = true;
+      } else if (request === POINTER_CAPTURE_RELEASE) {
+        state.armed = false;
+        state.request = false;
+      } else {
+        return POINTER_CAPTURE_INVALID_REQUEST;
+      }
+      if (state.active) {
+        return POINTER_CAPTURE_ACTIVE;
+      }
+      return state.armed ? POINTER_CAPTURE_ARMED : POINTER_CAPTURE_RELEASED;
     }
 
     update(timeMs) {
@@ -1124,6 +1192,11 @@
         }
         case "host_motion_read":
           return this.#readMotion();
+        case POINTER_CAPTURE_IMPORT: {
+          const status = this.#requestPointerCapture(this.#u32(a0));
+          this.#setReg(7, BigInt(status));
+          return false;
+        }
         case "host_time_ms": {
           const timeMs = this.timeMs ?? performance.now() - this.clockStartedAt;
           this.#setReg(7, BigInt(Math.max(0, Math.trunc(timeMs))));

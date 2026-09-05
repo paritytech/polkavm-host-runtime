@@ -348,6 +348,25 @@ impl NativePvmRuntime {
             .map_err(NativePvmError::runtime)
     }
 
+    pub fn uses_pointer_capture(&self) -> Result<bool, NativePvmError> {
+        Ok(self.lock()?.uses_pointer_capture())
+    }
+
+    pub fn set_pointer_capture_supported(&self, supported: bool) -> Result<(), NativePvmError> {
+        self.lock()?.set_pointer_capture_supported(supported);
+        Ok(())
+    }
+
+    pub fn set_pointer_capture_active(&self, active: bool) -> Result<(), NativePvmError> {
+        self.lock()?
+            .set_pointer_capture_active(active)
+            .map_err(NativePvmError::runtime)
+    }
+
+    pub fn take_pointer_capture_request(&self) -> Result<Option<bool>, NativePvmError> {
+        Ok(self.lock()?.take_pointer_capture_request())
+    }
+
     pub fn gpu_ready(&self) -> Result<bool, NativePvmError> {
         Ok(self.lock()?.gpu_ready())
     }
