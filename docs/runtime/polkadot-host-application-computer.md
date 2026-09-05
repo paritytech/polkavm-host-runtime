@@ -419,7 +419,7 @@ Invariants carried over from the terminal-computer supervisor:
 - `workspace_resize` obeys the existing 1..=1000 column/row clamp; a child
   observes the new geometry through `tty_get_size` on its next read. Surface
   reads, input queues, and transfer sizes obey the same bounds as terminal
-  output (64 KiB per transfer, bounded per-child queues), and at most 4
+  output (64 KiB per transfer, bounded per-child queues), and at most 9
   workspace children are live at once.
 
 A workspace application therefore composes existing contracts: it is an
