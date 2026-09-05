@@ -238,12 +238,70 @@ polkadot_host_0_1_fs_stat(path_pointer, path_length, record_pointer) -> status
 polkadot_host_0_1_fs_sync(handle) -> status
 polkadot_host_0_1_fs_close(handle) -> status
 polkadot_host_0_1_fs_remove(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_list(destination, capacity) -> record bytes | error
+polkadot_host_0_1_fs_mkdir(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_rmdir(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_rename(old_pointer, old_length, new_pointer, new_length) -> status
+polkadot_host_0_1_fs_metadata(path_pointer, path_length, record_pointer) -> status
+polkadot_host_0_1_fs_fstat(handle, record_pointer) -> status
+polkadot_host_0_1_fs_list_directory(path_pointer, path_length, destination, capacity)
+    -> record bytes | error
 ```
 
-The first implementation uses a virtual filesystem with a Host-provided
-persistent `/home` mount. Removing an open file returns `DENIED`; a successful
-removal is reported separately from modified file contents so persistence
-adapters can delete the backing entry.
+All foreground, piped, and workspace processes in one supervisor tree share
+one authoritative `/home` namespace. Handles and seek positions are local to
+each process; open-path tracking is global. There are no copied file views or
+exit-time merges. Normal exit, fault, cancellation, and child removal release
+that process's handles without undoing completed writes.
+
+Open flags: READ=1, WRITE=2, CREATE=4, TRUNCATE=8, EXCLUSIVE=16, APPEND=32.
+EXCLUSIVE requires writable CREATE; APPEND requires WRITE and selects the
+current EOF atomically on each write. Unknown flags and invalid combinations
+fail before mutation. Exclusive collisions return EXISTS, never truncate.
+Besides existing errors -1 through -6, namespace errors are EXISTS=-7,
+NOT_DIRECTORY=-8, IS_DIRECTORY=-9, and NOT_EMPTY=-10.
+
+Directories are real entries, including an implicit `/home` root. Guest
+creation requires an existing parent; Host seed mounts synthesize missing
+parents. Paths are canonical UTF-8 `/home` paths, at most 200 bytes, with no
+empty, dot, dot-dot, NUL, or trailing-slash segments. Quotas are 64 files,
+256 non-root directories, 1 MiB per file, and 16 handles per process.
+Quota errors return LIMIT before changing the namespace or destination bytes.
+
+`fs_remove` removes files; `fs_rmdir` removes empty directories. Removal of
+an open file returns DENIED. Rename is an atomic namespace operation, with
+same-kind replacement and whole-subtree moves for directories; nonempty
+destination directories and cycles fail. Open source/destination paths,
+including descendants, return DENIED globally. Every failure preserves the
+old source and destination. A successful rename preserves the moved inode
+and mtime and updates the affected parent directories.
+
+The original `fs_stat` writes only a little-endian u32 size for a file.
+`fs_metadata` and `fs_fstat` write exactly 24 little-endian bytes:
+`kind:u32` (1=file, 2=directory), `size:u32` (zero for directories),
+`mtime_ns:u64`, `inode:u64`. Inodes are stable identities. Mutations use
+`max(wall_clock_ns, previous_clock_ns + 1)`, so same-size rewrites advance
+mtime even in one clock tick or during clock rollback; stat does not sample
+a fabricated current timestamp.
+
+`fs_list` retains its all-file-path record. `fs_list_directory` returns
+immediate children in UTF-8 byte order: u32 count, then repeated
+`name_length:u32`, basename bytes, `kind:u32`. Like `fs_list`, insufficient
+capacity returns the negative required length and writes no partial record.
+
+Embedders drain modified bytes, removed paths, and `take_filesystem_metadata`
+(`takeFilesystemMetadata` in JS) in the same turn and persist one atomic
+checkpoint. Metadata has version 1, decimal-string `nextInode`/`clockNs`, and
+sorted entries containing `path`, `kind`, decimal-string `mtimeNs`/`inode`.
+Export/import APIs support complete snapshots; restore mounts the exact file
+byte set first, then validates/imports metadata before starting children or
+opening handles. This preserves empty directories and modification times.
+Malformed snapshots are rejected atomically. Host mount/import are seed and
+restore operations, not guest writes, and do not emit mutation deltas.
+
+`fs_sync` establishes visibility only. In-memory atomicity is tested; neither
+this call nor successful guest exit promises durability across Host crashes.
+Dotli checkpoints bytes and metadata together in one IndexedDB record.
 
 ### `host.process`
 
@@ -260,11 +318,10 @@ foreground operation while the parent stays suspended in the hostcall:
 ```text
 polkadot_host_0_1_process_run(package_ptr, package_len, args_ptr, args_len)
     -> child exit status | error
-polkadot_host_0_1_fs_list(destination, capacity) -> record bytes | error
 ```
 
 The supervisor owns the process stack (max depth 4), grants the foreground
-process the terminal, and rebases the shared `/home` store when a child exits.
+process the terminal, and gives every child the same `/home` store.
 
 Piped background children implement pipes and `:!` filters without `fork`:
 
@@ -355,50 +412,84 @@ SplitHorizontal
     +-- ssh.pvm
 ```
 
-### Draft `host.workspace` surface ABI (unimplemented)
+### `host.workspace` (prototype)
 
-Design draft; binary signatures follow the conventions above and must be
-pinned by conformance fixtures before any Host advertises them.
+Binary signatures follow the conventions above and are pinned by conformance
+fixtures before any Host advertises them as stable.
 
 A surface is an opaque handle owned by the Host, like every other resource.
-Two surface kinds exist initially, and both deliberately avoid a fixed bitmap
-geometry:
+Two surface kinds exist; both deliberately avoid a fixed bitmap geometry:
 
-- `text`: a column/row cell grid. The Host renders cells natively, so
-  terminals stay DPI-independent on every platform (this removes the current
-  640x400 presentation ceiling rather than generalizing it).
+- `text`: an ANSI byte stream over a column/row cell grid. The workspace
+  guest emulates each child grid itself (the tmux model) and repaints its own
+  terminal, so the Host renders exactly one terminal natively and terminals
+  stay DPI-independent on every platform.
 - `frame`: an RGBA framebuffer presented whole. This is the phase-7 graphics
   contract and is not required for the tiling milestone.
 
+In `0.1` each child owns exactly one `text` surface, so the child handle
+doubles as the surface handle; a separate surface handle space is reserved
+for multi-surface children and `frame` surfaces.
+
 ```text
-polkadot_host_0_1_workspace_spawn(package, argv, environment)
-    -> (child_handle, surface_handle) | error
-polkadot_host_0_1_workspace_run(child_handle) -> status
-polkadot_host_0_1_workspace_send_input(child_handle, record_pointer, length)
-    -> written | WOULD_BLOCK | error
-polkadot_host_0_1_workspace_resize(child_handle, columns, rows) -> status
-polkadot_host_0_1_workspace_surface_read(surface_handle, pointer, capacity)
-    -> length | WOULD_BLOCK | error
-polkadot_host_0_1_workspace_close(child_handle) -> status
+polkadot_host_0_1_workspace_spawn(pkg_ptr, pkg_len, args_ptr, args_len,
+                                  columns, rows) -> child handle | error
+polkadot_host_0_1_workspace_send_input(child, source, length)
+    -> written | error
+polkadot_host_0_1_workspace_read(child, destination, capacity)
+    -> bytes | 0 after exit drained | WOULD_BLOCK
+polkadot_host_0_1_workspace_resize(child, columns, rows) -> status
+polkadot_host_0_1_workspace_wait(child) -> exit status | WOULD_BLOCK
+polkadot_host_0_1_workspace_close(child) -> status
 ```
+
+A workspace child is a complete computer: a nested supervisor with its own
+foreground stack, piped children, and granted `/home` view, whose terminal
+endpoint is the parent-held child handle instead of the Host terminal. A
+shell pane can therefore `process_run` Vim without any workspace-specific
+support. Nesting depth is bounded: a workspace child is not granted
+`host.workspace` in `0.1`.
+
+Scheduling stays cooperative and inherits the piped-children rule: children
+execute only while the workspace guest is suspended inside a workspace
+hostcall or `core_yield`. Package resolution uses the same Host-owned
+registry and open-spawn suspension as `process_spawn`, and it propagates
+through the whole tree: a `workspace_spawn` naming an unregistered package,
+or an unresolved spawn inside a nested child computer, suspends until the
+embedding Host provides or rejects the package. A resolved package joins
+the shared registry, so any published application can run inside a pane
+without being declared in the workspace's own archive; bundled child
+packages remain an optional version pin, never the launch mechanism.
 
 Invariants carried over from the terminal-computer supervisor:
 
 - The Host owns every child VM, its gas budget, its capability grants, and its
-  fault containment. `workspace_run` returns the same status codes as
-  `process_run`; a faulted child is reported and reaped, never resurrected.
-- The workspace guest sees only surface output records and child exit status.
-  It never reads child memory, files, or capability state.
+  fault containment. A faulted child is reported through `workspace_wait`
+  with the same status codes as `process_run` and is reaped, never
+  resurrected.
+- The workspace guest sees surface output and child exit status, never child
+  memory. Its own `host.fs` grant accesses the same `/home` as its children.
 - Input is routed, not shared: the Host delivers input records exclusively to
   the workspace, which forwards bytes to at most one focused child per call.
   Host-authority cancellation (the Ctrl-] equivalent) always targets the
   workspace itself and cannot be intercepted by it.
-- `workspace_resize` obeys the existing 1..=1000 column/row clamp, and surface
-  reads are bounded by the same queue limits as terminal output.
+- `workspace_resize` obeys the existing 1..=1000 column/row clamp; a child
+  observes the new geometry through `tty_get_size` on its next read. Surface
+  reads, input queues, and transfer sizes obey the same bounds as terminal
+  output (64 KiB per transfer, bounded per-child queues), and at most 9
+  workspace children are live at once.
+- Revoking network access closes existing sockets throughout the workspace
+  tree and denies connections by current and future descendants. Process
+  exit, fault, and cancellation release both file handles and sockets.
+- Cancelling a foreground requester discards its unresolved spawn. Revoking
+  `host.workspace` cancels routed child resolutions and completes a pending
+  workspace spawn with `DENIED`; late package deliveries cannot resurrect it.
+- A pane's exit does not discard terminal output: nested-program output and
+  the pane's final reply remain readable in order before EOF.
 
 A workspace application therefore composes existing contracts: it is an
-ordinary computer guest whose extra capability is holding child and surface
-handles. Layout, focus, and keybindings are guest policy.
+ordinary computer guest whose extra capability is holding child handles.
+Layout, focus, and keybindings are guest policy.
 
 A first tiling workspace may implement bindings such as:
 
@@ -685,10 +776,10 @@ explicitly deferred until this direct editor slice works.
 
 From the pre-publication security review of the experimental runtime:
 
-- Host-side work is not metered by guest gas: every process transition clones
-  the shared `/home` store (up to 64 MiB), and one pipe hostcall can drive a
-  background child through up to 1,024 full gas slices. Needs copy-on-write
-  file sharing and a shared drive budget.
+- Host-side work is not metered by guest gas. The `/home` store is shared
+  without cloning on process transitions, but one pipe hostcall can still
+  drive a background child through up to 1,024 full gas slices. A shared
+  drive budget remains necessary.
 - A granted network capability has no destination policy: loopback,
   link-local, and private ranges are reachable, and resolution/connect block
   the runtime thread (up to 5 s). Needs a Host-supplied address policy and

@@ -8,6 +8,7 @@ extern crate polkavm_wasm as polkavm;
 mod application;
 mod computer;
 mod corevm;
+mod filesystem;
 pub use pvm_gpu_wire as gpu_wire;
 pub use pvm_motion_wire as motion_wire;
 pub use pvm_ui_wire as ui_wire;
@@ -35,13 +36,14 @@ uniffi::setup_scaffolding!();
 pub use application::ApplicationRuntime;
 pub use computer::{
     ChildProcessRequest, ComputerContext, ComputerRuntime, ComputerStatus, ComputerSupervisor,
-    COMPUTER_ABI_VERSION, COMPUTER_TTY_HANDLE, FS_OPEN_CREATE, FS_OPEN_READ, FS_OPEN_TRUNCATE,
-    FS_OPEN_WRITE, MAX_BACKGROUND_PROCESSES, MAX_COMPUTER_CONTEXT_BYTES,
-    MAX_COMPUTER_CONTEXT_ENTRIES, MAX_COMPUTER_FILES, MAX_COMPUTER_FILE_BYTES,
-    MAX_COMPUTER_PATH_BYTES, MAX_COMPUTER_PROCESSES, MAX_NET_ADDRESS_BYTES,
-    MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES,
-    TTY_MODE_ECHO, TTY_MODE_RAW,
+    COMPUTER_ABI_VERSION, COMPUTER_TTY_HANDLE, FS_OPEN_APPEND, FS_OPEN_CREATE, FS_OPEN_EXCLUSIVE,
+    FS_OPEN_READ, FS_OPEN_TRUNCATE, FS_OPEN_WRITE, MAX_BACKGROUND_PROCESSES,
+    MAX_COMPUTER_CONTEXT_BYTES, MAX_COMPUTER_CONTEXT_ENTRIES, MAX_COMPUTER_DIRECTORIES,
+    MAX_COMPUTER_FILES, MAX_COMPUTER_FILE_BYTES, MAX_COMPUTER_PATH_BYTES, MAX_COMPUTER_PROCESSES,
+    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES,
+    MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
 };
+pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
 pub use manifest::AppDescriptor;
 
 use anyhow::{anyhow, bail, Context, Result};
