@@ -500,6 +500,98 @@ test("open resolution supplies packages anywhere in the tree", () => {
   assert.deepEqual(resolutions, ["no-such-package", "pane", "extra"]);
 });
 
+test("network revocation reaches a running workspace pane", () => {
+  let closed = 0;
+  const provider = {
+    connect: () => ({
+      read: () => null,
+      write: (bytes) => bytes.byteLength,
+      close: () => closed++,
+    }),
+  };
+  const supervisor = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true, networkProvider: provider },
+  );
+  supervisor.setWorkspaceEnabled(true);
+  supervisor.setNetworkEnabled(true);
+  const result = runDriver(supervisor, (name) => {
+    if (name === "pane") return workspacePane;
+    if (name !== "extra") return undefined;
+    const pane = supervisor.workspaceChildren.find((child) => child.exit === null);
+    const devices = pane.supervisor.stack[0].devices;
+    const socket = devices.netTcpConnect("example.org:443");
+    assert.ok(socket >= 0x1000);
+    supervisor.setNetworkEnabled(false);
+    assert.equal(closed, 1);
+    assert.equal(devices.netWrite(socket, new Uint8Array([1])), -2);
+    assert.equal(devices.netTcpConnect("example.org:443"), -5);
+    return coreServices;
+  });
+  assert.equal(result.code, 0);
+  assert.equal(closed, 1);
+});
+
+test("cancelling a nested package requester cannot resume its abandoned spawn", () => {
+  const supervisor = new ComputerSupervisor(
+    workspacePane,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  supervisor.sendTerminalInput(new TextEncoder().encode("p"));
+  assert.deepEqual(supervisor.run(), { kind: "package", package: "extra" });
+  supervisor.providePackage(pipeDriver);
+  assert.equal(supervisor.run().kind, "package");
+  assert.deepEqual(supervisor.terminateForeground(), { kind: "yielded" });
+  assert.equal(supervisor.pendingPackage(), null);
+  assert.throws(() => supervisor.providePackage(pipeFilter));
+  assert.equal(supervisor.run().kind, "yielded");
+  let output = "";
+  for (let bytes = supervisor.takeTerminalOutput(); bytes !== null; bytes = supervisor.takeTerminalOutput()) {
+    output += text(bytes);
+  }
+  assert.ok(output.endsWith("p:130"), output);
+  supervisor.dispose();
+});
+
+test("workspace revocation cancels direct and routed pending resolutions", () => {
+  const direct = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  direct.setWorkspaceEnabled(true);
+  assert.equal(direct.run().kind, "package");
+  direct.setWorkspaceEnabled(false);
+  assert.equal(direct.pendingPackage(), null);
+  assert.throws(() => direct.providePackage(workspacePane));
+  assert.equal(runDriver(direct).code, 41);
+
+  const routed = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  routed.registerPackage("pane", workspacePane);
+  routed.setWorkspaceEnabled(true);
+  assert.equal(routed.run().kind, "package");
+  routed.rejectPackage();
+  assert.deepEqual(routed.run(), { kind: "package", package: "extra" });
+  routed.setWorkspaceEnabled(false);
+  assert.equal(routed.pendingPackage(), null);
+  assert.notEqual(routed.run().kind, "package");
+  routed.dispose();
+});
+
 test("workspace cancellation releases shared locks without losing pending writes", () => {
   const supervisor = new ComputerSupervisor(
     workspaceDriver,

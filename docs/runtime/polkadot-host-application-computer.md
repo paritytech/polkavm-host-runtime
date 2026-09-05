@@ -478,6 +478,14 @@ Invariants carried over from the terminal-computer supervisor:
   reads, input queues, and transfer sizes obey the same bounds as terminal
   output (64 KiB per transfer, bounded per-child queues), and at most 9
   workspace children are live at once.
+- Revoking network access closes existing sockets throughout the workspace
+  tree and denies connections by current and future descendants. Process
+  exit, fault, and cancellation release both file handles and sockets.
+- Cancelling a foreground requester discards its unresolved spawn. Revoking
+  `host.workspace` cancels routed child resolutions and completes a pending
+  workspace spawn with `DENIED`; late package deliveries cannot resurrect it.
+- A pane's exit does not discard terminal output: nested-program output and
+  the pane's final reply remain readable in order before EOF.
 
 A workspace application therefore composes existing contracts: it is an
 ordinary computer guest whose extra capability is holding child handles.
@@ -768,10 +776,10 @@ explicitly deferred until this direct editor slice works.
 
 From the pre-publication security review of the experimental runtime:
 
-- Host-side work is not metered by guest gas: every process transition clones
-  the shared `/home` store (up to 64 MiB), and one pipe hostcall can drive a
-  background child through up to 1,024 full gas slices. Needs copy-on-write
-  file sharing and a shared drive budget.
+- Host-side work is not metered by guest gas. The `/home` store is shared
+  without cloning on process transitions, but one pipe hostcall can still
+  drive a background child through up to 1,024 full gas slices. A shared
+  drive budget remains necessary.
 - A granted network capability has no destination policy: loopback,
   link-local, and private ranges are reachable, and resolution/connect block
   the runtime thread (up to 5 s). Needs a Host-supplied address policy and
