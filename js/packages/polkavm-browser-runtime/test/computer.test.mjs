@@ -636,7 +636,7 @@ test("workspace cancellation releases shared locks without losing pending writes
     FS_OPEN_EXCLUSIVE: EXCLUSIVE,
     STATUS_EXISTS,
     STATUS_DENIED,
-  } = globalThis.PvmComputer;
+  } = globalThis.PolkaVmComputer;
   const handle = child.fsOpen("/home/cancel.lock", WRITE | CREATE | EXCLUSIVE);
   assert.ok(handle >= 16);
   assert.equal(child.fsWrite(handle, new TextEncoder().encode("pending")), 7);
@@ -672,7 +672,7 @@ test("process exit, fault and supervisor cancellation release all open paths", (
     ComputerDevices,
     FS_OPEN_WRITE: WRITE,
     FS_OPEN_CREATE: CREATE,
-  } = globalThis.PvmComputer;
+  } = globalThis.PolkaVmComputer;
   for (const gas of [MAX_GAS, 1]) {
     const process = new ComputerProcess(
       coreServices,

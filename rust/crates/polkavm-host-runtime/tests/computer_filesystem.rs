@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-use pvm_runtime::{BackendKind, ComputerContext, ComputerStatus, ComputerSupervisor};
+use polkavm_host_runtime::{BackendKind, ComputerContext, ComputerStatus, ComputerSupervisor};
 
 const PROGRAM: &[u8] = include_bytes!("fixtures/computer-filesystem.polkavm");
 

@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use polkavm::ProgramBlob;
-use pvm_runtime::{BackendKind, ComputerContext, ComputerStatus, ComputerSupervisor};
+use polkavm_host_runtime::{BackendKind, ComputerContext, ComputerStatus, ComputerSupervisor};
 
 const DRIVER: &[u8] = include_bytes!("fixtures/computer-workspace-driver.polkavm");
 const PANE: &[u8] = include_bytes!("fixtures/computer-workspace-pane.polkavm");

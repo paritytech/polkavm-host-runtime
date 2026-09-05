@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-await import("../src/pvm-computer.js");
+await import("../src/polkavm-computer.js");
 const {
   ComputerDevices,
   FS_OPEN_READ: READ,
@@ -18,7 +18,7 @@ const {
   STATUS_NOT_DIRECTORY: NOT_DIRECTORY,
   STATUS_IS_DIRECTORY: IS_DIRECTORY,
   STATUS_NOT_EMPTY: NOT_EMPTY,
-} = globalThis.PvmComputer;
+} = globalThis.PolkaVmComputer;
 const encode = (text) => new TextEncoder().encode(text);
 const decode = (bytes) => new TextDecoder().decode(bytes);
 
