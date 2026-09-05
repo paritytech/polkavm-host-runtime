@@ -187,14 +187,14 @@ The call reads the oldest queued WebGPU event.
      GPU error defined by the selected WebGPU contract
 ```
 
-### TrUAPI transport
+### Host-frame transport
 
-Every ABI v1 application receives a bounded transport for canonical TrUAPI
-request and response frames. The runtime treats frame bytes as opaque; TrUAPI
-defines their encoding and service semantics.
+Every ABI v1 application receives a bounded transport for opaque request and
+response frames. The runtime does not define frame encoding or service
+semantics.
 
 ```text
-host_truapi_send(pointer: u32, length: u32) -> u32
+host_frame_send(pointer: u32, length: u32) -> u32
 ```
 
 The call copies one complete request frame into the Host's FIFO request queue.
@@ -207,7 +207,7 @@ It returns:
 ```
 
 ```text
-host_truapi_poll(pointer: u32, capacity: u32) -> i32
+host_frame_poll(pointer: u32, capacity: u32) -> i32
 ```
 
 The call reads the oldest complete response frame. A successful read removes
@@ -225,9 +225,9 @@ Request and response queues are independent. ABI v1 allows frames up to
 each direction. The Host MUST reject an empty or over-limit response before it
 becomes visible to the guest.
 
-TrUAPI transport is part of the base application ABI and does not require a
-manifest capability. Product identity, execution kind, permissions, and
-service availability remain Host and TrUAPI policy.
+The host-frame transport is part of the base application ABI and does not
+require a manifest capability. Product identity, execution kind, permissions,
+and service availability remain Host policy.
 
 ### Input
 
@@ -604,9 +604,9 @@ queued GPU batches                    4
 queued GPU events                     256
 GPU submissions per init/update       8
 GPU inline uploads per init/update    16 MiB
-TrUAPI frame                          1 MiB
-queued TrUAPI frames per direction   32
-queued TrUAPI bytes per direction    4 MiB
+host frame                            1 MiB
+queued host frames per direction     32
+queued host-frame bytes per direction 4 MiB
 ```
 
 Profile contracts define their additional bounds. Conforming Hosts MUST NOT
@@ -655,7 +655,7 @@ results covering:
 - audio submission and gating;
 - save submission;
 - bounded logging;
-- TrUAPI request/response round trips and queue bounds;
+- host-frame request/response round trips and queue bounds;
 - graphics-profile enforcement.
 
 Native and browser implementations MUST run the same fixture inputs. Full

@@ -2,17 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FIXTURES="$ROOT/rust/crates/pvm-runtime/tests/fixtures"
-TOOLCHAIN="${PVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
+FIXTURES="$ROOT/rust/crates/polkavm-host-runtime/tests/fixtures"
+TOOLCHAIN="${POLKAVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
-  "polkavm-app-v1/truapi-roundtrip pvm_truapi_roundtrip truapi-roundtrip.polkavm"
-  "polkavm-app-v1/ui-output pvm_ui_output ui-output.polkavm"
-  "polkavm-app-v1/pointer-capture pvm_pointer_capture pointer-capture.polkavm"
-  "polkadot-host-computer-0.1/core-context pvm_computer_core_context computer-core-context.polkavm"
-  "polkadot-host-computer-0.1/tty-fs-roundtrip pvm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
-  "polkadot-host-computer-0.1/pipe-filter pvm_computer_pipe_filter computer-pipe-filter.polkavm"
-  "polkadot-host-computer-0.1/pipe-driver pvm_computer_pipe_driver computer-pipe-driver.polkavm"
-  "polkadot-host-computer-0.1/tcp-roundtrip pvm_computer_tcp_roundtrip computer-tcp-roundtrip.polkavm"
+  "polkavm-app-v1/host-frame-roundtrip polkavm_host_frame_roundtrip host-frame-roundtrip.polkavm"
+  "polkavm-app-v1/ui-output polkavm_ui_output ui-output.polkavm"
+  "polkavm-app-v1/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
+  "polkadot-host-computer-0.1/core-context polkavm_computer_core_context computer-core-context.polkavm"
+  "polkadot-host-computer-0.1/tty-fs-roundtrip polkavm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
+  "polkadot-host-computer-0.1/pipe-filter polkavm_computer_pipe_filter computer-pipe-filter.polkavm"
+  "polkadot-host-computer-0.1/pipe-driver polkavm_computer_pipe_driver computer-pipe-driver.polkavm"
+  "polkadot-host-computer-0.1/tcp-roundtrip polkavm_computer_tcp_roundtrip computer-tcp-roundtrip.polkavm"
 )
 
 for tool in cargo polkatool rustup; do

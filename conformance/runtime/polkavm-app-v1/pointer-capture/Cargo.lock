@@ -58,7 +58,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pvm-pointer-capture"
+name = "polkavm-pointer-capture"
 version = "0.1.0"
 dependencies = [
  "polkavm-derive",

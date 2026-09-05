@@ -43,7 +43,7 @@ is a library above this ABI, not the platform contract.
          |               |                |
       POSIX shim      native Rust SDK   other SDKs
          |               |
-    Vim / Emacs /     native PVM
+    Vim / Emacs /     native PolkaVM
     SSH / Git           applications
 ```
 
@@ -455,7 +455,7 @@ input_next_event()
 ```
 
 Do not make Wayland the base ABI. Hosts map surfaces to their native graphics
-systems. Browser integration starts with a Host webview, then a PVM browser
+systems. Browser integration starts with a Host webview, then a PolkaVM browser
 shell controlling that engine; a self-contained browser engine is a later
 stress test.
 
@@ -486,13 +486,13 @@ Host stubs once the prototype signatures settle.
 
 ## Repository ownership
 
-`pvm-host-runtime` owns the ABI definitions, VM integration, capability and
+`polkavm-host-runtime` owns the ABI definitions, VM integration, capability and
 handle semantics, reference backends, and conformance fixtures.
 
 `polkavm-app-kit` owns packaged demonstration applications such as the shell,
 utilities, and editor.
 
-`host-rust-core` pins a reviewed `pvm-host-runtime` release and exposes it to
+`host-rust-core` pins a reviewed `polkavm-host-runtime` release and exposes it to
 concrete Polkadot Hosts. It does not carry a second runtime implementation.
 
 ## First development spike

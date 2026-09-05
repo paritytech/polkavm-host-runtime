@@ -58,7 +58,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pvm-ui-output"
+name = "polkavm-ui-output"
 version = "0.1.0"
 dependencies = [
  "polkavm-derive",
