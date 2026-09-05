@@ -96,6 +96,10 @@ await copyFile(
   resolve(source, "pvm-wasm-worker-entry.js"),
   resolve(dist, "pvm-wasm-worker-entry.js"),
 );
+await copyFile(
+  resolve(source, "pvm-computer.js"),
+  resolve(dist, "pvm-computer.js"),
+);
 await writeFile(
   resolve(dist, "pvm-worker.js"),
   Buffer.concat([
@@ -114,6 +118,7 @@ const files = [
   "pvm-wasm-translated.js",
   "pvm-runtime-core.js",
   "pvm-wasm-worker-entry.js",
+  "pvm-computer.js",
 ];
 const sums = [];
 for (const file of files) {

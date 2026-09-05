@@ -197,6 +197,9 @@ The first executable slice uses these versioned imports:
 polkadot_host_0_1_core_args(pointer: u32, capacity: u32) -> i32
 polkadot_host_0_1_core_environment(pointer: u32, capacity: u32) -> i32
 polkadot_host_0_1_core_yield() -> ()
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
 polkadot_host_0_1_core_exit(status: i32) -> never
 ```
 
@@ -210,6 +213,12 @@ The read operations return bytes written when capacity is sufficient. Otherwise
 they return the required capacity as a negative `i32` and write nothing.
 Invalid guest memory fails the execution. Each encoded record is limited to
 64 KiB and 1,024 entries.
+
+Clock calls write one little-endian `u64` nanosecond value: monotonic time since
+the process was created, or wall time since the Unix epoch. The pointer-based
+record avoids target-specific 64-bit return-register conventions on 32-bit
+guests. `core_random` fills exactly the requested bytes from the Host CSPRNG;
+zero-length requests are invalid and one call is limited to 4 KiB.
 
 ### Stream operations
 
@@ -228,10 +237,13 @@ polkadot_host_0_1_fs_truncate(handle, length) -> status
 polkadot_host_0_1_fs_stat(path_pointer, path_length, record_pointer) -> status
 polkadot_host_0_1_fs_sync(handle) -> status
 polkadot_host_0_1_fs_close(handle) -> status
+polkadot_host_0_1_fs_remove(path_pointer, path_length) -> status
 ```
 
 The first implementation uses a virtual filesystem with a Host-provided
-persistent `/home` mount.
+persistent `/home` mount. Removing an open file returns `DENIED`; a successful
+removal is reported separately from modified file contents so persistence
+adapters can delete the backing entry.
 
 ### `host.process`
 
@@ -271,6 +283,9 @@ EOF -> wait` sequence always terminates. Pids are pid-scoped pipe handles for
 now; generic transferable handles remain an open question. Background
 children cannot spawn (max 4 live per computer).
 
+Host-authority cancellation abandons any unresolved spawn owned by the
+cancelled foreground; a late package delivery cannot launch it in the parent.
+
 ### `host.net`
 
 ```text
@@ -293,7 +308,17 @@ polkadot_host_0_1_net_close(handle)           -> 0 | error
 
 The Host grants the capability per computer (`set_network_enabled`); at most
 4 sockets, nonblocking, 64 KiB per transfer. Listen, accept, and UDP remain
-unimplemented. Wasm hosts currently report DENIED.
+unimplemented. Browser Hosts inject a byte-stream provider and remain DENIED
+when none is configured. The reference `WebSocketTcpProvider` opens a
+Host-selected relay URL, sends one JSON request
+`{"version":1,"address":"host:port"}`, waits for `{"type":"connected"}`, then
+exchanges raw TCP bytes as binary frames. TLS, HTTP, and SSH stay in the guest.
+The relay retains at most 1 MiB or 1,024 incoming chunks per socket and permits
+at most 1 MiB of queued outgoing bytes. Receive overflow closes the stream and
+reports an I/O error rather than silently truncating it; activity wakes the
+yielded guest to retry. Late relay events cannot reopen a closed stream.
+Exit, fault, and Host-authority cancellation close the process's granted
+streams in both the native and browser hosts.
 
 ### `host.tty`
 
@@ -330,15 +355,50 @@ SplitHorizontal
     +-- ssh.pvm
 ```
 
-Later workspace operations are:
+### Draft `host.workspace` surface ABI (unimplemented)
+
+Design draft; binary signatures follow the conventions above and must be
+pinned by conformance fixtures before any Host advertises them.
+
+A surface is an opaque handle owned by the Host, like every other resource.
+Two surface kinds exist initially, and both deliberately avoid a fixed bitmap
+geometry:
+
+- `text`: a column/row cell grid. The Host renders cells natively, so
+  terminals stay DPI-independent on every platform (this removes the current
+  640x400 presentation ceiling rather than generalizing it).
+- `frame`: an RGBA framebuffer presented whole. This is the phase-7 graphics
+  contract and is not required for the tiling milestone.
 
 ```text
-workspace.spawn_child()
-workspace.child_surface()
-workspace.resize_child()
-workspace.focus_child()
-workspace.close_child()
+polkadot_host_0_1_workspace_spawn(package, argv, environment)
+    -> (child_handle, surface_handle) | error
+polkadot_host_0_1_workspace_run(child_handle) -> status
+polkadot_host_0_1_workspace_send_input(child_handle, record_pointer, length)
+    -> written | WOULD_BLOCK | error
+polkadot_host_0_1_workspace_resize(child_handle, columns, rows) -> status
+polkadot_host_0_1_workspace_surface_read(surface_handle, pointer, capacity)
+    -> length | WOULD_BLOCK | error
+polkadot_host_0_1_workspace_close(child_handle) -> status
 ```
+
+Invariants carried over from the terminal-computer supervisor:
+
+- The Host owns every child VM, its gas budget, its capability grants, and its
+  fault containment. `workspace_run` returns the same status codes as
+  `process_run`; a faulted child is reported and reaped, never resurrected.
+- The workspace guest sees only surface output records and child exit status.
+  It never reads child memory, files, or capability state.
+- Input is routed, not shared: the Host delivers input records exclusively to
+  the workspace, which forwards bytes to at most one focused child per call.
+  Host-authority cancellation (the Ctrl-] equivalent) always targets the
+  workspace itself and cannot be intercepted by it.
+- `workspace_resize` obeys the existing 1..=1000 column/row clamp, and surface
+  reads are bounded by the same queue limits as terminal output.
+
+A workspace application therefore composes existing contracts: it is an
+ordinary computer guest whose extra capability is holding child and surface
+handles. Layout, focus, and keybindings are guest policy.
 
 A first tiling workspace may implement bindings such as:
 
@@ -386,7 +446,7 @@ see the changes — both standalone and as a sandboxed child of the shell.
 `:!` filters remain stubbed pending a `mch_call_shell` mapping onto the pipe
 capability. Full matrix: [vim-tiny-compatibility.md](vim-tiny-compatibility.md).
 
-SSH (phase 4) is assessed: Dropbear's dbclient plus its bundled crypto stack
+SSH is assessed: Dropbear's dbclient plus its bundled crypto stack
 compiles cleanly against the same toolchain; the single missing host
 capability is entropy (`core_random`). Matrix and vertical-slice plan:
 [ssh-client-compatibility.md](ssh-client-compatibility.md).
@@ -395,6 +455,68 @@ Presentation: the `computer-serve` Host mode (application repository: Epoca)
 renders the supervisor's ANSI stream host-side through the shared terminal
 emulator and speaks the framebuffer-app wire protocol, so browser surfaces
 can present the computer without new message types.
+
+Browser Host: `js/packages/pvm-browser-runtime/src/pvm-computer.js` implements
+the same contract in JavaScript over the wasm-translated guest - context,
+tty/fs devices, supervisor, pipes, spawn gating, and network denial - and runs
+the identical `.polkavm` conformance fixtures in the browser test suite.
+Translated shell and Vim guests run unmodified under it, so the computer is a
+client-side web product, not a native-only CLI.
+
+### Priority 1: Lynx
+
+Lynx is the first remaining product milestone. It deliberately precedes SSH:
+both need generic DNS, TCP, poll, cryptographic random, and clocks, while Lynx
+also exercises the existing terminal and virtual filesystem through an
+immediately visible application. The Host MUST NOT implement HTTP, TLS, or
+Lynx-specific calls. Lynx owns HTTP and TLS over a Host-provided opaque TCP
+stream. Native Hosts connect directly; browser Hosts use a generic
+WebSocket/WebTransport-to-TCP connector. The connector is not browser or SSH
+support and can serve any byte-stream protocol.
+
+Success means the same `lynx.polkavm` binary:
+
+1. launches standalone and through open DotNS spawn from the computer shell;
+2. opens an HTTPS page, follows a link, and navigates back;
+3. downloads a file into the Host-provided virtual `/home`;
+4. persists bookmarks, configuration, and downloads across relaunch;
+5. runs unchanged on native and browser Hosts.
+
+Shell escapes, external mail/news commands, printer commands, and protocols
+other than HTTP/HTTPS remain disabled in the first port.
+
+### Priority 2: Doom as a workspace child
+
+After Lynx, implement the first mixed-surface workspace rather than another
+terminal program. A `workspace.polkavm` root launches independently sandboxed
+children whose existing contracts remain unchanged:
+
+```text
+workspace.polkavm
++-- shell.polkavm  -> text surface
++-- kilo.polkavm   -> text surface
++-- doom.polkavm   -> frame surface
+```
+
+The Host owns every VM, surface, capability grant, resource bound, and input
+route. The workspace owns only layout, focus, resize requests, and launch/close
+requests. Success means Doom renders and receives input beside terminal
+children, a child fault does not terminate the workspace, and no child can
+read another child's memory or widen its capabilities.
+
+### Remaining priority
+
+After Lynx and the Doom workspace child, proceed in this order:
+
+1. SQLite for random-access durability, atomic replacement, and locking;
+2. Lua for useful scripting over existing Host capabilities;
+3. BusyBox/Toybox applets (not a speculative full `fork`-based shell);
+4. SSH, reusing Lynx's DNS/TCP/random/clock substrate with all SSH protocol and
+   cryptography remaining in the guest;
+5. tmux for multiple TTY handles, polling, and retained sessions;
+6. Git for the combined filesystem/process/network integration test;
+7. terminal Emacs as a late libc/terminal/process compatibility stress test;
+8. Servo as a long-term full-platform stress test, not a prerequisite.
 
 ### Targeted POSIX compatibility
 
@@ -461,28 +583,31 @@ stress test.
 
 ## Package model
 
-A package eventually contains a manifest, PolkaVM executable, assets, requested
-capabilities, entrypoint, ABI requirements, and metadata.
+Every launchable program is a normal DotNS application with its own App
+Manifest, content-addressed archive, entrypoint, and requested Host contract.
+`process_spawn("vim", ...)` is open resolution, not a parent-manifest
+allowlist: the Host resolves `vim`, verifies the child's own signed executable
+record against the fetched archive, checks that it speaks a supported contract,
+and creates an independently sandboxed VM. The child's effective grant cannot
+exceed the parent's.
 
-```toml
-name = "vim"
-version = "9.x"
-entrypoint = "vim.polkavm"
+An application MAY carry name-to-CID pins for deterministic/offline operation.
+Pins are lockfile data, never authorization: an unpinned published app remains
+launchable when Host policy permits registry access, and a pinned app receives
+no additional authority.
 
-[[interfaces]]
-name = "polkadot-host-computer/core"
-version = "0.1"
+The manifest never names a real host resource. Filesystem operations address
+only namespaces the Host chooses to mount into the process (`/home` in 0.1);
+the backing store is unobservable Host policy. The same rule applies to
+terminal, socket, process, and surface handles.
 
-[capabilities]
-terminal = true
+A `.polkavm` optional custom section MAY mirror contract metadata for tooling
+or archive-local fixtures, but DotNS executable records remain the pre-fetch
+trust anchor for published applications.
 
-[filesystem]
-documents = "read-write"
-```
-
-Applications declare required modular interfaces rather than assume one global
-Host version. A machine-readable IDL should generate Rust and C bindings plus
-Host stubs once the prototype signatures settle.
+Applications declare a Host contract before fetch; the blob's exact import
+table is checked before execution. A machine-readable IDL should generate Rust
+and C bindings plus Host stubs once the prototype signatures settle.
 
 ## Repository ownership
 

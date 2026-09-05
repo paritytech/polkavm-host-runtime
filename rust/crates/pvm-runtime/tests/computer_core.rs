@@ -6,6 +6,7 @@ use polkavm::ProgramBlob;
 use pvm_runtime::{BackendKind, ComputerContext, ComputerRuntime, ComputerStatus};
 
 const PROGRAM: &[u8] = include_bytes!("fixtures/computer-core-context.polkavm");
+const CORE_SERVICES: &[u8] = include_bytes!("fixtures/computer-core-services.polkavm");
 const ROUNDTRIP: &[u8] = include_bytes!("fixtures/computer-tty-fs-roundtrip.polkavm");
 
 #[test]
@@ -47,6 +48,21 @@ fn computer_guest_reads_context_and_exits_with_status() {
     assert_eq!(runtime.run().unwrap(), ComputerStatus::Exited(23));
 }
 
+#[test]
+fn computer_guest_reads_clocks_and_secure_random() {
+    let mut runtime = ComputerRuntime::new_with_backend(
+        CORE_SERVICES,
+        ComputerContext::new(vec![], vec![]).unwrap(),
+        50_000_000,
+        BackendKind::Interpreter,
+    )
+    .expect("create computer runtime");
+
+    // The fixture verifies monotonic ordering, a plausible wall clock,
+    // distinct secure-random outputs, and INVALID/LIMIT boundaries.
+    assert_eq!(runtime.run().unwrap(), ComputerStatus::Exited(31));
+}
+
 fn drain_output(runtime: &mut ComputerRuntime) -> Vec<u8> {
     let mut output = Vec::new();
     while let Some(bytes) = runtime.take_terminal_output() {
@@ -73,6 +89,7 @@ fn computer_guest_roundtrips_terminal_and_filesystem() {
     assert_eq!(drain_output(&mut runtime), b"ready:seeded\r\n");
     assert_eq!(runtime.terminal_mode(), pvm_runtime::TTY_MODE_RAW);
     assert!(runtime.take_modified_files().is_empty());
+    assert!(runtime.take_removed_files().is_empty());
 
     runtime.send_terminal_input(b"hello").unwrap();
     assert_eq!(runtime.run().unwrap(), ComputerStatus::Yielded);
@@ -88,6 +105,10 @@ fn computer_guest_roundtrips_terminal_and_filesystem() {
     assert_eq!(
         runtime.take_modified_files(),
         vec![("/home/echo.txt".to_owned(), b"hello pvm".to_vec())]
+    );
+    assert_eq!(
+        runtime.take_removed_files(),
+        vec!["/home/remove.tmp".to_owned()]
     );
 
     let mut relaunched = ComputerRuntime::new_with_backend(

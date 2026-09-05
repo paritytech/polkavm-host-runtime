@@ -112,6 +112,9 @@ struct InputEvent {
 #[derive(Clone, Copy)]
 enum ComputerCall {
     Yield,
+    ClockMonotonic,
+    ClockWall,
+    Random,
     TtyCurrent,
     TtyRead,
     TtyWrite,
@@ -125,6 +128,7 @@ enum ComputerCall {
     FsStat,
     FsSync,
     FsClose,
+    FsRemove,
     FsList,
     ProcessRun,
     ProcessSpawn,
@@ -141,6 +145,9 @@ enum ComputerCall {
 fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
     Some(match name {
         b"polkadot_host_0_1_core_yield" => ComputerCall::Yield,
+        b"polkadot_host_0_1_core_clock_monotonic" => ComputerCall::ClockMonotonic,
+        b"polkadot_host_0_1_core_clock_wall" => ComputerCall::ClockWall,
+        b"polkadot_host_0_1_core_random" => ComputerCall::Random,
         b"polkadot_host_0_1_tty_current" => ComputerCall::TtyCurrent,
         b"polkadot_host_0_1_tty_read" => ComputerCall::TtyRead,
         b"polkadot_host_0_1_tty_write" => ComputerCall::TtyWrite,
@@ -154,6 +161,7 @@ fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
         b"polkadot_host_0_1_fs_stat" => ComputerCall::FsStat,
         b"polkadot_host_0_1_fs_sync" => ComputerCall::FsSync,
         b"polkadot_host_0_1_fs_close" => ComputerCall::FsClose,
+        b"polkadot_host_0_1_fs_remove" => ComputerCall::FsRemove,
         b"polkadot_host_0_1_fs_list" => ComputerCall::FsList,
         b"polkadot_host_0_1_process_run" => ComputerCall::ProcessRun,
         b"polkadot_host_0_1_process_spawn" => ComputerCall::ProcessSpawn,
@@ -1254,6 +1262,37 @@ impl Vm {
 
         match call {
             ComputerCall::Yield => return Ok(Some(Interruption::Yield)),
+            ComputerCall::ClockMonotonic => {
+                let destination = guest_pointer(a0, "monotonic clock destination")?;
+                self.instance.write_memory(
+                    destination,
+                    &self.computer.core_clock_monotonic().to_le_bytes(),
+                )?;
+                self.instance.set_reg(Reg::A0, 0);
+            }
+            ComputerCall::ClockWall => {
+                let destination = guest_pointer(a0, "wall clock destination")?;
+                self.instance
+                    .write_memory(destination, &self.computer.core_clock_wall().to_le_bytes())?;
+                self.instance.set_reg(Reg::A0, 0);
+            }
+            ComputerCall::Random => {
+                let destination = guest_pointer(a0, "random destination")?;
+                let length = usize::try_from(a1).unwrap_or(usize::MAX);
+                let result = if length == 0 {
+                    crate::computer::STATUS_INVALID
+                } else if length > crate::computer::MAX_RANDOM_BYTES {
+                    crate::computer::STATUS_LIMIT
+                } else {
+                    let mut bytes = vec![0u8; length];
+                    let result = self.computer.core_random(&mut bytes);
+                    if result == 0 {
+                        self.instance.write_memory(destination, &bytes)?;
+                    }
+                    result
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
             ComputerCall::TtyCurrent => {
                 self.instance
                     .set_reg(Reg::A0, u64::from(crate::computer::COMPUTER_TTY_HANDLE));
@@ -1372,6 +1411,15 @@ impl Vm {
             }
             ComputerCall::FsClose => {
                 let result = self.computer.fs_close(a0 as u32);
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsRemove => {
+                let result = self
+                    .read_computer_path(a0, a1)?
+                    .as_deref()
+                    .map_or(crate::computer::STATUS_INVALID, |path| {
+                        self.computer.fs_remove(path)
+                    });
                 self.instance.set_reg(Reg::A0, status(result));
             }
             ComputerCall::FsList => {

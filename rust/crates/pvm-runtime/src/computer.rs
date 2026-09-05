@@ -52,6 +52,8 @@ pub(crate) const FIRST_SOCKET_HANDLE: u32 = 0x1000;
 pub(crate) const FIRST_FILE_HANDLE: u32 = 16;
 /// Maximum accepted network address length in bytes.
 pub const MAX_NET_ADDRESS_BYTES: usize = 256;
+/// Maximum random bytes filled by one hostcall.
+pub const MAX_RANDOM_BYTES: usize = 4 * 1024;
 
 pub(crate) const STATUS_WOULD_BLOCK: i32 = -1;
 pub(crate) const STATUS_BAD_HANDLE: i32 = -2;
@@ -157,8 +159,11 @@ pub(crate) struct ComputerDevices {
     tty_mode: u32,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeSet<String>,
+    removed: BTreeSet<String>,
     open_files: BTreeMap<u32, OpenComputerFile>,
     network_enabled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    monotonic_epoch: std::time::Instant,
     #[cfg(not(target_arch = "wasm32"))]
     sockets: BTreeMap<u32, std::net::TcpStream>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -176,13 +181,61 @@ impl ComputerDevices {
             tty_mode: TTY_MODE_ECHO,
             files: BTreeMap::new(),
             modified: BTreeSet::new(),
+            removed: BTreeSet::new(),
             open_files: BTreeMap::new(),
             network_enabled: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            monotonic_epoch: std::time::Instant::now(),
             #[cfg(not(target_arch = "wasm32"))]
             sockets: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             next_socket: FIRST_SOCKET_HANDLE,
         }
+    }
+
+    /* ── Core clocks and entropy ──────────────────────────────────── */
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_clock_monotonic(&self) -> u64 {
+        self.monotonic_epoch
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_clock_monotonic(&self) -> u64 {
+        0
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_clock_wall(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_clock_wall(&self) -> u64 {
+        0
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn core_random(&self, bytes: &mut [u8]) -> i32 {
+        if bytes.is_empty() {
+            return STATUS_INVALID;
+        }
+        match getrandom::fill(bytes) {
+            Ok(()) => 0,
+            Err(_) => STATUS_INVALID,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn core_random(&self, _bytes: &mut [u8]) -> i32 {
+        STATUS_DENIED
     }
 
     /* ── Network boundary (host.net v0: outbound TCP only) ─────────── */
@@ -311,6 +364,7 @@ impl ComputerDevices {
             bail!("computer filesystem file limit exceeded");
         }
         self.files.insert(path.to_owned(), bytes);
+        self.removed.remove(path);
         Ok(())
     }
 
@@ -323,6 +377,10 @@ impl ComputerDevices {
                 Some((path, bytes))
             })
             .collect()
+    }
+
+    fn take_removed_files(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.removed).into_iter().collect()
     }
 
     pub(crate) fn has_terminal_input(&self) -> bool {
@@ -412,6 +470,7 @@ impl ComputerDevices {
         if !self.files.contains_key(path) || (writable && flags & FS_OPEN_TRUNCATE != 0) {
             self.files.insert(path.to_owned(), Vec::new());
             self.modified.insert(path.to_owned());
+            self.removed.remove(path);
         }
         self.open_files.insert(
             handle,
@@ -526,6 +585,21 @@ impl ComputerDevices {
         }
     }
 
+    pub(crate) fn fs_remove(&mut self, path: &str) -> i32 {
+        let Some(path) = validate_computer_path(path) else {
+            return STATUS_INVALID;
+        };
+        if self.open_files.values().any(|open| open.path == path) {
+            return STATUS_DENIED;
+        }
+        if self.files.remove(path).is_none() {
+            return STATUS_NOT_FOUND;
+        }
+        self.modified.remove(path);
+        self.removed.insert(path.to_owned());
+        0
+    }
+
     /// Encodes the mounted file paths as a length-delimited record.
     pub(crate) fn fs_list_record(&self) -> Vec<u8> {
         let mut record = Vec::with_capacity(64);
@@ -628,9 +702,17 @@ impl ComputerRuntime {
         }
 
         self.vm.set_gas(self.max_gas_per_run);
-        match self.vm.run().map_err(|error| anyhow!(error))? {
+        let interruption = match self.vm.run() {
+            Ok(interruption) => interruption,
+            Err(error) => {
+                self.dispose();
+                return Err(anyhow!(error));
+            }
+        };
+        match interruption {
             Interruption::Exit(status) => {
                 self.exit_status = Some(status);
+                self.dispose();
                 Ok(ComputerStatus::Exited(status))
             }
             Interruption::Yield => Ok(ComputerStatus::Yielded),
@@ -671,9 +753,16 @@ impl ComputerRuntime {
             | Interruption::Display { .. }
             | Interruption::AudioInit { .. }
             | Interruption::AudioFrame { .. } => {
+                self.dispose();
                 bail!("computer guest requested an application-presentation operation")
             }
         }
+    }
+
+    fn dispose(&mut self) {
+        self.vm.computer.open_files.clear();
+        self.set_network_enabled(false);
+        self.exit_status.get_or_insert(130);
     }
 
     /// Returns the selected execution backend.
@@ -768,6 +857,11 @@ impl ComputerRuntime {
         self.vm.computer.take_modified_files()
     }
 
+    /// Drains paths removed by the guest since the previous call.
+    pub fn take_removed_files(&mut self) -> Vec<String> {
+        self.vm.computer.take_removed_files()
+    }
+
     /// Returns the recorded exit status, when the guest has exited.
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
@@ -809,6 +903,7 @@ pub struct ComputerSupervisor {
     pending_output: Vec<u8>,
     files: BTreeMap<String, Vec<u8>>,
     modified: BTreeMap<String, Vec<u8>>,
+    removed: BTreeSet<String>,
     backend: polkavm::BackendKind,
     max_gas_per_run: u64,
     columns: u32,
@@ -845,6 +940,7 @@ impl ComputerSupervisor {
             environment,
             files: BTreeMap::new(),
             modified: BTreeMap::new(),
+            removed: BTreeSet::new(),
             backend,
             max_gas_per_run,
             columns: 80,
@@ -876,6 +972,7 @@ impl ComputerSupervisor {
     pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
         self.foreground().mount_file(path, bytes.clone())?;
         self.files.insert(path.to_owned(), bytes);
+        self.removed.remove(path);
         Ok(())
     }
 
@@ -935,6 +1032,11 @@ impl ComputerSupervisor {
         core::mem::take(&mut self.modified).into_iter().collect()
     }
 
+    /// Drains paths removed by any process since the previous call.
+    pub fn take_removed_files(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.removed).into_iter().collect()
+    }
+
     /// Exit status reported for a child that faulted (trap, gas, segfault).
     const FAULTED_CHILD_STATUS: i32 = 139;
 
@@ -947,6 +1049,17 @@ impl ComputerSupervisor {
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
     pub fn run(&mut self) -> Result<ComputerStatus> {
+        let result = self.run_inner();
+        if result.is_err() {
+            for process in &mut self.stack {
+                process.dispose();
+            }
+            self.background.clear();
+        }
+        result
+    }
+
+    fn run_inner(&mut self) -> Result<ComputerStatus> {
         // Bound the fault-containment path so a root that spawns
         // immediately-faulting children in a loop cannot keep run() from
         // returning control to the Host.
@@ -955,11 +1068,17 @@ impl ComputerSupervisor {
             let status = match self.foreground().run() {
                 Ok(status) => status,
                 Err(error) => {
+                    self.collect_modified();
                     if self.stack.len() == 1 {
+                        self.background.clear();
                         return Err(error);
                     }
                     fault_pops += 1;
                     if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
+                        for process in &mut self.stack {
+                            process.dispose();
+                        }
+                        self.background.clear();
                         return Err(error.context("children faulted repeatedly"));
                     }
                     self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
@@ -990,6 +1109,7 @@ impl ComputerSupervisor {
                     // The exited root stays resident so terminal accessors
                     // remain valid; rerunning it reports the same status.
                     if self.stack.len() == 1 {
+                        self.background.clear();
                         return Ok(ComputerStatus::Exited(code));
                     }
                     // Mask to the POSIX exit-code byte: negative statuses
@@ -1030,9 +1150,19 @@ impl ComputerSupervisor {
         let depth = self.stack.len();
         self.background.retain(|child| child.owner <= depth);
         self.foreground().resolve_spawn(status);
+        self.rebase_foreground()?;
+        Ok(())
+    }
+
+    fn rebase_foreground(&mut self) -> Result<()> {
         let files = self.files.clone();
+        let devices = &mut self.foreground().vm.computer;
+        devices.files.retain(|path, _| files.contains_key(path));
+        devices
+            .open_files
+            .retain(|_, open| files.contains_key(&open.path));
         for (path, bytes) in files {
-            self.foreground().mount_file(&path, bytes)?;
+            devices.mount_file(&path, bytes)?;
         }
         Ok(())
     }
@@ -1047,6 +1177,7 @@ impl ComputerSupervisor {
             // Record the exit so subsequent run() calls stay terminated; a
             // root that already exited keeps its genuine status.
             let status = *self.foreground().exit_status.get_or_insert(130);
+            self.foreground().dispose();
             self.background.clear();
             return Ok(ComputerStatus::Exited(status));
         }
@@ -1061,9 +1192,15 @@ impl ComputerSupervisor {
     }
 
     fn collect_modified(&mut self) {
+        for path in self.foreground().take_removed_files() {
+            self.files.remove(&path);
+            self.modified.remove(&path);
+            self.removed.insert(path);
+        }
         let changed = self.foreground().take_modified_files();
         for (path, bytes) in changed {
             self.files.insert(path.clone(), bytes.clone());
+            self.removed.remove(&path);
             self.modified.insert(path, bytes);
         }
     }
@@ -1179,8 +1316,14 @@ impl ComputerSupervisor {
                     .output
                     .extend_from_slice(&bytes[..bytes.len().min(available)]);
             }
+            for path in child.runtime.take_removed_files() {
+                self.files.remove(&path);
+                self.modified.remove(&path);
+                self.removed.insert(path);
+            }
             for (path, bytes) in child.runtime.take_modified_files() {
                 self.files.insert(path.clone(), bytes.clone());
+                self.removed.remove(&path);
                 self.modified.insert(path, bytes);
             }
             let child = &mut self.background[index];
@@ -1216,11 +1359,7 @@ impl ComputerSupervisor {
     /// Reclaims an exited background child, publishing its file changes.
     fn reap_background(&mut self, index: usize) -> Result<()> {
         self.background.remove(index);
-        let files = self.files.clone();
-        let foreground = self.foreground();
-        for (path, bytes) in files {
-            foreground.mount_file(&path, bytes)?;
-        }
+        self.rebase_foreground()?;
         Ok(())
     }
 
@@ -1314,6 +1453,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn child_removal_rebases_the_resumed_parent_namespace() {
+        let mut supervisor = ComputerSupervisor::new_with_backend(
+            include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+            ComputerContext::default(),
+            50_000_000,
+            polkavm::BackendKind::Interpreter,
+        )
+        .unwrap();
+        supervisor
+            .register_package(
+                "child",
+                include_bytes!("../tests/fixtures/computer-tty-fs-roundtrip.polkavm").to_vec(),
+            )
+            .unwrap();
+        supervisor
+            .mount_file("/home/seed.txt", b"seeded".to_vec())
+            .unwrap();
+        supervisor
+            .mount_file("/home/remove.tmp", b"old".to_vec())
+            .unwrap();
+        let mut child = supervisor.spawn_child("child", Vec::new()).unwrap();
+        child.send_terminal_input(b"q").unwrap();
+        supervisor.stack.push(child);
+
+        assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(31));
+        assert_eq!(
+            supervisor
+                .foreground()
+                .vm
+                .computer
+                .fs_stat("/home/remove.tmp"),
+            None
+        );
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/remove.tmp"]);
+    }
+
+    #[test]
+    fn piped_child_removal_preserves_files_created_by_parent_after_spawn() {
+        let mut supervisor = ComputerSupervisor::new_with_backend(
+            include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+            ComputerContext::default(),
+            50_000_000,
+            polkavm::BackendKind::Interpreter,
+        )
+        .unwrap();
+        supervisor
+            .register_package(
+                "child",
+                include_bytes!("../tests/fixtures/computer-tty-fs-roundtrip.polkavm").to_vec(),
+            )
+            .unwrap();
+        supervisor
+            .mount_file("/home/seed.txt", b"seeded".to_vec())
+            .unwrap();
+        supervisor
+            .mount_file("/home/remove.tmp", b"old".to_vec())
+            .unwrap();
+        let pid = supervisor.spawn_piped("child", Vec::new()).unwrap();
+
+        // The child snapshot predates this unrelated parent creation.
+        let parent = &mut supervisor.foreground().vm.computer;
+        let handle = parent.fs_open("/home/parent.txt", FS_OPEN_WRITE | FS_OPEN_CREATE) as u32;
+        assert_eq!(parent.fs_write(handle, b"parent"), 6);
+        assert_eq!(parent.fs_close(handle), 0);
+        // run_inner collects parent deltas before dispatching a pipe request.
+        supervisor.collect_modified();
+        supervisor
+            .handle_child_request(ChildProcessRequest::PipeWrite {
+                pid,
+                bytes: b"q".to_vec(),
+            })
+            .unwrap();
+        supervisor
+            .handle_child_request(ChildProcessRequest::Wait { pid })
+            .unwrap();
+
+        let parent = &mut supervisor.foreground().vm.computer;
+        assert_eq!(parent.fs_stat("/home/remove.tmp"), None);
+        let handle = parent.fs_open("/home/parent.txt", FS_OPEN_READ) as u32;
+        let mut bytes = [0; 6];
+        assert_eq!(parent.fs_read(handle, &mut bytes), 6);
+        assert_eq!(&bytes, b"parent");
+        assert_eq!(parent.fs_close(handle), 0);
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/remove.tmp"]);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_paths_close_native_network_streams() {
+        use std::io::Read;
+
+        for terminal in ["exit", "fault", "cancel"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut supervisor = ComputerSupervisor::new_with_backend(
+                include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+                ComputerContext::default(),
+                if terminal == "fault" { 1 } else { 50_000_000 },
+                polkavm::BackendKind::Interpreter,
+            )
+            .unwrap();
+            supervisor.set_network_enabled(true);
+            assert!(
+                supervisor
+                    .foreground()
+                    .vm
+                    .computer
+                    .net_tcp_connect(&listener.local_addr().unwrap().to_string())
+                    > 0
+            );
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            match terminal {
+                "exit" => assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(31)),
+                "fault" => assert!(supervisor.run().is_err()),
+                _ => assert_eq!(
+                    supervisor.terminate_foreground().unwrap(),
+                    ComputerStatus::Exited(130)
+                ),
+            }
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0, "{terminal}");
+        }
+    }
+
+    #[test]
     fn context_encoding_is_length_delimited_and_ordered() {
         let context = ComputerContext::new(
             vec!["shell.polkavm".into(), "--login".into()],
@@ -1391,6 +1655,7 @@ mod tests {
         assert_eq!(&buffer[..5], b"hello");
         assert_eq!(devices.fs_stat("/home/hello.c"), Some(5));
         assert_eq!(devices.fs_sync(handle), 0);
+        assert_eq!(devices.fs_remove("/home/hello.c"), STATUS_DENIED);
         assert_eq!(devices.fs_close(handle), 0);
         assert_eq!(devices.fs_close(handle), STATUS_BAD_HANDLE);
 
@@ -1400,6 +1665,13 @@ mod tests {
             vec![("/home/hello.c".to_owned(), b"hello".to_vec())]
         );
         assert!(devices.take_modified_files().is_empty());
+        assert_eq!(devices.fs_remove("/home/hello.c"), 0);
+        assert_eq!(devices.fs_stat("/home/hello.c"), None);
+        assert_eq!(
+            devices.take_removed_files(),
+            vec!["/home/hello.c".to_owned()]
+        );
+        assert_eq!(devices.fs_remove("/home/hello.c"), STATUS_NOT_FOUND);
     }
 
     #[test]

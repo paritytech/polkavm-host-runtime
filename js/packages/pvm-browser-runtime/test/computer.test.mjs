@@ -1,0 +1,413 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import test from "node:test";
+
+await import("../src/pvm-computer.js");
+
+const packageRoot = resolve(import.meta.dirname, "..");
+const repositoryRoot = resolve(packageRoot, "../../..");
+const fixtureRoot = resolve(
+  repositoryRoot,
+  "rust/crates/pvm-runtime/tests/fixtures",
+);
+
+const {
+  computerContext,
+  ComputerProcess,
+  ComputerSupervisor,
+  ComputerTranslator,
+  WebSocketTcpProvider,
+  TTY_MODE_RAW,
+} = globalThis.PvmComputer;
+
+const MAX_GAS = 50_000_000;
+
+const translator = await ComputerTranslator.create(
+  await readFile(resolve(packageRoot, "dist/pvm-browser-runtime.wasm")),
+);
+
+async function fixture(name) {
+  return translator.translate(
+    await readFile(resolve(fixtureRoot, `${name}.polkavm`)),
+  );
+}
+
+const coreContext = await fixture("computer-core-context");
+const coreServices = await fixture("computer-core-services");
+const roundtrip = await fixture("computer-tty-fs-roundtrip");
+const pipeDriver = await fixture("computer-pipe-driver");
+const pipeFilter = await fixture("computer-pipe-filter");
+const tcpRoundtrip = await fixture("computer-tcp-roundtrip");
+
+const text = (bytes) => new TextDecoder().decode(bytes);
+
+function runToExit(target, limit = 10_000) {
+  for (let step = 0; step < limit; step++) {
+    const status = target.run();
+    if (status.kind === "exited") {
+      return status.code;
+    }
+    assert.equal(status.kind, "yielded");
+  }
+  throw new Error("guest did not exit");
+}
+
+test("computer guest reads context and exits with status", () => {
+  const context = computerContext(
+    ["shell.polkavm", "--login"],
+    [
+      ["HOME", "/home"],
+      ["TERM", "pvm-tty"],
+    ],
+  );
+  const process = new ComputerProcess(coreContext, context, MAX_GAS);
+  assert.deepEqual(process.run(), { kind: "exited", code: 23 });
+  assert.deepEqual(process.run(), { kind: "exited", code: 23 });
+});
+
+test("computer guest reads clocks and secure random", () => {
+  const process = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  assert.deepEqual(process.run(), { kind: "exited", code: 31 });
+});
+
+test("computer guest roundtrips terminal and filesystem", () => {
+  const process = new ComputerProcess(
+    roundtrip,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  process.setTerminalSize(100, 40);
+  process.mountFile("/home/seed.txt", new TextEncoder().encode("seeded"));
+
+  assert.equal(process.run().kind, "yielded");
+  assert.equal(text(process.takeTerminalOutput()), "ready:seeded\r\n");
+  assert.equal(process.terminalMode(), TTY_MODE_RAW);
+  assert.deepEqual(process.takeModifiedFiles(), []);
+  assert.deepEqual(process.takeRemovedFiles(), []);
+
+  process.sendTerminalInput(new TextEncoder().encode("hello"));
+  assert.equal(process.run().kind, "yielded");
+  assert.equal(text(process.takeTerminalOutput()), "HELLO");
+
+  process.sendTerminalInput(new TextEncoder().encode(" pvm"));
+  assert.equal(process.run().kind, "yielded");
+  assert.equal(text(process.takeTerminalOutput()), " PVM");
+
+  process.sendTerminalInput(new TextEncoder().encode("q"));
+  assert.deepEqual(process.run(), { kind: "exited", code: 7 });
+  const modified = process.takeModifiedFiles();
+  assert.equal(modified.length, 1);
+  assert.equal(modified[0][0], "/home/echo.txt");
+  assert.equal(text(modified[0][1]), "hello pvm");
+  assert.deepEqual(process.takeRemovedFiles(), ["/home/remove.tmp"]);
+});
+
+test("child removal rebases the resumed parent namespace", () => {
+  const supervisor = new ComputerSupervisor(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  const child = new ComputerProcess(roundtrip, computerContext([], []), MAX_GAS);
+  for (const target of [supervisor, child]) {
+    target.mountFile("/home/seed.txt", new TextEncoder().encode("seeded"));
+    target.mountFile("/home/remove.tmp", new TextEncoder().encode("old"));
+  }
+  child.sendTerminalInput(new TextEncoder().encode("q"));
+  supervisor.stack.push(child);
+
+  assert.deepEqual(supervisor.run(), { kind: "exited", code: 31 });
+  assert.equal(supervisor.stack[0].devices.fsStat("/home/remove.tmp"), null);
+  assert.deepEqual(supervisor.takeRemovedFiles(), ["/home/remove.tmp"]);
+});
+
+test("guest streams bytes through a piped child and reaps it", () => {
+  const supervisor = new ComputerSupervisor(
+    pipeDriver,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("upper", pipeFilter);
+
+  // The driver asserts every contract detail internally (unknown package,
+  // bad pids, partial writes, EOF, double reap) and exits nonzero with a
+  // distinct code on the first violation.
+  assert.equal(runToExit(supervisor), 0);
+  assert.equal(text(supervisor.takeTerminalOutput()), "HELLO, PIPES");
+});
+
+test("spawn without registration fails from the start", () => {
+  const supervisor = new ComputerSupervisor(
+    pipeDriver,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  assert.equal(runToExit(supervisor), 13);
+});
+
+test("open spawn suspends for the embedder and resumes", () => {
+  const supervisor = new ComputerSupervisor(
+    pipeDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  const requested = [];
+  for (let step = 0; step < 10_000; step++) {
+    const status = supervisor.run();
+    if (status.kind === "exited") {
+      assert.equal(status.code, 0);
+      assert.equal(text(supervisor.takeTerminalOutput()), "HELLO, PIPES");
+      // The driver probes one unknown package (rejected -> NOT_FOUND, the
+      // same observable as the default path) and pipes through "upper"
+      // (provided by the embedder without prior registration).
+      assert.ok(requested.includes("upper"));
+      assert.ok(requested.some((name) => name !== "upper"));
+      return;
+    }
+    if (status.kind === "package") {
+      // Suspension is idempotent until the embedder acts.
+      assert.deepEqual(supervisor.run(), status);
+      requested.push(status.package);
+      if (status.package === "upper") {
+        supervisor.providePackage(pipeFilter);
+      } else {
+        supervisor.rejectPackage();
+      }
+      continue;
+    }
+    assert.equal(status.kind, "yielded");
+  }
+  throw new Error("guest did not exit");
+});
+
+test("supervisor terminates the root as interrupted", () => {
+  const supervisor = new ComputerSupervisor(
+    roundtrip,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.setTerminalSize(100, 40);
+  supervisor.mountFile(
+    "/home/seed.txt",
+    new TextEncoder().encode("seeded"),
+  );
+
+  assert.equal(supervisor.run().kind, "yielded");
+  supervisor.sendTerminalInput(new TextEncoder().encode("hello"));
+  assert.equal(supervisor.run().kind, "yielded");
+
+  assert.deepEqual(supervisor.terminateForeground(), {
+    kind: "exited",
+    code: 130,
+  });
+  assert.deepEqual(supervisor.takeModifiedFiles(), []);
+  // Termination is recorded: the computer stays exited on later runs.
+  assert.deepEqual(supervisor.run(), { kind: "exited", code: 130 });
+});
+
+test("WebSocket TCP provider negotiates then carries bounded binary streams", () => {
+  const instances = [];
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.bufferedAmount = 0;
+      this.sent = [];
+      instances.push(this);
+    }
+
+    send(value) {
+      this.sent.push(value);
+    }
+
+    close() {
+      this.onclose?.();
+    }
+  }
+
+  let activity = 0;
+  const provider = new WebSocketTcpProvider(
+    "wss://relay.invalid/tcp",
+    () => activity++,
+    FakeWebSocket,
+  );
+  const stream = provider.connect("example.org:443");
+  const socket = instances[0];
+  socket.onopen();
+  assert.deepEqual(JSON.parse(socket.sent[0]), {
+    version: 1,
+    address: "example.org:443",
+  });
+  assert.equal(stream.write(new Uint8Array([1])), null);
+
+  socket.onmessage({ data: JSON.stringify({ type: "connected" }) });
+  assert.equal(stream.write(new Uint8Array([1, 2])), 2);
+  assert.ok(socket.sent[1] instanceof ArrayBuffer);
+  socket.onmessage({ data: new Uint8Array([3, 4, 5]) });
+  assert.deepEqual(stream.read(2), new Uint8Array([3, 4]));
+  assert.deepEqual(stream.read(2), new Uint8Array([5]));
+  assert.equal(stream.read(2), null);
+  assert.ok(activity >= 2);
+
+  stream.close();
+  assert.deepEqual(stream.read(2), new Uint8Array());
+});
+
+test("TCP relay buffering is bounded and a closed stream cannot reopen", () => {
+  let socket;
+  class FakeWebSocket {
+    constructor() {
+      socket = this;
+      this.bufferedAmount = 0;
+    }
+
+    send() {}
+
+    close() {
+      this.onclose?.();
+    }
+  }
+  const provider = new WebSocketTcpProvider(
+    "wss://relay.invalid/tcp",
+    null,
+    FakeWebSocket,
+  );
+  const stream = provider.connect("example.org:443");
+  const connected = { data: JSON.stringify({ type: "connected" }) };
+  socket.onmessage(connected);
+  socket.bufferedAmount = 1024 * 1024;
+  assert.equal(stream.write(new Uint8Array([1])), null);
+  socket.bufferedAmount--;
+  assert.equal(stream.write(new Uint8Array([1])), 1);
+
+  socket.onmessage({ data: new Uint8Array(1024 * 1024) });
+  assert.equal(stream.read(1).byteLength, 1);
+  socket.onmessage({ data: new Uint8Array([42]) });
+  assert.equal(stream.read(1024 * 1024).at(-1), 42);
+  socket.onmessage({ data: new Uint8Array(1024 * 1024 + 1) });
+  assert.throws(() => stream.read(1));
+  socket.onmessage(connected);
+  assert.throws(() => stream.write(new Uint8Array([1])));
+
+  const chunks = provider.connect("example.org:443");
+  socket.onmessage(connected);
+  for (let index = 0; index < 1025; index++) {
+    socket.onmessage({ data: new Uint8Array([1]) });
+  }
+  assert.throws(() => chunks.read(1));
+
+  const closed = provider.connect("example.org:443");
+  closed.close();
+  socket.onmessage(connected);
+  socket.onmessage({ data: new Uint8Array([1]) });
+  assert.deepEqual(closed.read(1), new Uint8Array());
+  assert.throws(() => closed.write(new Uint8Array([1])));
+});
+
+test("process exit, fault and cancellation release granted network streams", () => {
+  let closed = 0;
+  const provider = {
+    connect() {
+      return {
+        read: () => null,
+        write: () => null,
+        close() {
+          closed++;
+          if (closed === 1) throw new Error("provider teardown failed");
+        },
+      };
+    },
+  };
+  const process = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    provider,
+  );
+  process.setNetworkEnabled(true);
+  process.devices.netTcpConnect("example.org:443");
+  process.devices.netTcpConnect("example.org:443");
+  assert.deepEqual(process.run(), { kind: "exited", code: 31 });
+  assert.equal(closed, 2);
+  process.dispose();
+  assert.equal(closed, 2);
+
+  const fault = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    0,
+    null,
+    provider,
+  );
+  fault.setNetworkEnabled(true);
+  fault.devices.netTcpConnect("example.org:443");
+  assert.throws(() => fault.run());
+  assert.equal(closed, 3);
+
+  const supervisor = new ComputerSupervisor(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { networkProvider: provider },
+  );
+  supervisor.setNetworkEnabled(true);
+  supervisor.stack[0].devices.netTcpConnect("example.org:443");
+  assert.deepEqual(supervisor.terminateForeground(), { kind: "exited", code: 130 });
+  assert.equal(closed, 4);
+  assert.deepEqual(supervisor.run(), { kind: "exited", code: 130 });
+});
+
+test("network capability roundtrips through a Host byte-stream provider", () => {
+  let closed = false;
+  const provider = {
+    connect(address) {
+      assert.equal(address, "fixture.invalid:443");
+      const incoming = [];
+      return {
+        read(capacity) {
+          if (incoming.length === 0) return null;
+          return Uint8Array.from(incoming.splice(0, capacity));
+        },
+        write(bytes) {
+          for (const byte of bytes) {
+            incoming.push(
+              byte >= 0x61 && byte <= 0x7a ? byte - (0x61 - 0x41) : byte,
+            );
+          }
+          return bytes.byteLength;
+        },
+        close() {
+          closed = true;
+        },
+      };
+    },
+  };
+  const process = new ComputerProcess(
+    tcpRoundtrip,
+    computerContext([], [["NET_TARGET", "fixture.invalid:443"]]),
+    MAX_GAS,
+    null,
+    provider,
+  );
+  process.setNetworkEnabled(true);
+  assert.equal(runToExit(process), 0);
+  assert.equal(closed, true);
+});
+
+test("network capability reports denied on the web host", () => {
+  const process = new ComputerProcess(
+    tcpRoundtrip,
+    computerContext([], [["NET_TARGET", "127.0.0.1:1"]]),
+    MAX_GAS,
+  );
+  // The tcp fixture maps a DENIED connect to its distinct exit code 21.
+  assert.equal(runToExit(process), 21);
+});
