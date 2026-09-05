@@ -40,4 +40,4 @@ polkavm-wasm = { package = "polkavm", git = "https://github.com/paritytech/polka
 [dev-dependencies]
 wasmi = "0.40"
 polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "e06cce9da5c6d3f72458168876ea304e27992094", version = "=0.37.0" }
-wasmparser = "0.240"
+wasmparser = "0.258"
