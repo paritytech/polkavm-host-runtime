@@ -59,6 +59,10 @@ test("Wasm runtime exports the neutral graphics and motion ABI", async () => {
     "pvm_browser_set_motion_availability",
     "pvm_browser_send_motion_sample",
     "pvm_browser_uses_motion",
+    "pvm_browser_uses_pointer_capture",
+    "pvm_browser_set_pointer_capture_supported",
+    "pvm_browser_set_pointer_capture_active",
+    "pvm_browser_take_pointer_capture_request",
   ]) {
     assert.ok(exports.has(name), `missing ${name}`);
   }

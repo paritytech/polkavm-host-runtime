@@ -637,3 +637,147 @@ test("browser runtime can select the interpreter without attempting translation"
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
 });
+
+test("translated backend keeps pointer capture under Host policy", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/motion-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "pointer-capture-policy",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  assert.equal(translated.usesPointerCapture(), false);
+  assert.equal(translated.takePointerCaptureRequest(), null);
+
+  translated.setPointerCaptureActive(true);
+  translated.setPointerCaptureActive(true);
+  translated.setPointerCaptureActive(false);
+  const records = translated.input.map((record) => [record[0], record[1]]);
+  assert.deepEqual(
+    records,
+    [
+      [15, 1],
+      [15, 0],
+    ],
+    "each capture transition reaches the guest exactly once",
+  );
+  translated.stop();
+});
+
+test("both browser backends answer the pointer capture hostcall", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/pointer-capture.polkavm",
+    ),
+  );
+  const status = (bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return [0, 4, 8, 12].map((offset) => view.getInt32(offset, true));
+  };
+
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "pointer-capture-hostcall",
+      pointerCaptureSupported: true,
+    },
+  });
+  const ready = await waitForMessage(messages, "ready");
+  assert.equal(
+    ready.usesPointerCapture,
+    true,
+    "the Host learns that this guest arms capture itself",
+  );
+  const saved = await waitForMessage(messages, "save");
+  assert.deepEqual(
+    status(saved.bytes),
+    [1, -2, 0, 1],
+    "arm, undefined request, release, arm",
+  );
+  const request = await waitForMessage(messages, "pointer-capture");
+  assert.equal(request.capture, true, "the newest guest request reaches the Host");
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const outputs = [];
+  const unsupported = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    (output) => outputs.push(output),
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  assert.equal(unsupported.usesPointerCapture(), true);
+  unsupported.initialize();
+  assert.deepEqual(
+    status(outputs.find((output) => output.type === "save").bytes),
+    [-1, -1, -1, -1],
+    "a backend without capture support answers every request alike",
+  );
+  assert.equal(unsupported.takePointerCaptureRequest(), null);
+  unsupported.stop();
+
+  const supportedOutputs = [];
+  const supported = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    (output) => supportedOutputs.push(output),
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  supported.setPointerCaptureSupported(true);
+  supported.initialize();
+  assert.deepEqual(
+    status(supportedOutputs.find((output) => output.type === "save").bytes),
+    [1, -2, 0, 1],
+    "the translated backend matches the native status codes",
+  );
+  assert.equal(supported.takePointerCaptureRequest(), true);
+  supported.setPointerCaptureSupported(false);
+  supported.initialize();
+  assert.equal(
+    supported.takePointerCaptureRequest(),
+    null,
+    "revoking support drops the request the Host has not served",
+  );
+  supported.stop();
+});
