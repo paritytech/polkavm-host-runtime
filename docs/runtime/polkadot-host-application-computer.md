@@ -310,7 +310,10 @@ when none is configured. The reference `WebSocketTcpProvider` opens a
 Host-selected relay URL, sends one JSON request
 `{"version":1,"address":"host:port"}`, waits for `{"type":"connected"}`, then
 exchanges raw TCP bytes as binary frames. TLS, HTTP, and SSH stay in the guest.
-Browser buffering is capped; activity wakes the yielded guest to retry.
+The relay retains at most 1 MiB or 1,024 incoming chunks per socket and permits
+at most 1 MiB of queued outgoing bytes. Receive overflow closes the stream and
+reports an I/O error rather than silently truncating it; activity wakes the
+yielded guest to retry. Late relay events cannot reopen a closed stream.
 
 ### `host.tty`
 
