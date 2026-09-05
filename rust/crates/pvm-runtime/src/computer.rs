@@ -702,9 +702,17 @@ impl ComputerRuntime {
         }
 
         self.vm.set_gas(self.max_gas_per_run);
-        match self.vm.run().map_err(|error| anyhow!(error))? {
+        let interruption = match self.vm.run() {
+            Ok(interruption) => interruption,
+            Err(error) => {
+                self.dispose();
+                return Err(anyhow!(error));
+            }
+        };
+        match interruption {
             Interruption::Exit(status) => {
                 self.exit_status = Some(status);
+                self.dispose();
                 Ok(ComputerStatus::Exited(status))
             }
             Interruption::Yield => Ok(ComputerStatus::Yielded),
@@ -745,9 +753,16 @@ impl ComputerRuntime {
             | Interruption::Display { .. }
             | Interruption::AudioInit { .. }
             | Interruption::AudioFrame { .. } => {
+                self.dispose();
                 bail!("computer guest requested an application-presentation operation")
             }
         }
+    }
+
+    fn dispose(&mut self) {
+        self.vm.computer.open_files.clear();
+        self.set_network_enabled(false);
+        self.exit_status.get_or_insert(130);
     }
 
     /// Returns the selected execution backend.
@@ -1043,10 +1058,15 @@ impl ComputerSupervisor {
                 Ok(status) => status,
                 Err(error) => {
                     if self.stack.len() == 1 {
+                        self.background.clear();
                         return Err(error);
                     }
                     fault_pops += 1;
                     if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
+                        for process in &mut self.stack {
+                            process.dispose();
+                        }
+                        self.background.clear();
                         return Err(error.context("children faulted repeatedly"));
                     }
                     self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
@@ -1077,6 +1097,7 @@ impl ComputerSupervisor {
                     // The exited root stays resident so terminal accessors
                     // remain valid; rerunning it reports the same status.
                     if self.stack.len() == 1 {
+                        self.background.clear();
                         return Ok(ComputerStatus::Exited(code));
                     }
                     // Mask to the POSIX exit-code byte: negative statuses
@@ -1134,6 +1155,7 @@ impl ComputerSupervisor {
             // Record the exit so subsequent run() calls stay terminated; a
             // root that already exited keeps its genuine status.
             let status = *self.foreground().exit_status.get_or_insert(130);
+            self.foreground().dispose();
             self.background.clear();
             return Ok(ComputerStatus::Exited(status));
         }
@@ -1411,6 +1433,33 @@ fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_paths_close_native_network_streams() {
+        use std::io::Read;
+
+        for terminal in ["exit", "fault", "cancel"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut supervisor = ComputerSupervisor::new_with_backend(
+                include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+                ComputerContext::default(),
+                if terminal == "fault" { 1 } else { 50_000_000 },
+                polkavm::BackendKind::Interpreter,
+            ).unwrap();
+            supervisor.set_network_enabled(true);
+            assert!(supervisor.foreground().vm.computer
+                .net_tcp_connect(&listener.local_addr().unwrap().to_string()) > 0);
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            match terminal {
+                "exit" => assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(31)),
+                "fault" => assert!(supervisor.run().is_err()),
+                _ => assert_eq!(supervisor.terminate_foreground().unwrap(), ComputerStatus::Exited(130)),
+            }
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0, "{terminal}");
+        }
+    }
 
     #[test]
     fn context_encoding_is_length_delimited_and_ordered() {

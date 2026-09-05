@@ -1681,6 +1681,7 @@
         this.dispose();
         return { kind: "exited", code: root.exitStatus };
       }
+      this.pendingResolution = null;
       this.#popForeground(130);
       return { kind: "yielded" };
     }
