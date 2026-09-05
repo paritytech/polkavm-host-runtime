@@ -1,6 +1,6 @@
 [package]
 name = "pvm-gpu-wire"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Bounded host-neutral Tri2D and WebGPU wire protocols for PolkaVM applications"
 license = "MPL-2.0"
