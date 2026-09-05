@@ -77,6 +77,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Check conformance guests
         run: scripts/check-conformance-guests.sh
+      # Ubuntu's AppArmor policy otherwise blocks PolkaVM's Linux sandbox.
+      - name: Enable sandbox user namespaces on the ephemeral runner
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Test
         run: cargo test --workspace --all-features
       - name: Check browser target
