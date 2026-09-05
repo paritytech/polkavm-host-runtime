@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "pvm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/pvm-computer.js"),
-        sha256: "0bc312f927231adcba8ea4cd8ef6aa4a3dbdc0cf1137f61c147d33bfe2120490",
+        sha256: "55c704a375a2fbc3584d19927a9c52800b362b575a8c77d78b0b94f074756487",
     },
     BrowserAsset {
         path: "SHA256SUMS",

@@ -127,7 +127,12 @@ extern "C" fn _pvm_start() {
         }
 
         // Unknown packages and invalid geometry are rejected without effects.
-        if spawn(b"no-such-package", 40, 12) != NOT_FOUND {
+        let missing = spawn(b"no-such-package", 40, 12);
+        // Revocation while package resolution is suspended must return DENIED.
+        if missing == DENIED {
+            fail(42);
+        }
+        if missing != NOT_FOUND {
             fail(15);
         }
         if spawn(b"pane", 0, 12) != INVALID {

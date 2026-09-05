@@ -1814,19 +1814,32 @@ mod tests {
         let mut supervisor = filesystem_supervisor();
         supervisor.set_workspace_enabled(true);
         supervisor.set_network_enabled(true);
-        let handle = supervisor.spawn_workspace_child("child", vec![], 80, 24).unwrap();
+        let handle = supervisor
+            .spawn_workspace_child("child", vec![], 80, 24)
+            .unwrap();
         let index = supervisor.workspace_index(handle).unwrap();
-        let socket = supervisor.workspace_children[index].supervisor.foreground()
-            .vm.computer.net_tcp_connect(&address);
+        let socket = supervisor.workspace_children[index]
+            .supervisor
+            .foreground()
+            .vm
+            .computer
+            .net_tcp_connect(&address);
         assert!(socket >= FIRST_SOCKET_HANDLE as i32);
         let (mut peer, _) = listener.accept().unwrap();
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
 
         supervisor.set_network_enabled(false);
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         let pane = &mut supervisor.workspace_children[index].supervisor;
-        assert_eq!(pane.foreground().vm.computer.net_tcp_connect(&address), STATUS_DENIED);
-        assert_eq!(pane.foreground().vm.computer.net_write(socket as u32, b"x"), STATUS_BAD_HANDLE);
+        assert_eq!(
+            pane.foreground().vm.computer.net_tcp_connect(&address),
+            STATUS_DENIED
+        );
+        assert_eq!(
+            pane.foreground().vm.computer.net_write(socket as u32, b"x"),
+            STATUS_BAD_HANDLE
+        );
         let mut nested = pane.spawn_child("child", vec![]).unwrap();
         assert_eq!(nested.vm.computer.net_tcp_connect(&address), STATUS_DENIED);
     }
@@ -1835,15 +1848,29 @@ mod tests {
     fn workspace_exit_retains_nested_output_and_the_panes_final_reply() {
         let mut supervisor = filesystem_supervisor();
         for (name, bytes) in [
-            ("pane", include_bytes!("../tests/fixtures/computer-workspace-pane.polkavm").as_slice()),
-            ("extra", include_bytes!("../tests/fixtures/computer-pipe-driver.polkavm").as_slice()),
-            ("upper", include_bytes!("../tests/fixtures/computer-pipe-filter.polkavm").as_slice()),
+            (
+                "pane",
+                include_bytes!("../tests/fixtures/computer-workspace-pane.polkavm").as_slice(),
+            ),
+            (
+                "extra",
+                include_bytes!("../tests/fixtures/computer-pipe-driver.polkavm").as_slice(),
+            ),
+            (
+                "upper",
+                include_bytes!("../tests/fixtures/computer-pipe-filter.polkavm").as_slice(),
+            ),
         ] {
             supervisor.register_package(name, bytes.to_vec()).unwrap();
         }
-        let handle = supervisor.spawn_workspace_child("pane", vec![], 80, 24).unwrap();
+        let handle = supervisor
+            .spawn_workspace_child("pane", vec![], 80, 24)
+            .unwrap();
         let index = supervisor.workspace_index(handle).unwrap();
-        supervisor.workspace_children[index].supervisor.send_terminal_input(b"pq").unwrap();
+        supervisor.workspace_children[index]
+            .supervisor
+            .send_terminal_input(b"pq")
+            .unwrap();
         supervisor.drive_workspace_child(index).unwrap();
         let child = &supervisor.workspace_children[index];
         assert_eq!(child.exit, Some(7));
@@ -1857,15 +1884,21 @@ mod tests {
             ComputerContext::default(),
             50_000_000,
             polkavm::BackendKind::Interpreter,
-        ).unwrap();
+        )
+        .unwrap();
         supervisor.set_package_resolution(true);
         supervisor.send_terminal_input(b"p").unwrap();
         assert_eq!(supervisor.run().unwrap(), ComputerStatus::PackageRequested);
-        supervisor.provide_package(
-            include_bytes!("../tests/fixtures/computer-pipe-driver.polkavm").to_vec(),
-        ).unwrap();
+        supervisor
+            .provide_package(
+                include_bytes!("../tests/fixtures/computer-pipe-driver.polkavm").to_vec(),
+            )
+            .unwrap();
         assert_eq!(supervisor.run().unwrap(), ComputerStatus::PackageRequested);
-        assert_eq!(supervisor.terminate_foreground().unwrap(), ComputerStatus::Yielded);
+        assert_eq!(
+            supervisor.terminate_foreground().unwrap(),
+            ComputerStatus::Yielded
+        );
         assert_eq!(supervisor.pending_package(), None);
         assert!(supervisor.provide_package(EXITING_GUEST.to_vec()).is_err());
         assert_eq!(supervisor.run().unwrap(), ComputerStatus::Yielded);
