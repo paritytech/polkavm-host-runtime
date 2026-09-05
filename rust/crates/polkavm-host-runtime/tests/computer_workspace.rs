@@ -7,6 +7,7 @@ use pvm_runtime::{BackendKind, ComputerContext, ComputerStatus, ComputerSupervis
 
 const DRIVER: &[u8] = include_bytes!("fixtures/computer-workspace-driver.polkavm");
 const PANE: &[u8] = include_bytes!("fixtures/computer-workspace-pane.polkavm");
+const EXTRA: &[u8] = include_bytes!("fixtures/computer-core-services.polkavm");
 
 fn supervisor(program: &[u8]) -> ComputerSupervisor {
     ComputerSupervisor::new_with_backend(
@@ -48,6 +49,7 @@ fn fixture_imports_versioned_workspace_operations() {
 fn workspace_guest_supervises_an_independent_child() {
     let mut supervisor = supervisor(DRIVER);
     supervisor.register_package("pane", PANE.to_vec()).unwrap();
+    supervisor.register_package("extra", EXTRA.to_vec()).unwrap();
     supervisor.set_workspace_enabled(true);
 
     // The driver asserts every contract detail internally (bad handles,
@@ -72,9 +74,51 @@ fn workspace_guest_supervises_an_independent_child() {
 }
 
 #[test]
+fn open_resolution_supplies_packages_anywhere_in_the_tree() {
+    // Nothing is pre-registered: the workspace spawn of `pane` and the
+    // pane's own foreground run of `extra` both suspend for the embedder,
+    // and the driver's unknown-package probe resolves through rejection.
+    let mut supervisor = supervisor(DRIVER);
+    supervisor.set_workspace_enabled(true);
+    supervisor.set_package_resolution(true);
+
+    let mut resolutions = Vec::new();
+    let status = loop {
+        match supervisor.run().unwrap() {
+            ComputerStatus::PackageRequested => {
+                let name = supervisor.pending_package().expect("pending name");
+                resolutions.push(name.clone());
+                match name.as_str() {
+                    "pane" => supervisor.provide_package(PANE.to_vec()).unwrap(),
+                    "extra" => supervisor.provide_package(EXTRA.to_vec()).unwrap(),
+                    // The driver probes an unknown label and expects the
+                    // embedder's rejection to surface as NOT_FOUND (-4).
+                    _ => supervisor.reject_package(-4).unwrap(),
+                }
+            }
+            status => break status,
+        }
+    };
+    assert_eq!(status, ComputerStatus::Exited(0));
+    assert_eq!(
+        supervisor.take_terminal_output().as_deref(),
+        Some(b"workspace:ok".as_slice())
+    );
+    assert_eq!(
+        resolutions,
+        vec![
+            "no-such-package".to_owned(),
+            "pane".to_owned(),
+            "extra".to_owned()
+        ]
+    );
+}
+
+#[test]
 fn workspace_operations_are_denied_without_the_grant() {
     let mut supervisor = supervisor(DRIVER);
     supervisor.register_package("pane", PANE.to_vec()).unwrap();
+    supervisor.register_package("extra", EXTRA.to_vec()).unwrap();
 
     // Without set_workspace_enabled the driver's first probe observes
     // DENIED and exits with its distinct gating code.

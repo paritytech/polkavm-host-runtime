@@ -396,7 +396,13 @@ support. Nesting depth is bounded: a workspace child is not granted
 Scheduling stays cooperative and inherits the piped-children rule: children
 execute only while the workspace guest is suspended inside a workspace
 hostcall or `core_yield`. Package resolution uses the same Host-owned
-registry and open-spawn suspension as `process_spawn`.
+registry and open-spawn suspension as `process_spawn`, and it propagates
+through the whole tree: a `workspace_spawn` naming an unregistered package,
+or an unresolved spawn inside a nested child computer, suspends until the
+embedding Host provides or rejects the package. A resolved package joins
+the shared registry, so any published application can run inside a pane
+without being declared in the workspace's own archive; bundled child
+packages remain an optional version pin, never the launch mechanism.
 
 Invariants carried over from the terminal-computer supervisor:
 
