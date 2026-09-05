@@ -283,6 +283,9 @@ EOF -> wait` sequence always terminates. Pids are pid-scoped pipe handles for
 now; generic transferable handles remain an open question. Background
 children cannot spawn (max 4 live per computer).
 
+Host-authority cancellation abandons any unresolved spawn owned by the
+cancelled foreground; a late package delivery cannot launch it in the parent.
+
 ### `host.net`
 
 ```text
@@ -314,6 +317,8 @@ The relay retains at most 1 MiB or 1,024 incoming chunks per socket and permits
 at most 1 MiB of queued outgoing bytes. Receive overflow closes the stream and
 reports an I/O error rather than silently truncating it; activity wakes the
 yielded guest to retry. Late relay events cannot reopen a closed stream.
+Exit, fault, and Host-authority cancellation close the process's granted
+streams in both the native and browser hosts.
 
 ### `host.tty`
 
