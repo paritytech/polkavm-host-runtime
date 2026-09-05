@@ -52,6 +52,8 @@
   const MAX_OPEN_SOCKETS = 4;
   const FIRST_SOCKET_HANDLE = 0x1000;
   const MAX_NET_ADDRESS_BYTES = 256;
+  const MAX_NET_BUFFER_BYTES = 1024 * 1024;
+  const MAX_NET_BUFFER_CHUNKS = 1024;
   const MAX_FS_TRANSFER = 1024 * 1024;
   const FS_OPEN_READ = 1;
   const FS_OPEN_WRITE = 2;
@@ -263,15 +265,19 @@
     constructor(relayUrl, address, onActivity, WebSocketClass) {
       this.incoming = [];
       this.incomingOffset = 0;
+      this.incomingBytes = 0;
+      this.receiveFailed = false;
       this.connected = false;
       this.closed = false;
       this.onActivity = onActivity;
       this.socket = new WebSocketClass(relayUrl);
       this.socket.binaryType = "arraybuffer";
       this.socket.onopen = () => {
+        if (this.closed) return;
         this.socket.send(JSON.stringify({ version: 1, address }));
       };
       this.socket.onmessage = (event) => {
+        if (this.closed) return;
         if (typeof event.data === "string") {
           let message;
           try {
@@ -302,8 +308,22 @@
           this.#terminate();
           return;
         }
+        if (
+          !this.connected ||
+          this.incomingBytes + bytes.byteLength > MAX_NET_BUFFER_BYTES ||
+          (bytes.byteLength > 0 &&
+            this.incoming.length >= MAX_NET_BUFFER_CHUNKS)
+        ) {
+          this.receiveFailed = true;
+          this.incoming.length = 0;
+          this.incomingOffset = 0;
+          this.incomingBytes = 0;
+          this.#terminate();
+          return;
+        }
         if (bytes.byteLength > 0) {
           this.incoming.push(bytes.slice());
+          this.incomingBytes += bytes.byteLength;
         }
         this.#activity();
       };
@@ -312,6 +332,9 @@
     }
 
     read(capacity) {
+      if (this.receiveFailed) {
+        throw new Error("TCP relay receive limit or protocol violation");
+      }
       if (this.incoming.length === 0) {
         return this.closed ? new Uint8Array() : null;
       }
@@ -326,6 +349,7 @@
           written,
         );
         written += count;
+        this.incomingBytes -= count;
         this.incomingOffset += count;
         if (this.incomingOffset === chunk.byteLength) {
           this.incoming.shift();
@@ -343,7 +367,7 @@
         return null;
       }
       // Bound browser buffering; the guest yields and retries after activity.
-      if (this.socket.bufferedAmount > 1024 * 1024) {
+      if (this.socket.bufferedAmount + bytes.byteLength > MAX_NET_BUFFER_BYTES) {
         return null;
       }
       const owned = bytes.slice();
@@ -390,13 +414,23 @@
       this.nextSocket = FIRST_SOCKET_HANDLE;
     }
 
+    dispose() {
+      this.openFiles.clear();
+      this.networkEnabled = false;
+      for (const socket of this.sockets.values()) {
+        try {
+          socket.close();
+        } catch {
+          // Provider teardown failures must not prevent other process cleanup.
+        }
+      }
+      this.sockets.clear();
+    }
+
     setNetworkEnabled(enabled) {
       this.networkEnabled = enabled;
       if (!enabled) {
-        for (const socket of this.sockets.values()) {
-          socket.close();
-        }
-        this.sockets.clear();
+        for (const handle of this.sockets.keys()) this.netClose(handle);
       }
     }
 
@@ -475,8 +509,12 @@
         return STATUS_BAD_HANDLE;
       }
       this.sockets.delete(handle);
-      socket.close();
-      return 0;
+      try {
+        socket.close();
+        return 0;
+      } catch {
+        return STATUS_INVALID;
+      }
     }
 
     pushTerminalInput(bytes) {
@@ -830,6 +868,20 @@
     /** Runs until the guest yields, exits, or requests supervision.
      * Faults (trap, out of gas) throw, mirroring the native Err path. */
     run() {
+      try {
+        return this.#run();
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+
+    dispose() {
+      this.devices.dispose();
+      if (this.exitStatus === null) this.exitStatus = 130;
+    }
+
+    #run() {
       if (this.exitStatus !== null) {
         return { kind: "exited", code: this.exitStatus };
       }
@@ -867,6 +919,7 @@
           return { kind: "yielded" };
         }
         if (outcome === "exit") {
+          this.dispose();
           return { kind: "exited", code: this.exitStatus };
         }
         if (outcome === "spawn") {
@@ -1534,6 +1587,22 @@
     /** Runs the foreground process until the system yields or the root
      * exits; child faults fail only the child (status 139). */
     run() {
+      try {
+        return this.#run();
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+
+    dispose() {
+      for (const process of this.stack) process.dispose();
+      for (const child of this.background) child.process.dispose();
+      this.background.length = 0;
+      this.pendingResolution = null;
+    }
+
+    #run() {
       if (this.pendingResolution !== null) {
         // Idempotent while suspended: the embedder must provide or reject
         // the pending package before execution can continue.
@@ -1594,6 +1663,7 @@
         }
         // Exited.
         if (this.stack.length === 1) {
+          this.dispose();
           return { kind: "exited", code: status.code };
         }
         this.#popForeground(status.code & 0xff);
@@ -1608,9 +1678,10 @@
         if (root.exitStatus === null) {
           root.exitStatus = 130;
         }
-        this.background.length = 0;
+        this.dispose();
         return { kind: "exited", code: root.exitStatus };
       }
+      this.pendingResolution = null;
       this.#popForeground(130);
       return { kind: "yielded" };
     }
@@ -1629,6 +1700,7 @@
 
     #popForeground(status) {
       const child = this.stack.pop();
+      child.dispose();
       // Preserve terminal write order: parent bytes before the child's.
       const parentOutput = this.#foreground().takeTerminalOutput();
       if (parentOutput) {
@@ -1639,9 +1711,11 @@
         this.#appendPendingOutput(childOutput);
       }
       const depth = this.stack.length;
-      this.background = this.background.filter(
-        (entry) => entry.owner <= depth,
-      );
+      this.background = this.background.filter((entry) => {
+        if (entry.owner <= depth) return true;
+        entry.process.dispose();
+        return false;
+      });
       this.#foreground().resolveSpawn(status);
       for (const [path, bytes] of this.files) {
         this.#foreground().mountFile(path, bytes);

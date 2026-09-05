@@ -1446,16 +1446,27 @@ mod tests {
                 ComputerContext::default(),
                 if terminal == "fault" { 1 } else { 50_000_000 },
                 polkavm::BackendKind::Interpreter,
-            ).unwrap();
+            )
+            .unwrap();
             supervisor.set_network_enabled(true);
-            assert!(supervisor.foreground().vm.computer
-                .net_tcp_connect(&listener.local_addr().unwrap().to_string()) > 0);
+            assert!(
+                supervisor
+                    .foreground()
+                    .vm
+                    .computer
+                    .net_tcp_connect(&listener.local_addr().unwrap().to_string())
+                    > 0
+            );
             let (mut peer, _) = listener.accept().unwrap();
-            peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
             match terminal {
                 "exit" => assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(31)),
                 "fault" => assert!(supervisor.run().is_err()),
-                _ => assert_eq!(supervisor.terminate_foreground().unwrap(), ComputerStatus::Exited(130)),
+                _ => assert_eq!(
+                    supervisor.terminate_foreground().unwrap(),
+                    ComputerStatus::Exited(130)
+                ),
             }
             assert_eq!(peer.read(&mut [0]).unwrap(), 0, "{terminal}");
         }
