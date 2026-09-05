@@ -52,6 +52,8 @@
   const MAX_OPEN_SOCKETS = 4;
   const FIRST_SOCKET_HANDLE = 0x1000;
   const MAX_NET_ADDRESS_BYTES = 256;
+  const MAX_NET_BUFFER_BYTES = 1024 * 1024;
+  const MAX_NET_BUFFER_CHUNKS = 1024;
   const MAX_FS_TRANSFER = 1024 * 1024;
   const FS_OPEN_READ = 1;
   const FS_OPEN_WRITE = 2;
@@ -263,15 +265,19 @@
     constructor(relayUrl, address, onActivity, WebSocketClass) {
       this.incoming = [];
       this.incomingOffset = 0;
+      this.incomingBytes = 0;
+      this.receiveFailed = false;
       this.connected = false;
       this.closed = false;
       this.onActivity = onActivity;
       this.socket = new WebSocketClass(relayUrl);
       this.socket.binaryType = "arraybuffer";
       this.socket.onopen = () => {
+        if (this.closed) return;
         this.socket.send(JSON.stringify({ version: 1, address }));
       };
       this.socket.onmessage = (event) => {
+        if (this.closed) return;
         if (typeof event.data === "string") {
           let message;
           try {
@@ -302,8 +308,22 @@
           this.#terminate();
           return;
         }
+        if (
+          !this.connected ||
+          this.incomingBytes + bytes.byteLength > MAX_NET_BUFFER_BYTES ||
+          (bytes.byteLength > 0 &&
+            this.incoming.length >= MAX_NET_BUFFER_CHUNKS)
+        ) {
+          this.receiveFailed = true;
+          this.incoming.length = 0;
+          this.incomingOffset = 0;
+          this.incomingBytes = 0;
+          this.#terminate();
+          return;
+        }
         if (bytes.byteLength > 0) {
           this.incoming.push(bytes.slice());
+          this.incomingBytes += bytes.byteLength;
         }
         this.#activity();
       };
@@ -312,6 +332,9 @@
     }
 
     read(capacity) {
+      if (this.receiveFailed) {
+        throw new Error("TCP relay receive limit or protocol violation");
+      }
       if (this.incoming.length === 0) {
         return this.closed ? new Uint8Array() : null;
       }
@@ -326,6 +349,7 @@
           written,
         );
         written += count;
+        this.incomingBytes -= count;
         this.incomingOffset += count;
         if (this.incomingOffset === chunk.byteLength) {
           this.incoming.shift();
@@ -343,7 +367,7 @@
         return null;
       }
       // Bound browser buffering; the guest yields and retries after activity.
-      if (this.socket.bufferedAmount > 1024 * 1024) {
+      if (this.socket.bufferedAmount + bytes.byteLength > MAX_NET_BUFFER_BYTES) {
         return null;
       }
       const owned = bytes.slice();
