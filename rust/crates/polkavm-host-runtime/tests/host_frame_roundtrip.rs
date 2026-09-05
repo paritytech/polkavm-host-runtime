@@ -12,7 +12,7 @@ const RESPONSE: &[u8] = b"host-frame-conformance-response-v1";
 const SUCCESS: &[u8] = b"host-frame-roundtrip-ok";
 
 #[test]
-fn fixture_imports_the_v1_host_frame_transport() {
+fn fixture_imports_the_v2_host_frame_transport() {
     let blob = ProgramBlob::parse(PROGRAM.into()).expect("fixture should be valid PolkaVM");
     let imports: Vec<_> = blob
         .imports()

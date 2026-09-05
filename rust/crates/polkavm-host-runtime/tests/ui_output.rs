@@ -12,7 +12,7 @@ use std::collections::HashMap;
 const PROGRAM: &[u8] = include_bytes!("fixtures/ui-output.polkavm");
 
 #[test]
-fn fixture_imports_the_v1_ui_output_transport() {
+fn fixture_imports_the_v2_ui_output_transport() {
     let blob = ProgramBlob::parse(PROGRAM.into()).expect("fixture should be valid PolkaVM");
     let imports: Vec<_> = blob
         .imports()
