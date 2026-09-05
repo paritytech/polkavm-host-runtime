@@ -31,6 +31,42 @@ fn corevm_reports_when_motion_is_not_imported() {
 }
 
 #[test]
+fn corevm_accepts_and_reports_the_pointer_capture_hostcall() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(crate::POINTER_CAPTURE_IMPORT.as_bytes());
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let mut vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    assert!(vm.uses_pointer_capture());
+
+    vm.set_pointer_capture_supported(true);
+    assert_eq!(
+        vm.pointer_capture.request(crate::POINTER_CAPTURE_ARM),
+        crate::POINTER_CAPTURE_ARMED
+    );
+    assert_eq!(vm.take_pointer_capture_request(), Some(true));
+}
+
+#[test]
+fn corevm_capture_state_reaches_the_extended_input_queue() {
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(crate::POINTER_CAPTURE_IMPORT.as_bytes());
+    builder.add_export_by_basic_block(0, b"_pvm_start");
+    builder.set_code(&[asm::ret()], &[]);
+    let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+    let mut vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+    vm.set_pointer_capture_supported(true);
+    vm.set_pointer_capture_active(true).unwrap();
+    assert_eq!(
+        vm.epoca_input_events.pop_front(),
+        Some(crate::ui::pointer_capture_record(true))
+    );
+}
+
+#[test]
 fn open_files_enforce_the_descriptor_limit() {
     let file = Arc::new(File { blob: Vec::new() });
     let mut open_files = OpenFiles::new();

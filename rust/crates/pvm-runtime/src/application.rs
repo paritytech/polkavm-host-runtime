@@ -134,29 +134,34 @@ impl ApplicationRuntime {
     pub fn uses_pointer_capture(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.uses_pointer_capture(),
-            Self::CoreVm(_) => false,
+            Self::CoreVm(runtime) => runtime.vm.uses_pointer_capture(),
         }
     }
 
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
-        if let Self::Cooperative(runtime) = self {
-            runtime.set_pointer_capture_supported(supported);
+        match self {
+            Self::Cooperative(runtime) => runtime.set_pointer_capture_supported(supported),
+            Self::CoreVm(runtime) => runtime.vm.set_pointer_capture_supported(supported),
         }
     }
 
     pub fn set_pointer_capture_active(&mut self, active: bool) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_pointer_capture_active(active),
-            Self::CoreVm(_) => Ok(()),
+            Self::CoreVm(runtime) => runtime
+                .vm
+                .set_pointer_capture_active(active)
+                .map_err(anyhow::Error::msg),
         }
     }
 
     pub fn take_pointer_capture_request(&mut self) -> Option<bool> {
         match self {
             Self::Cooperative(runtime) => runtime.take_pointer_capture_request(),
-            Self::CoreVm(_) => None,
+            Self::CoreVm(runtime) => runtime.vm.take_pointer_capture_request(),
         }
     }
+
     pub fn last_gas_used(&self) -> u64 {
         match self {
             Self::Cooperative(runtime) => runtime.last_gas_used(),
