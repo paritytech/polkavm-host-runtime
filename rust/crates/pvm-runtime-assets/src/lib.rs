@@ -26,7 +26,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "pvm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/pvm-browser-runtime.wasm"),
-        sha256: "89a0fb3e9d732bef393beb7926d84d4b6dfac63141618ea65db79b9fe39174f4",
+        sha256: "ab977dcb0fca1e56e1179d6e4eadb03bab10eb17f7e5f199ec35df584ac8dc1b",
     },
     BrowserAsset {
         path: "pvm-worker.js",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 7] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "47c010edbb58a15d3a73742ec23f2ecb00e3e1f367d058a2afbf32e328125343",
+        sha256: "d2e8bccdf23d754bc0bac8f39068f55f3816951c7bab0327414e917e5090daed",
     },
 ];
 
