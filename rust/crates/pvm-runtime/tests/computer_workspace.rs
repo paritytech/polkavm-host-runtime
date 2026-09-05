@@ -111,7 +111,7 @@ fn workspace_guest_supervises_an_independent_child() {
         modified
             .iter()
             .any(|(path, bytes)| path == "/home/pane.txt" && bytes == b"from-pane"),
-        "pane write should merge into the parent /home: {modified:?}"
+        "pane write should be visible in the shared /home store: {modified:?}"
     );
 }
 
