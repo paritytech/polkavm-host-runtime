@@ -206,6 +206,57 @@ test("compiler backend enforces the declared graphics profile", async () => {
   await waitForMessage(messages, "terminated");
 });
 
+test("compiler backend returns complete u64 clock values to 32-bit guests", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/clock-u64.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "clock-u64",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const outputs = [];
+  const translated = new globalThis.TranslatedPvmRuntime(
+    compiled.module,
+    [],
+    (output) => outputs.push(output),
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.initialize();
+
+  translated.update(17);
+  assert.deepEqual(
+    outputs.findLast((output) => output.type === "save").bytes,
+    new Uint8Array([17, 0, 0, 0, 0, 0, 0, 0]),
+  );
+
+  translated.update(0x2_0000_0011);
+  assert.deepEqual(
+    outputs.findLast((output) => output.type === "save").bytes,
+    new Uint8Array([17, 0, 0, 0, 2, 0, 0, 0]),
+  );
+  translated.stop();
+});
+
 test("compiler startup keeps the newest GPU capabilities", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
