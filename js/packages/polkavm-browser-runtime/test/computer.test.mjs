@@ -240,6 +240,57 @@ test("WebSocket TCP provider negotiates then carries bounded binary streams", ()
   assert.deepEqual(stream.read(2), new Uint8Array());
 });
 
+test("TCP relay buffering is bounded and a closed stream cannot reopen", () => {
+  let socket;
+  class FakeWebSocket {
+    constructor() {
+      socket = this;
+      this.bufferedAmount = 0;
+    }
+
+    send() {}
+
+    close() {
+      this.onclose?.();
+    }
+  }
+  const provider = new WebSocketTcpProvider(
+    "wss://relay.invalid/tcp",
+    null,
+    FakeWebSocket,
+  );
+  const stream = provider.connect("example.org:443");
+  const connected = { data: JSON.stringify({ type: "connected" }) };
+  socket.onmessage(connected);
+  socket.bufferedAmount = 1024 * 1024;
+  assert.equal(stream.write(new Uint8Array([1])), null);
+  socket.bufferedAmount--;
+  assert.equal(stream.write(new Uint8Array([1])), 1);
+
+  socket.onmessage({ data: new Uint8Array(1024 * 1024) });
+  assert.equal(stream.read(1).byteLength, 1);
+  socket.onmessage({ data: new Uint8Array([42]) });
+  assert.equal(stream.read(1024 * 1024).at(-1), 42);
+  socket.onmessage({ data: new Uint8Array(1024 * 1024 + 1) });
+  assert.throws(() => stream.read(1));
+  socket.onmessage(connected);
+  assert.throws(() => stream.write(new Uint8Array([1])));
+
+  const chunks = provider.connect("example.org:443");
+  socket.onmessage(connected);
+  for (let index = 0; index < 1025; index++) {
+    socket.onmessage({ data: new Uint8Array([1]) });
+  }
+  assert.throws(() => chunks.read(1));
+
+  const closed = provider.connect("example.org:443");
+  closed.close();
+  socket.onmessage(connected);
+  socket.onmessage({ data: new Uint8Array([1]) });
+  assert.deepEqual(closed.read(1), new Uint8Array());
+  assert.throws(() => closed.write(new Uint8Array([1])));
+});
+
 test("network capability roundtrips through a Host byte-stream provider", () => {
   let closed = false;
   const provider = {
