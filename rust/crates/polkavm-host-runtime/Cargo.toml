@@ -28,16 +28,16 @@ wasm-encoder = "0.240"
 # getrandom 0.3 is pinned for the browser-host build toolchain; 0.4
 # raised MSRV and changed the target-detection API surface.
 getrandom = "0.3"
-polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "8b2e08876754504c0ee6614ed70d3ef1b27c4b10", version = "=0.37.0", features = ["generic-sandbox"] }
+polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", features = ["generic-sandbox"] }
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "24", optional = true }
 thiserror = { version = "1", optional = true }
 uniffi = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "8b2e08876754504c0ee6614ed70d3ef1b27c4b10", version = "=0.37.0", features = ["generic-sandbox"] }
+polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", features = ["generic-sandbox"] }
 
 [dev-dependencies]
 wasmi = "0.40"
-polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "8b2e08876754504c0ee6614ed70d3ef1b27c4b10", version = "=0.37.0" }
+polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0" }
 wasmparser = "0.240"

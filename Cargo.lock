@@ -859,7 +859,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "polkavm"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=8b2e08876754504c0ee6614ed70d3ef1b27c4b10#8b2e08876754504c0ee6614ed70d3ef1b27c4b10"
+source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
 dependencies = [
  "libc",
  "log",
@@ -872,7 +872,7 @@ dependencies = [
 [[package]]
 name = "polkavm-assembler"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=8b2e08876754504c0ee6614ed70d3ef1b27c4b10#8b2e08876754504c0ee6614ed70d3ef1b27c4b10"
+source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
 dependencies = [
  "log",
 ]
@@ -887,7 +887,7 @@ dependencies = [
 [[package]]
 name = "polkavm-common"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=8b2e08876754504c0ee6614ed70d3ef1b27c4b10#8b2e08876754504c0ee6614ed70d3ef1b27c4b10"
+source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
 dependencies = [
  "log",
  "picosimd",
@@ -931,7 +931,7 @@ dependencies = [
 [[package]]
 name = "polkavm-linux-raw"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=8b2e08876754504c0ee6614ed70d3ef1b27c4b10#8b2e08876754504c0ee6614ed70d3ef1b27c4b10"
+source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
 
 [[package]]
 name = "polkavm-motion-wire"
@@ -969,7 +969,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
-
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
