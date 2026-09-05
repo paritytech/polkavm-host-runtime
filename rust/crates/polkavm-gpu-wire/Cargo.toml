@@ -8,7 +8,7 @@ repository = "https://github.com/paritytech/polkavm-host-runtime"
 publish = false
 
 [features]
-default = ["tri2d-validation"]
+default = []
 tri2d-validation = []
 
 [lib]

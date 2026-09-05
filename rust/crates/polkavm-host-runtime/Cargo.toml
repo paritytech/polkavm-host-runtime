@@ -17,7 +17,7 @@ native-gpu = ["dep:pollster", "dep:wgpu"]
 [dependencies]
 anyhow = "1"
 log = "0.4"
-polkavm-gpu-wire = { version = "0.2.0", path = "../polkavm-gpu-wire" }
+polkavm-gpu-wire = { version = "0.2.0", path = "../polkavm-gpu-wire", features = ["tri2d-validation"] }
 polkavm-motion-wire = { version = "0.2.0", path = "../polkavm-motion-wire" }
 polkavm-ui-wire = { version = "0.2.0", path = "../polkavm-ui-wire" }
 serde = { version = "1", features = ["derive"] }
