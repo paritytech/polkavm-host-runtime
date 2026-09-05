@@ -22,6 +22,7 @@ const DENIED: i32 = -5;
 #[polkavm_derive::polkavm_import]
 extern "C" {
     fn polkadot_host_0_1_core_exit(status: i32);
+    fn polkadot_host_0_1_core_yield();
     fn polkadot_host_0_1_tty_current() -> u32;
     fn polkadot_host_0_1_tty_write(handle: u32, source: u32, length: u32) -> i32;
     fn polkadot_host_0_1_workspace_spawn(
@@ -63,18 +64,28 @@ unsafe fn send(handle: u32, bytes: &[u8]) -> i32 {
     polkadot_host_0_1_workspace_send_input(handle, bytes.as_ptr() as u32, bytes.len() as u32)
 }
 
-/// Reads exactly `expected` from the child surface; any other bytes,
-/// `WOULD_BLOCK`, or EOF fails with `code`. The supervisor drives the child
-/// inside the read hostcall, so expected output is available immediately.
+/// Reads exactly `expected` from the child surface; any other bytes or EOF
+/// fails with `code`. The supervisor drives the child inside the read
+/// hostcall; `WOULD_BLOCK` yields so the embedder can settle a suspended
+/// package resolution, bounded so a wedged child still fails the test.
 unsafe fn expect_output(handle: u32, expected: &[u8], code: i32) {
     let mut received = [0u8; 64];
     let mut length = 0usize;
+    let mut yields = 0usize;
     while length < expected.len() {
         let read = polkadot_host_0_1_workspace_read(
             handle,
             received.as_mut_ptr().wrapping_add(length) as u32,
             (expected.len() - length) as u32,
         );
+        if read == WOULD_BLOCK {
+            yields += 1;
+            if yields > 4_096 {
+                fail(code);
+            }
+            polkadot_host_0_1_core_yield();
+            continue;
+        }
         if read <= 0 {
             fail(code);
         }
@@ -167,6 +178,14 @@ extern "C" fn _pvm_start() {
             fail(29);
         }
         expect_output(handle, b"w:ok", 30);
+
+        // A pane is a complete computer: its foreground stack runs the
+        // Host-registered `extra` package (core-services exits 31). Under
+        // open resolution the embedder provides the same package instead.
+        if send(handle, b"p") != 1 {
+            fail(37);
+        }
+        expect_output(handle, b"p:31", 38);
 
         // Exit is reported through wait; the handle stays valid for
         // draining and is reclaimed only by close.

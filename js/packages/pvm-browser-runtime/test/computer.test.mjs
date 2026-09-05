@@ -402,6 +402,7 @@ test("workspace guest supervises an independent child", () => {
     MAX_GAS,
   );
   supervisor.registerPackage("pane", workspacePane);
+  supervisor.registerPackage("extra", coreServices);
   supervisor.setWorkspaceEnabled(true);
 
   // The driver asserts every contract detail internally (bad handles,
@@ -430,8 +431,48 @@ test("workspace operations are denied without the grant", () => {
     MAX_GAS,
   );
   supervisor.registerPackage("pane", workspacePane);
+  supervisor.registerPackage("extra", coreServices);
 
   // Without setWorkspaceEnabled the driver's first probe observes DENIED
   // and exits with its distinct gating code.
   assert.equal(runToExit(supervisor), 41);
+});
+
+test("open resolution supplies packages anywhere in the tree", () => {
+  // Nothing is pre-registered: the workspace spawn of `pane` and the
+  // pane's own foreground run of `extra` both suspend for the embedder,
+  // and the driver's unknown-package probe resolves through rejection.
+  const supervisor = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { packageResolution: true },
+  );
+  supervisor.setWorkspaceEnabled(true);
+
+  const resolutions = [];
+  let code = null;
+  for (let step = 0; step < 10_000 && code === null; step++) {
+    const status = supervisor.run();
+    if (status.kind === "exited") {
+      code = status.code;
+    } else if (status.kind === "package") {
+      resolutions.push(status.package);
+      if (status.package === "pane") {
+        supervisor.providePackage(workspacePane);
+      } else if (status.package === "extra") {
+        supervisor.providePackage(coreServices);
+      } else {
+        // The driver probes an unknown label and expects the embedder's
+        // rejection to surface as NOT_FOUND (-4).
+        supervisor.rejectPackage(-4);
+      }
+    } else {
+      assert.equal(status.kind, "yielded");
+    }
+  }
+  assert.equal(code, 0);
+  assert.equal(text(supervisor.takeTerminalOutput()), "workspace:ok");
+  assert.deepEqual(resolutions, ["no-such-package", "pane", "extra"]);
 });

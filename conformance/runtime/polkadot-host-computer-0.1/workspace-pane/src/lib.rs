@@ -29,6 +29,12 @@ extern "C" {
     fn polkadot_host_0_1_fs_write(handle: u32, source: u32, length: u32) -> i32;
     fn polkadot_host_0_1_fs_close(handle: u32) -> i32;
     fn polkadot_host_0_1_workspace_close(handle: u32) -> i32;
+    fn polkadot_host_0_1_process_run(
+        package: u32,
+        package_length: u32,
+        arguments: u32,
+        arguments_length: u32,
+    ) -> i32;
 }
 
 fn fail(code: i32) -> ! {
@@ -140,6 +146,29 @@ extern "C" fn _pvm_start() {
                         fail(36);
                     }
                     write_all(tty, b"n:denied");
+                }
+                b'p' => {
+                    // Runs a package inside this pane's own foreground
+                    // stack. With open resolution enabled and the package
+                    // unregistered, the request suspends the whole tree
+                    // until the embedder provides or rejects it.
+                    let package = b"extra";
+                    let status = polkadot_host_0_1_process_run(
+                        package.as_ptr() as u32,
+                        package.len() as u32,
+                        0,
+                        0,
+                    );
+                    let mut reply = [0u8; 16];
+                    reply[0] = b'p';
+                    reply[1] = b':';
+                    let mut length = 2;
+                    if status < 0 {
+                        reply[length] = b'-';
+                        length += 1;
+                    }
+                    let length = push_decimal(&mut reply, length, status.unsigned_abs());
+                    write_all(tty, &reply[..length]);
                 }
                 other => {
                     let toggled = [other ^ 0x20];

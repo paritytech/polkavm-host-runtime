@@ -1552,6 +1552,22 @@
         throw new Error("no package resolution is pending");
       }
       this.pendingResolution = null;
+      if (pending.mode === "childRoute") {
+        // Share the resolution with the whole tree, then route it to the
+        // suspended child.
+        const child = this.workspaceChildren.find(
+          (entry) => entry.handle === pending.handle,
+        );
+        if (child === undefined) {
+          throw new Error("suspended workspace child is gone");
+        }
+        const name = child.supervisor.pendingPackage();
+        if (name !== null) {
+          this.registerPackage(name, module);
+        }
+        child.supervisor.providePackage(module);
+        return;
+      }
       this.registerPackage(pending.request.package, module);
       this.#dispatchSpawn(pending);
     }
@@ -1563,12 +1579,43 @@
         throw new Error("no package resolution is pending");
       }
       this.pendingResolution = null;
+      if (pending.mode === "childRoute") {
+        const child = this.workspaceChildren.find(
+          (entry) => entry.handle === pending.handle,
+        );
+        if (child === undefined) {
+          throw new Error("suspended workspace child is gone");
+        }
+        child.supervisor.rejectPackage(status);
+        return;
+      }
       this.#foreground().resolveSpawn(status);
+    }
+
+    /** Returns the package name awaiting embedder resolution, if any. */
+    pendingPackage() {
+      const pending = this.pendingResolution;
+      if (pending === null) {
+        return null;
+      }
+      if (pending.mode === "childRoute") {
+        const child = this.workspaceChildren.find(
+          (entry) => entry.handle === pending.handle,
+        );
+        return child ? child.supervisor.pendingPackage() : null;
+      }
+      return pending.request.package;
     }
 
     #dispatchSpawn(pending) {
       if (pending.mode === "child") {
         this.#handleChildRequest(pending.request);
+        return;
+      }
+      if (pending.mode === "workspace") {
+        this.#handleWorkspaceRequest(pending.request, (value) =>
+          this.#foreground().resolveSpawn(value),
+        );
         return;
       }
       const child = this.#spawnChild(
@@ -1696,10 +1743,7 @@
       if (this.pendingResolution !== null) {
         // Idempotent while suspended: the embedder must provide or reject
         // the pending package before execution can continue.
-        return {
-          kind: "package",
-          package: this.pendingResolution.request.package,
-        };
+        return { kind: "package", package: this.pendingPackage() };
       }
       let faultPops = 0;
       for (;;) {
@@ -1719,6 +1763,20 @@
         }
         this.#collectModified();
         if (status.kind === "yielded") {
+          // Surface a suspended workspace child's resolution once the
+          // workspace guest has yielded; the embedder resolves it before
+          // execution continues anywhere in the tree.
+          const suspended = this.workspaceChildren.find(
+            (child) =>
+              child.exit === null && child.supervisor.pendingPackage() !== null,
+          );
+          if (suspended !== undefined) {
+            this.pendingResolution = {
+              mode: "childRoute",
+              handle: suspended.handle,
+            };
+            return { kind: "package", package: this.pendingPackage() };
+          }
           return { kind: "yielded" };
         }
         if (status.kind === "spawn") {
@@ -1744,10 +1802,7 @@
           }
           this.#handleChildRequest(request);
           if (this.pendingResolution !== null) {
-            return {
-              kind: "package",
-              package: this.pendingResolution.request.package,
-            };
+            return { kind: "package", package: this.pendingPackage() };
           }
           continue;
         }
@@ -2019,6 +2074,13 @@
           resolve(STATUS_LIMIT);
           return;
         }
+        if (
+          this.packageResolution &&
+          !this.packages.has(request.package)
+        ) {
+          this.#suspendForPackage(request, "workspace");
+          return;
+        }
         resolve(
           this.#spawnWorkspaceChild(
             request.package,
@@ -2142,8 +2204,12 @@
           exit = FAULTED_CHILD_STATUS;
         } else if (outcome.kind === "exited") {
           exit = outcome.code & 0xff;
+        } else if (outcome.kind === "package") {
+          // A suspended package resolution surfaces at the parent's next
+          // yielded return; stop driving without progress.
+          return;
         } else if (outcome.kind !== "yielded") {
-          // A nested supervisor only surfaces yielded or exited.
+          // A nested supervisor only surfaces yielded, exited, or package.
           exit = FAULTED_CHILD_STATUS;
         }
         if (exit !== null) {
@@ -2177,7 +2243,10 @@
           context,
           this.maxGas,
           this.emitLog,
-          { networkProvider: this.networkProvider },
+          {
+            networkProvider: this.networkProvider,
+            packageResolution: this.packageResolution,
+          },
         );
         // The nested computer shares the Host-authorized package registry
         // so a shell pane can run editors; it is never granted

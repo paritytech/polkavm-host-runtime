@@ -141,6 +141,9 @@ pub enum ComputerStatus {
     SpawnRequested,
     /// The guest issued a spawn/wait/pipe call; the supervisor must resolve it.
     ChildRequest,
+    /// A spawn named an unregistered package and open resolution is
+    /// enabled; the embedder must `provide_package` or `reject_package`.
+    PackageRequested,
 }
 
 struct OpenComputerFile {
@@ -1002,6 +1005,31 @@ pub struct ComputerSupervisor {
     rows: u32,
     network: bool,
     workspace: bool,
+    package_resolution: bool,
+    pending_resolution: Option<PendingResolution>,
+}
+
+/// A spawn suspended awaiting embedder package resolution (open spawn).
+enum PendingResolution {
+    /// `process_run` from the root foreground.
+    Run {
+        package: String,
+        arguments: Vec<String>,
+    },
+    /// `process_spawn` (piped) from the root foreground.
+    Piped {
+        package: String,
+        arguments: Vec<String>,
+    },
+    /// `workspace_spawn` from the root guest.
+    Workspace {
+        package: String,
+        arguments: Vec<String>,
+        columns: u32,
+        rows: u32,
+    },
+    /// A workspace child's own supervisor is suspended on a resolution.
+    Child { handle: u32 },
 }
 
 impl ComputerSupervisor {
@@ -1041,7 +1069,106 @@ impl ComputerSupervisor {
             rows: 24,
             network: false,
             workspace: false,
+            package_resolution: false,
+            pending_resolution: None,
         })
+    }
+
+    /// Enables open package resolution: a spawn naming an unregistered
+    /// package suspends the computer with `PackageRequested` instead of
+    /// failing with `NOT_FOUND`, so the embedding Host can resolve the
+    /// name (e.g. through DotNS), then `provide_package` or
+    /// `reject_package`. Disabled by default: the conformance contract
+    /// expects immediate `NOT_FOUND`. Workspace children inherit it.
+    pub fn set_package_resolution(&mut self, enabled: bool) {
+        self.package_resolution = enabled;
+    }
+
+    /// Returns the package name awaiting embedder resolution, if any.
+    pub fn pending_package(&self) -> Option<String> {
+        match self.pending_resolution.as_ref()? {
+            PendingResolution::Run { package, .. }
+            | PendingResolution::Piped { package, .. }
+            | PendingResolution::Workspace { package, .. } => Some(package.clone()),
+            PendingResolution::Child { handle } => self
+                .workspace_children
+                .iter()
+                .find(|child| child.handle == *handle)?
+                .supervisor
+                .pending_package(),
+        }
+    }
+
+    /// Registers the pending package and retries the suspended spawn.
+    pub fn provide_package(&mut self, program: Vec<u8>) -> Result<()> {
+        let Some(pending) = self.pending_resolution.take() else {
+            bail!("no package resolution is pending");
+        };
+        match pending {
+            PendingResolution::Run { package, arguments } => {
+                self.register_package(&package, program)?;
+                match self.spawn_child(&package, arguments) {
+                    Ok(child) => self.stack.push(child),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            PendingResolution::Piped { package, arguments } => {
+                self.register_package(&package, program)?;
+                match self.spawn_piped(&package, arguments) {
+                    Ok(pid) => self.foreground().resolve_spawn(pid as i32),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            PendingResolution::Workspace {
+                package,
+                arguments,
+                columns,
+                rows,
+            } => {
+                self.register_package(&package, program)?;
+                match self.spawn_workspace_child(&package, arguments, columns, rows) {
+                    Ok(handle) => self.foreground().resolve_spawn(handle as i32),
+                    Err(status) => self.foreground().resolve_spawn(status),
+                }
+            }
+            PendingResolution::Child { handle } => {
+                // Share the resolution with the whole tree, then route it
+                // to the suspended child.
+                let Some(index) = self.workspace_index(handle) else {
+                    bail!("suspended workspace child is gone");
+                };
+                if let Some(name) = self.workspace_children[index].supervisor.pending_package() {
+                    self.register_package(&name, program.clone())?;
+                }
+                self.workspace_children[index]
+                    .supervisor
+                    .provide_package(program)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails the suspended spawn; the requesting guest observes `status`.
+    pub fn reject_package(&mut self, status: i32) -> Result<()> {
+        let Some(pending) = self.pending_resolution.take() else {
+            bail!("no package resolution is pending");
+        };
+        match pending {
+            PendingResolution::Run { .. }
+            | PendingResolution::Piped { .. }
+            | PendingResolution::Workspace { .. } => {
+                self.foreground().resolve_spawn(status);
+            }
+            PendingResolution::Child { handle } => {
+                let Some(index) = self.workspace_index(handle) else {
+                    bail!("suspended workspace child is gone");
+                };
+                self.workspace_children[index]
+                    .supervisor
+                    .reject_package(status)?;
+            }
+        }
+        Ok(())
     }
 
     /// Registers a launchable package under a Host-authorized name.
@@ -1153,6 +1280,11 @@ impl ComputerSupervisor {
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
     pub fn run(&mut self) -> Result<ComputerStatus> {
+        if self.pending_resolution.is_some() {
+            // Idempotent while suspended: the embedder must provide or
+            // reject the pending package before execution continues.
+            return Ok(ComputerStatus::PackageRequested);
+        }
         // Bound the fault-containment path so a root that spawns
         // immediately-faulting children in a loop cannot keep run() from
         // returning control to the Host.
@@ -1179,12 +1311,30 @@ impl ComputerSupervisor {
             };
             self.collect_modified();
             match status {
-                ComputerStatus::Yielded => return Ok(ComputerStatus::Yielded),
+                ComputerStatus::Yielded => {
+                    // Surface a suspended workspace child's resolution once
+                    // the workspace guest has yielded; the embedder resolves
+                    // it before execution continues anywhere in the tree.
+                    if let Some(child) = self.workspace_children.iter().find(|child| {
+                        child.exit.is_none() && child.supervisor.pending_package().is_some()
+                    }) {
+                        self.pending_resolution = Some(PendingResolution::Child {
+                            handle: child.handle,
+                        });
+                        return Ok(ComputerStatus::PackageRequested);
+                    }
+                    return Ok(ComputerStatus::Yielded);
+                }
                 ComputerStatus::SpawnRequested => {
                     let request = self.foreground().take_spawn_request();
                     let Some((package, arguments)) = request else {
                         bail!("spawn status without a pending request");
                     };
+                    if self.package_resolution && !self.packages.contains_key(&package) {
+                        self.pending_resolution =
+                            Some(PendingResolution::Run { package, arguments });
+                        return Ok(ComputerStatus::PackageRequested);
+                    }
                     match self.spawn_child(&package, arguments) {
                         Ok(child) => self.stack.push(child),
                         Err(status) => self.foreground().resolve_spawn(status),
@@ -1196,6 +1346,9 @@ impl ComputerSupervisor {
                         bail!("child-request status without a pending request");
                     };
                     self.handle_child_request(request)?;
+                    if self.pending_resolution.is_some() {
+                        return Ok(ComputerStatus::PackageRequested);
+                    }
                 }
                 ComputerStatus::Exited(code) => {
                     // The exited root stays resident so terminal accessors
@@ -1208,6 +1361,9 @@ impl ComputerSupervisor {
                     // stay failures (e.g. -1 -> 255) and cannot alias the
                     // negative hostcall error space.
                     self.pop_foreground(code & 0xff)?;
+                }
+                ComputerStatus::PackageRequested => {
+                    bail!("a process runtime cannot request package resolution")
                 }
             }
         }
@@ -1262,6 +1418,7 @@ impl ComputerSupervisor {
             self.foreground().dispose();
             self.background.clear();
             self.workspace_children.clear();
+            self.pending_resolution = None;
             return Ok(ComputerStatus::Exited(status));
         }
         self.pop_foreground(130)?;
@@ -1294,6 +1451,10 @@ impl ComputerSupervisor {
             ChildProcessRequest::Spawn { package, arguments } => {
                 if self.background.len() >= MAX_BACKGROUND_PROCESSES {
                     self.foreground().resolve_spawn(STATUS_LIMIT);
+                    return Ok(());
+                }
+                if self.package_resolution && !self.packages.contains_key(&package) {
+                    self.pending_resolution = Some(PendingResolution::Piped { package, arguments });
                     return Ok(());
                 }
                 match self.spawn_piped(&package, arguments) {
@@ -1394,6 +1555,15 @@ impl ComputerSupervisor {
             } => {
                 if self.workspace_children.len() >= MAX_WORKSPACE_CHILDREN {
                     self.foreground().resolve_spawn(STATUS_LIMIT);
+                    return Ok(());
+                }
+                if self.package_resolution && !self.packages.contains_key(&package) {
+                    self.pending_resolution = Some(PendingResolution::Workspace {
+                        package,
+                        arguments,
+                        columns,
+                        rows,
+                    });
                     return Ok(());
                 }
                 match self.spawn_workspace_child(&package, arguments, columns, rows) {
@@ -1520,6 +1690,9 @@ impl ComputerSupervisor {
             let exit = match outcome {
                 Ok(ComputerStatus::Exited(code)) => Some(code & 0xff),
                 Ok(ComputerStatus::Yielded) => None,
+                // A suspended package resolution surfaces at the parent's
+                // next Yielded return; stop driving without progress.
+                Ok(ComputerStatus::PackageRequested) => return Ok(()),
                 // A nested supervisor only surfaces Yielded or Exited.
                 Ok(_) | Err(_) => Some(Self::FAULTED_CHILD_STATUS),
             };
@@ -1578,6 +1751,7 @@ impl ComputerSupervisor {
             .set_terminal_size(columns, rows)
             .map_err(|_| STATUS_INVALID)?;
         child.set_network_enabled(self.network);
+        child.package_resolution = self.package_resolution;
         for (path, bytes) in &self.files {
             child
                 .mount_file(path, bytes.clone())
@@ -1658,6 +1832,12 @@ impl ComputerSupervisor {
                     // No nested background trees in the experimental contract.
                     let _ = child.runtime.take_child_request();
                     child.runtime.resolve_spawn(STATUS_DENIED);
+                }
+                ComputerStatus::PackageRequested => {
+                    // Process runtimes never request package resolution;
+                    // treat a stray status as a contained child fault.
+                    child.exit = Some(Self::FAULTED_CHILD_STATUS);
+                    return Ok(());
                 }
             }
         }
