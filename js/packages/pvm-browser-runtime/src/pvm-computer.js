@@ -414,13 +414,23 @@
       this.nextSocket = FIRST_SOCKET_HANDLE;
     }
 
+    dispose() {
+      this.openFiles.clear();
+      this.networkEnabled = false;
+      for (const socket of this.sockets.values()) {
+        try {
+          socket.close();
+        } catch {
+          // Provider teardown failures must not prevent other process cleanup.
+        }
+      }
+      this.sockets.clear();
+    }
+
     setNetworkEnabled(enabled) {
       this.networkEnabled = enabled;
       if (!enabled) {
-        for (const socket of this.sockets.values()) {
-          socket.close();
-        }
-        this.sockets.clear();
+        for (const handle of this.sockets.keys()) this.netClose(handle);
       }
     }
 
@@ -499,8 +509,12 @@
         return STATUS_BAD_HANDLE;
       }
       this.sockets.delete(handle);
-      socket.close();
-      return 0;
+      try {
+        socket.close();
+        return 0;
+      } catch {
+        return STATUS_INVALID;
+      }
     }
 
     pushTerminalInput(bytes) {
@@ -854,6 +868,20 @@
     /** Runs until the guest yields, exits, or requests supervision.
      * Faults (trap, out of gas) throw, mirroring the native Err path. */
     run() {
+      try {
+        return this.#run();
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+
+    dispose() {
+      this.devices.dispose();
+      if (this.exitStatus === null) this.exitStatus = 130;
+    }
+
+    #run() {
       if (this.exitStatus !== null) {
         return { kind: "exited", code: this.exitStatus };
       }
@@ -891,6 +919,7 @@
           return { kind: "yielded" };
         }
         if (outcome === "exit") {
+          this.dispose();
           return { kind: "exited", code: this.exitStatus };
         }
         if (outcome === "spawn") {
@@ -1558,6 +1587,22 @@
     /** Runs the foreground process until the system yields or the root
      * exits; child faults fail only the child (status 139). */
     run() {
+      try {
+        return this.#run();
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+
+    dispose() {
+      for (const process of this.stack) process.dispose();
+      for (const child of this.background) child.process.dispose();
+      this.background.length = 0;
+      this.pendingResolution = null;
+    }
+
+    #run() {
       if (this.pendingResolution !== null) {
         // Idempotent while suspended: the embedder must provide or reject
         // the pending package before execution can continue.
@@ -1618,6 +1663,7 @@
         }
         // Exited.
         if (this.stack.length === 1) {
+          this.dispose();
           return { kind: "exited", code: status.code };
         }
         this.#popForeground(status.code & 0xff);
@@ -1632,7 +1678,7 @@
         if (root.exitStatus === null) {
           root.exitStatus = 130;
         }
-        this.background.length = 0;
+        this.dispose();
         return { kind: "exited", code: root.exitStatus };
       }
       this.#popForeground(130);
@@ -1653,6 +1699,7 @@
 
     #popForeground(status) {
       const child = this.stack.pop();
+      child.dispose();
       // Preserve terminal write order: parent bytes before the child's.
       const parentOutput = this.#foreground().takeTerminalOutput();
       if (parentOutput) {
@@ -1663,9 +1710,11 @@
         this.#appendPendingOutput(childOutput);
       }
       const depth = this.stack.length;
-      this.background = this.background.filter(
-        (entry) => entry.owner <= depth,
-      );
+      this.background = this.background.filter((entry) => {
+        if (entry.owner <= depth) return true;
+        entry.process.dispose();
+        return false;
+      });
       this.#foreground().resolveSpawn(status);
       for (const [path, bytes] of this.files) {
         this.#foreground().mountFile(path, bytes);

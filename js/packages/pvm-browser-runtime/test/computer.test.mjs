@@ -291,6 +291,61 @@ test("TCP relay buffering is bounded and a closed stream cannot reopen", () => {
   assert.throws(() => closed.write(new Uint8Array([1])));
 });
 
+test("process exit, fault and cancellation release granted network streams", () => {
+  let closed = 0;
+  const provider = {
+    connect() {
+      return {
+        read: () => null,
+        write: () => null,
+        close() {
+          closed++;
+          if (closed === 1) throw new Error("provider teardown failed");
+        },
+      };
+    },
+  };
+  const process = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    provider,
+  );
+  process.setNetworkEnabled(true);
+  process.devices.netTcpConnect("example.org:443");
+  process.devices.netTcpConnect("example.org:443");
+  assert.deepEqual(process.run(), { kind: "exited", code: 31 });
+  assert.equal(closed, 2);
+  process.dispose();
+  assert.equal(closed, 2);
+
+  const fault = new ComputerProcess(
+    coreServices,
+    computerContext([], []),
+    0,
+    null,
+    provider,
+  );
+  fault.setNetworkEnabled(true);
+  fault.devices.netTcpConnect("example.org:443");
+  assert.throws(() => fault.run());
+  assert.equal(closed, 3);
+
+  const supervisor = new ComputerSupervisor(
+    coreServices,
+    computerContext([], []),
+    MAX_GAS,
+    null,
+    { networkProvider: provider },
+  );
+  supervisor.setNetworkEnabled(true);
+  supervisor.stack[0].devices.netTcpConnect("example.org:443");
+  assert.deepEqual(supervisor.terminateForeground(), { kind: "exited", code: 130 });
+  assert.equal(closed, 4);
+  assert.deepEqual(supervisor.run(), { kind: "exited", code: 130 });
+});
+
 test("network capability roundtrips through a Host byte-stream provider", () => {
   let closed = false;
   const provider = {
