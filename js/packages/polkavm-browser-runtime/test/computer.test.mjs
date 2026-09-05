@@ -110,23 +110,22 @@ test("computer guest roundtrips terminal and filesystem", () => {
   assert.deepEqual(process.takeRemovedFiles(), ["/home/remove.tmp"]);
 });
 
-test("child removal rebases the resumed parent namespace", () => {
+test("foreground programs inherit their pane's terminal dimensions", () => {
   const supervisor = new ComputerSupervisor(
-    coreServices,
+    workspacePane,
     computerContext([], []),
     MAX_GAS,
   );
-  const child = new ComputerProcess(roundtrip, computerContext([], []), MAX_GAS);
-  for (const target of [supervisor, child]) {
-    target.mountFile("/home/seed.txt", new TextEncoder().encode("seeded"));
-    target.mountFile("/home/remove.tmp", new TextEncoder().encode("old"));
-  }
-  child.sendTerminalInput(new TextEncoder().encode("q"));
-  supervisor.stack.push(child);
+  supervisor.registerPackage("extra", workspacePane);
+  supervisor.setTerminalSize(123, 45);
+  supervisor.sendTerminalInput(new TextEncoder().encode("p"));
+  assert.equal(supervisor.run().kind, "yielded");
+  while (supervisor.takeTerminalOutput() !== null) {}
 
-  assert.deepEqual(supervisor.run(), { kind: "exited", code: 31 });
-  assert.equal(supervisor.stack[0].devices.fsStat("/home/remove.tmp"), null);
-  assert.deepEqual(supervisor.takeRemovedFiles(), ["/home/remove.tmp"]);
+  supervisor.sendTerminalInput(new TextEncoder().encode("s"));
+  assert.equal(supervisor.run().kind, "yielded");
+  assert.equal(text(supervisor.takeTerminalOutput()), "123x45");
+  supervisor.dispose();
 });
 
 test("guest streams bytes through a piped child and reaps it", () => {
