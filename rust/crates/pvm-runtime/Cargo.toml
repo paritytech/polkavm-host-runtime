@@ -38,6 +38,6 @@ uniffi = { workspace = true, optional = true }
 polkavm-wasm = { package = "polkavm", git = "https://github.com/paritytech/polkavm.git", rev = "3df1d0309c4c81a1aad0a755d83570d203bba1d9", version = "=0.37.0", features = ["generic-sandbox"] }
 
 [dev-dependencies]
-wasmi = "0.40"
+wasmi = "2.0"
 polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "e06cce9da5c6d3f72458168876ea304e27992094", version = "=0.37.0" }
 wasmparser = "0.240"
