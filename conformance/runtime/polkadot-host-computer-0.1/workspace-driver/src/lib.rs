@@ -23,6 +23,7 @@ const DENIED: i32 = -5;
 extern "C" {
     fn polkadot_host_0_1_core_exit(status: i32);
     fn polkadot_host_0_1_core_yield();
+    fn polkadot_host_0_1_tty_read(handle: u32, destination: u32, capacity: u32) -> i32;
     fn polkadot_host_0_1_tty_current() -> u32;
     fn polkadot_host_0_1_tty_write(handle: u32, source: u32, length: u32) -> i32;
     fn polkadot_host_0_1_workspace_spawn(
@@ -186,6 +187,32 @@ extern "C" fn _pvm_start() {
             fail(37);
         }
         expect_output(handle, b"p:31", 38);
+
+        // The Host mounts /home/seed.txt only after this marker, so the
+        // pane's spawn-time snapshot cannot contain it: a hit proves live
+        // parent->child mount propagation (open-resolution seed files).
+        let marker = b"mount:ready";
+        polkadot_host_0_1_tty_write(tty, marker.as_ptr() as u32, marker.len() as u32);
+        let mut byte = [0u8; 1];
+        let mut yields = 0usize;
+        loop {
+            let read = polkadot_host_0_1_tty_read(tty, byte.as_mut_ptr() as u32, 1);
+            if read == 1 {
+                break;
+            }
+            if read != WOULD_BLOCK {
+                fail(42);
+            }
+            yields += 1;
+            if yields > 4_096 {
+                fail(42);
+            }
+            polkadot_host_0_1_core_yield();
+        }
+        if send(handle, b"r") != 1 {
+            fail(43);
+        }
+        expect_output(handle, b"r:seed", 44);
 
         // Exit is reported through wait; the handle stays valid for
         // draining and is reclaimed only by close.

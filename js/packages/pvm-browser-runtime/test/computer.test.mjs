@@ -395,6 +395,45 @@ test("network capability reports denied on the web host", () => {
   assert.equal(runToExit(process), 21);
 });
 
+/**
+ * Drives the workspace driver to completion, playing the Host: at the
+ * driver's `mount:ready` checkpoint it mounts `/home/seed.txt` (proving
+ * live parent->child mount propagation), and it settles open package
+ * resolutions through `resolve` (returning undefined rejects as -4).
+ */
+function runDriver(supervisor, resolve = () => undefined) {
+  let output = "";
+  let mounted = false;
+  const resolutions = [];
+  for (let step = 0; step < 10_000; step++) {
+    const status = supervisor.run();
+    const bytes = supervisor.takeTerminalOutput();
+    if (bytes) {
+      output += text(bytes);
+    }
+    if (status.kind === "exited") {
+      return { code: status.code, output, resolutions };
+    }
+    if (status.kind === "package") {
+      resolutions.push(status.package);
+      const module = resolve(status.package);
+      if (module === undefined) {
+        supervisor.rejectPackage(-4);
+      } else {
+        supervisor.providePackage(module);
+      }
+      continue;
+    }
+    assert.equal(status.kind, "yielded");
+    if (!mounted && output.includes("mount:ready")) {
+      mounted = true;
+      supervisor.mountFile("/home/seed.txt", new TextEncoder().encode("seed"));
+      supervisor.sendTerminalInput(new TextEncoder().encode("g"));
+    }
+  }
+  throw new Error("driver did not exit");
+}
+
 test("workspace guest supervises an independent child", () => {
   const supervisor = new ComputerSupervisor(
     workspaceDriver,
@@ -407,11 +446,13 @@ test("workspace guest supervises an independent child", () => {
 
   // The driver asserts every contract detail internally (bad handles,
   // unknown package, invalid geometry, banner, byte roundtrip, resize
-  // observability, nested denial, persistence, exit reporting, EOF after
-  // drain, close-once) and exits nonzero with a distinct code on the
-  // first violation.
-  assert.equal(runToExit(supervisor), 0);
-  assert.equal(text(supervisor.takeTerminalOutput()), "workspace:ok");
+  // observability, nested denial, persistence, live seed mounts, exit
+  // reporting, EOF after drain, close-once) and exits nonzero with a
+  // distinct code on the first violation.
+  const { code, output, resolutions } = runDriver(supervisor);
+  assert.equal(code, 0, `driver output: ${output}`);
+  assert.ok(output.endsWith("workspace:ok"), `driver output: ${output}`);
+  assert.deepEqual(resolutions, []);
 
   // The pane's `/home` write surfaced through the parent supervisor.
   const modified = supervisor.takeModifiedFiles();
@@ -435,7 +476,7 @@ test("workspace operations are denied without the grant", () => {
 
   // Without setWorkspaceEnabled the driver's first probe observes DENIED
   // and exits with its distinct gating code.
-  assert.equal(runToExit(supervisor), 41);
+  assert.equal(runDriver(supervisor).code, 41);
 });
 
 test("open resolution supplies packages anywhere in the tree", () => {
@@ -451,28 +492,12 @@ test("open resolution supplies packages anywhere in the tree", () => {
   );
   supervisor.setWorkspaceEnabled(true);
 
-  const resolutions = [];
-  let code = null;
-  for (let step = 0; step < 10_000 && code === null; step++) {
-    const status = supervisor.run();
-    if (status.kind === "exited") {
-      code = status.code;
-    } else if (status.kind === "package") {
-      resolutions.push(status.package);
-      if (status.package === "pane") {
-        supervisor.providePackage(workspacePane);
-      } else if (status.package === "extra") {
-        supervisor.providePackage(coreServices);
-      } else {
-        // The driver probes an unknown label and expects the embedder's
-        // rejection to surface as NOT_FOUND (-4).
-        supervisor.rejectPackage(-4);
-      }
-    } else {
-      assert.equal(status.kind, "yielded");
-    }
-  }
-  assert.equal(code, 0);
-  assert.equal(text(supervisor.takeTerminalOutput()), "workspace:ok");
+  const { code, output, resolutions } = runDriver(supervisor, (name) => {
+    if (name === "pane") return workspacePane;
+    if (name === "extra") return coreServices;
+    return undefined;
+  });
+  assert.equal(code, 0, `driver output: ${output}`);
+  assert.ok(output.endsWith("workspace:ok"), `driver output: ${output}`);
   assert.deepEqual(resolutions, ["no-such-package", "pane", "extra"]);
 });

@@ -27,6 +27,7 @@ extern "C" {
     fn polkadot_host_0_1_tty_get_size(handle: u32, record: u32) -> i32;
     fn polkadot_host_0_1_fs_open(path: u32, path_length: u32, flags: u32) -> i32;
     fn polkadot_host_0_1_fs_write(handle: u32, source: u32, length: u32) -> i32;
+    fn polkadot_host_0_1_fs_read(handle: u32, destination: u32, capacity: u32) -> i32;
     fn polkadot_host_0_1_fs_close(handle: u32) -> i32;
     fn polkadot_host_0_1_workspace_close(handle: u32) -> i32;
     fn polkadot_host_0_1_process_run(
@@ -169,6 +170,33 @@ extern "C" fn _pvm_start() {
                     }
                     let length = push_decimal(&mut reply, length, status.unsigned_abs());
                     write_all(tty, &reply[..length]);
+                }
+                b'r' => {
+                    // Reports /home/seed.txt: the Host mounts it only after
+                    // this pane spawned, so a hit proves live parent->child
+                    // mount propagation (open-resolution seed files).
+                    let path = b"/home/seed.txt";
+                    let handle = polkadot_host_0_1_fs_open(
+                        path.as_ptr() as u32,
+                        path.len() as u32,
+                        1,
+                    );
+                    if handle < 0 {
+                        write_all(tty, b"r:missing");
+                    } else {
+                        let mut contents = [0u8; 16];
+                        let read = polkadot_host_0_1_fs_read(
+                            handle as u32,
+                            contents.as_mut_ptr() as u32,
+                            contents.len() as u32,
+                        );
+                        polkadot_host_0_1_fs_close(handle as u32);
+                        if read < 0 {
+                            fail(37);
+                        }
+                        write_all(tty, b"r:");
+                        write_all(tty, &contents[..read as usize]);
+                    }
                 }
                 other => {
                     let toggled = [other ^ 0x20];

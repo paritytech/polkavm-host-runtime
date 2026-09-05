@@ -1190,9 +1190,23 @@ impl ComputerSupervisor {
         self.backend
     }
 
-    /// Mounts one persistent file into the shared `/home` store.
+    /// Mounts one persistent file into the shared `/home` store. The mount
+    /// reaches every live process: the foreground stack, piped background
+    /// children, and workspace children (whose own `/home` views merge back
+    /// on every drive), so a file provided after a child spawned — e.g. the
+    /// seed files of an open-resolved package — is visible tree-wide.
     pub fn mount_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
         self.foreground().mount_file(path, bytes.clone())?;
+        for child in &mut self.background {
+            if child.exit.is_none() {
+                child.runtime.mount_file(path, bytes.clone())?;
+            }
+        }
+        for child in &mut self.workspace_children {
+            if child.exit.is_none() {
+                child.supervisor.mount_file(path, bytes.clone())?;
+            }
+        }
         self.files.insert(path.to_owned(), bytes);
         self.removed.remove(path);
         Ok(())
