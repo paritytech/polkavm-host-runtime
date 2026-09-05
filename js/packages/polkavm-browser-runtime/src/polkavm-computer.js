@@ -1617,6 +1617,7 @@
         try {
           status = this.#foreground().run();
         } catch (error) {
+          this.#collectModified();
           if (this.stack.length === 1) {
             throw error;
           }
@@ -1717,9 +1718,18 @@
         return false;
       });
       this.#foreground().resolveSpawn(status);
-      for (const [path, bytes] of this.files) {
-        this.#foreground().mountFile(path, bytes);
+      this.#rebaseForeground();
+    }
+
+    #rebaseForeground() {
+      const devices = this.#foreground().devices;
+      for (const path of devices.files.keys()) {
+        if (!this.files.has(path)) devices.files.delete(path);
       }
+      for (const [handle, open] of devices.openFiles) {
+        if (!devices.files.has(open.path)) devices.openFiles.delete(handle);
+      }
+      for (const [path, bytes] of this.files) devices.mountFile(path, bytes);
     }
 
     #collectModified() {
@@ -1758,6 +1768,7 @@
           this.emitLog,
           this.networkProvider,
         );
+        child.setTerminalSize(this.columns, this.rows);
         child.setNetworkEnabled(this.network);
         for (const [path, bytes] of this.files) {
           child.mountFile(path, bytes);
@@ -1812,9 +1823,7 @@
         this.#driveBackground(entry);
         if (entry.exit !== null) {
           this.background.splice(index, 1);
-          for (const [path, bytes] of this.files) {
-            this.#foreground().mountFile(path, bytes);
-          }
+          this.#rebaseForeground();
           resolve(entry.exit & 0xff);
         } else {
           resolve(STATUS_WOULD_BLOCK);
