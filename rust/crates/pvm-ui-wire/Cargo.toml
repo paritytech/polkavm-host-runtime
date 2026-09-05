@@ -1,6 +1,6 @@
 [package]
 name = "pvm-ui-wire"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "Versioned host-neutral UI output wire protocol for PolkaVM applications"
 license = "MPL-2.0"
