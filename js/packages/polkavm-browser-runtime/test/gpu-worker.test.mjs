@@ -29,6 +29,18 @@ function parse(opcode, payload) {
   return parseCommand({ opcode, payload, index: 0 });
 }
 
+function shaderCommands(count) {
+  const wgsl = new TextEncoder().encode("@vertex fn main() {}");
+  return Array.from({ length: count }, (_, index) => {
+    const payload = new Uint8Array(8 + wgsl.byteLength);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, (1 << 20) | (index + 1), true);
+    view.setUint32(4, wgsl.byteLength, true);
+    payload.set(wgsl, 8);
+    return { opcode: 6, payload, index };
+  });
+}
+
 test("parses the R8Unorm texture format", () => {
   const payload = new Uint8Array(24);
   const view = new DataView(payload.buffer);
@@ -241,3 +253,16 @@ function commands(items) {
   }
   return bytes;
 }
+
+test("validates the GPUI editor's nineteen-compilation init batch", () => {
+  const engine = validationEngine();
+  engine.validate({ sequence: 1, commands: shaderCommands(19) });
+});
+
+test("rejects more compilations than the per-batch bound", () => {
+  const engine = validationEngine();
+  assert.throws(
+    () => engine.validate({ sequence: 1, commands: shaderCommands(33) }),
+    /too many GPU compilations/,
+  );
+});
