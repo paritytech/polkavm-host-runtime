@@ -67,6 +67,7 @@ pub struct Vm {
     audio_channels: u32,
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
     motion: crate::MotionState,
+    pointer_capture: crate::PointerCaptureState,
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
     #[cfg(target_arch = "wasm32")]
@@ -94,6 +95,7 @@ pub struct Vm {
     import_yield: Option<u32>,
     import_truapi_send: Option<u32>,
     import_motion_read: Option<u32>,
+    import_pointer_capture: Option<u32>,
     import_truapi_poll: Option<u32>,
     import_core_args: Option<u32>,
     import_core_environment: Option<u32>,
@@ -383,6 +385,7 @@ impl Vm {
         let mut import_truapi_send = None;
         let mut import_truapi_poll = None;
         let mut import_motion_read = None;
+        let mut import_pointer_capture = None;
         let mut import_core_args = None;
         let mut import_core_environment = None;
         let mut import_core_exit = None;
@@ -410,6 +413,9 @@ impl Vm {
                 b"host_truapi_send" => import_truapi_send = Some(import_index),
                 b"host_truapi_poll" => import_truapi_poll = Some(import_index),
                 b"host_motion_read" => import_motion_read = Some(import_index),
+                name if name == crate::POINTER_CAPTURE_IMPORT.as_bytes() => {
+                    import_pointer_capture = Some(import_index)
+                }
                 b"polkadot_host_0_1_core_args" => import_core_args = Some(import_index),
                 b"polkadot_host_0_1_core_environment" => {
                     import_core_environment = Some(import_index)
@@ -436,6 +442,7 @@ impl Vm {
             audio_channels: 0,
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             motion: crate::MotionState::new(),
+            pointer_capture: crate::PointerCaptureState::default(),
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
@@ -463,6 +470,7 @@ impl Vm {
             import_truapi_send,
             import_truapi_poll,
             import_motion_read,
+            import_pointer_capture,
             import_core_args,
             import_core_environment,
             import_core_exit,
@@ -504,6 +512,35 @@ impl Vm {
 
     pub fn uses_motion(&self) -> bool {
         self.import_motion_read.is_some()
+    }
+
+    pub fn uses_pointer_capture(&self) -> bool {
+        self.import_pointer_capture.is_some()
+    }
+
+    pub fn set_pointer_capture_supported(&mut self, supported: bool) {
+        self.pointer_capture.supported = supported;
+        if !supported {
+            self.pointer_capture.armed = false;
+            self.pointer_capture.request = None;
+        }
+    }
+
+    pub fn set_pointer_capture_active(&mut self, active: bool) -> Result<(), String> {
+        if self.pointer_capture.active == active {
+            return Ok(());
+        }
+        if self.epoca_input_events.len() == MAX_QUEUED_INPUT_EVENTS {
+            return Err("pointer capture input queue is full".into());
+        }
+        self.epoca_input_events
+            .push_back(crate::ui::pointer_capture_record(active));
+        self.pointer_capture.set_active(active);
+        Ok(())
+    }
+
+    pub fn take_pointer_capture_request(&mut self) -> Option<bool> {
+        self.pointer_capture.request.take()
     }
 
     pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
@@ -876,6 +913,14 @@ impl Vm {
                     self.motion.consume();
                     self.instance
                         .set_reg(Reg::A0, crate::motion_wire::MOTION_SAMPLE_BYTES as u64);
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall)
+                    if Some(hostcall) == self.import_pointer_capture =>
+                {
+                    let request = self.instance.reg(Reg::A0) as u32;
+                    let status = self.pointer_capture.request(request);
+                    self.instance.set_reg(Reg::A0, status as i64 as u64);
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_truapi_send => {

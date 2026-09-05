@@ -1466,6 +1466,7 @@
         case "host_truapi_send":
         case "host_truapi_poll":
         case "host_motion_read":
+        case POINTER_CAPTURE_IMPORT:
           return this.#handleCooperativeCall(name);
         case "pvm_set_palette": {
           const palette = this.#read(this.#u32(this.#reg(7)), 256 * 3);
