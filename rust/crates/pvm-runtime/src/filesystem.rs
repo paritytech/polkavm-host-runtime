@@ -631,7 +631,7 @@ impl FileSession {
         if let Err(status) = store.directory(parent(path)) {
             return status;
         }
-        if store.count(2) - 1 >= MAX_COMPUTER_DIRECTORIES {
+        if store.count(2) > MAX_COMPUTER_DIRECTORIES {
             return STATUS_LIMIT;
         }
         if let Err(status) = store.preflight(1) {

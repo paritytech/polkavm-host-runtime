@@ -133,6 +133,26 @@ test("invalid flags and directory paths cannot create or truncate files", () => 
   assert.equal(devices.takeFilesystemMetadata(), null);
 });
 
+test("non-directory ancestors report NOT_DIRECTORY without namespace mutation", () => {
+  const devices = new ComputerDevices();
+  devices.mountFile("/home/file", encode("unchanged"));
+  const before = devices.exportFilesystemMetadata();
+  const descendant = "/home/file/missing/child";
+  assert.equal(devices.fsOpen(descendant, READ), NOT_DIRECTORY);
+  assert.equal(devices.fsOpen(descendant, WRITE | CREATE), NOT_DIRECTORY);
+  assert.equal(devices.fsMkdir(descendant), NOT_DIRECTORY);
+  assert.equal(devices.fsRemove(descendant), NOT_DIRECTORY);
+  assert.equal(devices.fsRmdir(descendant), NOT_DIRECTORY);
+  assert.equal(devices.fsRename(descendant, "/home/new"), NOT_DIRECTORY);
+  assert.equal(devices.fsRename("/home/file", descendant), NOT_DIRECTORY);
+  assert.equal(devices.fsMetadata(descendant).status, NOT_DIRECTORY);
+  assert.equal(devices.fsListDirectory(descendant).status, NOT_DIRECTORY);
+  assert.equal(contents(devices, "/home/file"), "unchanged");
+  assert.deepEqual(devices.exportFilesystemMetadata(), before);
+  assert.deepEqual(devices.takeModifiedFiles(), []);
+  assert.deepEqual(devices.takeRemovedFiles(), []);
+});
+
 test("directory discovery and subtree rename preserve identity and preflight every failure", () => {
   const devices = new ComputerDevices();
   devices.mountFile("/home/tree/sub/file", encode("source"));
