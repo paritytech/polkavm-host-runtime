@@ -1049,6 +1049,17 @@ impl ComputerSupervisor {
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
     pub fn run(&mut self) -> Result<ComputerStatus> {
+        let result = self.run_inner();
+        if result.is_err() {
+            for process in &mut self.stack {
+                process.dispose();
+            }
+            self.background.clear();
+        }
+        result
+    }
+
+    fn run_inner(&mut self) -> Result<ComputerStatus> {
         // Bound the fault-containment path so a root that spawns
         // immediately-faulting children in a loop cannot keep run() from
         // returning control to the Host.
@@ -1057,6 +1068,7 @@ impl ComputerSupervisor {
             let status = match self.foreground().run() {
                 Ok(status) => status,
                 Err(error) => {
+                    self.collect_modified();
                     if self.stack.len() == 1 {
                         self.background.clear();
                         return Err(error);
@@ -1138,9 +1150,19 @@ impl ComputerSupervisor {
         let depth = self.stack.len();
         self.background.retain(|child| child.owner <= depth);
         self.foreground().resolve_spawn(status);
+        self.rebase_foreground()?;
+        Ok(())
+    }
+
+    fn rebase_foreground(&mut self) -> Result<()> {
         let files = self.files.clone();
+        let devices = &mut self.foreground().vm.computer;
+        devices.files.retain(|path, _| files.contains_key(path));
+        devices
+            .open_files
+            .retain(|_, open| files.contains_key(&open.path));
         for (path, bytes) in files {
-            self.foreground().mount_file(&path, bytes)?;
+            devices.mount_file(&path, bytes)?;
         }
         Ok(())
     }
@@ -1337,11 +1359,7 @@ impl ComputerSupervisor {
     /// Reclaims an exited background child, publishing its file changes.
     fn reap_background(&mut self, index: usize) -> Result<()> {
         self.background.remove(index);
-        let files = self.files.clone();
-        let foreground = self.foreground();
-        for (path, bytes) in files {
-            foreground.mount_file(&path, bytes)?;
-        }
+        self.rebase_foreground()?;
         Ok(())
     }
 
@@ -1433,6 +1451,93 @@ fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_removal_rebases_the_resumed_parent_namespace() {
+        let mut supervisor = ComputerSupervisor::new_with_backend(
+            include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+            ComputerContext::default(),
+            50_000_000,
+            polkavm::BackendKind::Interpreter,
+        )
+        .unwrap();
+        supervisor
+            .register_package(
+                "child",
+                include_bytes!("../tests/fixtures/computer-tty-fs-roundtrip.polkavm").to_vec(),
+            )
+            .unwrap();
+        supervisor
+            .mount_file("/home/seed.txt", b"seeded".to_vec())
+            .unwrap();
+        supervisor
+            .mount_file("/home/remove.tmp", b"old".to_vec())
+            .unwrap();
+        let mut child = supervisor.spawn_child("child", Vec::new()).unwrap();
+        child.send_terminal_input(b"q").unwrap();
+        supervisor.stack.push(child);
+
+        assert_eq!(supervisor.run().unwrap(), ComputerStatus::Exited(31));
+        assert_eq!(
+            supervisor
+                .foreground()
+                .vm
+                .computer
+                .fs_stat("/home/remove.tmp"),
+            None
+        );
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/remove.tmp"]);
+    }
+
+    #[test]
+    fn piped_child_removal_preserves_files_created_by_parent_after_spawn() {
+        let mut supervisor = ComputerSupervisor::new_with_backend(
+            include_bytes!("../tests/fixtures/computer-core-services.polkavm"),
+            ComputerContext::default(),
+            50_000_000,
+            polkavm::BackendKind::Interpreter,
+        )
+        .unwrap();
+        supervisor
+            .register_package(
+                "child",
+                include_bytes!("../tests/fixtures/computer-tty-fs-roundtrip.polkavm").to_vec(),
+            )
+            .unwrap();
+        supervisor
+            .mount_file("/home/seed.txt", b"seeded".to_vec())
+            .unwrap();
+        supervisor
+            .mount_file("/home/remove.tmp", b"old".to_vec())
+            .unwrap();
+        let pid = supervisor.spawn_piped("child", Vec::new()).unwrap();
+
+        // The child snapshot predates this unrelated parent creation.
+        let parent = &mut supervisor.foreground().vm.computer;
+        let handle = parent.fs_open("/home/parent.txt", FS_OPEN_WRITE | FS_OPEN_CREATE) as u32;
+        assert_eq!(parent.fs_write(handle, b"parent"), 6);
+        assert_eq!(parent.fs_close(handle), 0);
+        // run_inner collects parent deltas before dispatching a pipe request.
+        supervisor.collect_modified();
+        supervisor
+            .handle_child_request(ChildProcessRequest::PipeWrite {
+                pid,
+                bytes: b"q".to_vec(),
+            })
+            .unwrap();
+        supervisor
+            .handle_child_request(ChildProcessRequest::Wait { pid })
+            .unwrap();
+
+        let parent = &mut supervisor.foreground().vm.computer;
+        assert_eq!(parent.fs_stat("/home/remove.tmp"), None);
+        let handle = parent.fs_open("/home/parent.txt", FS_OPEN_READ) as u32;
+        let mut bytes = [0; 6];
+        assert_eq!(parent.fs_read(handle, &mut bytes), 6);
+        assert_eq!(&bytes, b"parent");
+        assert_eq!(parent.fs_close(handle), 0);
+        assert_eq!(supervisor.take_removed_files(), vec!["/home/remove.tmp"]);
+    }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
