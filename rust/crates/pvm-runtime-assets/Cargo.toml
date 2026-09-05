@@ -12,4 +12,4 @@ include = ["src/**", "assets/**", "Cargo.toml"]
 crate-type = ["rlib"]
 
 [dev-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
