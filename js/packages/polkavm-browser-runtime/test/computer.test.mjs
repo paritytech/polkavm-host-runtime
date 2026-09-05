@@ -41,6 +41,7 @@ const pipeFilter = await fixture("computer-pipe-filter");
 const tcpRoundtrip = await fixture("computer-tcp-roundtrip");
 const workspaceDriver = await fixture("computer-workspace-driver");
 const workspacePane = await fixture("computer-workspace-pane");
+const filesystemGuest = await fixture("computer-filesystem");
 
 const text = (bytes) => new TextDecoder().decode(bytes);
 
@@ -196,10 +197,7 @@ test("supervisor terminates the root as interrupted", () => {
     MAX_GAS,
   );
   supervisor.setTerminalSize(100, 40);
-  supervisor.mountFile(
-    "/home/seed.txt",
-    new TextEncoder().encode("seeded"),
-  );
+  supervisor.mountFile("/home/seed.txt", new TextEncoder().encode("seeded"));
 
   assert.equal(supervisor.run().kind, "yielded");
   supervisor.sendTerminalInput(new TextEncoder().encode("hello"));
@@ -519,4 +517,154 @@ test("open resolution supplies packages anywhere in the tree", () => {
   assert.equal(code, 0, `driver output: ${output}`);
   assert.ok(output.endsWith("workspace:ok"), `driver output: ${output}`);
   assert.deepEqual(resolutions, ["no-such-package", "pane", "extra"]);
+});
+
+test("workspace cancellation releases shared locks without losing pending writes", () => {
+  const supervisor = new ComputerSupervisor(
+    workspaceDriver,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("pane", workspacePane);
+  supervisor.registerPackage("extra", coreServices);
+  supervisor.setWorkspaceEnabled(true);
+  let output = "";
+  for (let step = 0; step < 10_000 && !output.includes("mount:ready"); step++) {
+    assert.equal(supervisor.run().kind, "yielded");
+    const bytes = supervisor.takeTerminalOutput();
+    if (bytes) output += text(bytes);
+  }
+  assert.ok(output.includes("mount:ready"));
+  const parent = supervisor.stack[0].devices;
+  const child = supervisor.workspaceChildren.find(
+    (entry) => entry.exit === null,
+  ).supervisor.stack[0].devices;
+  const {
+    FS_OPEN_WRITE: WRITE,
+    FS_OPEN_CREATE: CREATE,
+    FS_OPEN_EXCLUSIVE: EXCLUSIVE,
+    STATUS_EXISTS,
+    STATUS_DENIED,
+  } = globalThis.PvmComputer;
+  const handle = child.fsOpen("/home/cancel.lock", WRITE | CREATE | EXCLUSIVE);
+  assert.ok(handle >= 16);
+  assert.equal(child.fsWrite(handle, new TextEncoder().encode("pending")), 7);
+  assert.equal(
+    parent.fsOpen("/home/cancel.lock", WRITE | CREATE | EXCLUSIVE),
+    STATUS_EXISTS,
+  );
+  assert.equal(
+    parent.fsRename("/home/cancel.lock", "/home/committed"),
+    STATUS_DENIED,
+  );
+  supervisor.setWorkspaceEnabled(false);
+  assert.equal(parent.fsRename("/home/cancel.lock", "/home/committed"), 0);
+  assert.equal(
+    text(
+      supervisor
+        .takeModifiedFiles()
+        .find(([path]) => path === "/home/committed")[1],
+    ),
+    "pending",
+  );
+  assert.ok(supervisor.takeRemovedFiles().includes("/home/cancel.lock"));
+  assert.ok(
+    supervisor
+      .takeFilesystemMetadata()
+      .entries.some((entry) => entry.path === "/home/committed"),
+  );
+  supervisor.dispose();
+});
+
+test("process exit, fault and supervisor cancellation release all open paths", () => {
+  const {
+    ComputerDevices,
+    FS_OPEN_WRITE: WRITE,
+    FS_OPEN_CREATE: CREATE,
+  } = globalThis.PvmComputer;
+  for (const gas of [MAX_GAS, 1]) {
+    const process = new ComputerProcess(
+      coreServices,
+      computerContext([], []),
+      gas,
+    );
+    const observer = new ComputerDevices(null, process.devices.filesystem);
+    assert.ok(process.devices.fsOpen("/home/open", WRITE | CREATE) >= 16);
+    if (gas === 1) assert.throws(() => process.run(), /gas/);
+    else assert.equal(process.run().kind, "exited");
+    assert.equal(observer.fsRemove("/home/open"), 0);
+    observer.dispose();
+  }
+  const supervisor = new ComputerSupervisor(
+    coreContext,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  const observer = new ComputerDevices(null, supervisor.filesystem);
+  assert.ok(
+    supervisor.stack[0].devices.fsOpen("/home/open", WRITE | CREATE) >= 16,
+  );
+  assert.deepEqual(supervisor.terminateForeground(), {
+    kind: "exited",
+    code: 130,
+  });
+  assert.equal(observer.fsRemove("/home/open"), 0);
+  observer.dispose();
+});
+
+function filesystemCheckpoint(supervisor, expected) {
+  let output = "";
+  for (let step = 0; step < 100; step++) {
+    const status = supervisor.run();
+    const bytes = supervisor.takeTerminalOutput();
+    if (bytes) output += text(bytes);
+    if (output.includes(expected)) return;
+    assert.equal(status.kind, "yielded", output);
+  }
+  throw new Error(`missing checkpoint ${expected}: ${output}`);
+}
+
+test("real guest filesystem records and cross-process atomic publication", () => {
+  const supervisor = new ComputerSupervisor(
+    filesystemGuest,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("fs-child", filesystemGuest);
+  filesystemCheckpoint(supervisor, "fs:ready");
+  supervisor.sendTerminalInput(new TextEncoder().encode("p"));
+  filesystemCheckpoint(supervisor, "fs:published");
+  assert.deepEqual(supervisor.run(), { kind: "exited", code: 0 });
+  assert.deepEqual(
+    supervisor.takeModifiedFiles().map(([path, bytes]) => [path, text(bytes)]),
+    [["/home/repo/record", "candidate"]],
+  );
+});
+
+test("real guest cancellation preserves publication target across metadata restore", () => {
+  const supervisor = new ComputerSupervisor(
+    filesystemGuest,
+    computerContext([], []),
+    MAX_GAS,
+  );
+  supervisor.registerPackage("fs-child", filesystemGuest);
+  filesystemCheckpoint(supervisor, "fs:ready");
+  supervisor.sendTerminalInput(new TextEncoder().encode("c"));
+  filesystemCheckpoint(supervisor, "fs:cancel");
+  assert.deepEqual(supervisor.terminateForeground(), {
+    kind: "exited",
+    code: 130,
+  });
+  const metadata = supervisor.exportFilesystemMetadata();
+  const files = supervisor.takeModifiedFiles();
+  const restored = new ComputerSupervisor(
+    filesystemGuest,
+    computerContext(["check"], []),
+    MAX_GAS,
+  );
+  for (const [path, bytes] of files) restored.mountFile(path, bytes);
+  restored.importFilesystemMetadata(metadata);
+  assert.deepEqual(restored.exportFilesystemMetadata(), metadata);
+  filesystemCheckpoint(restored, "fs:restored");
+  assert.deepEqual(restored.run(), { kind: "exited", code: 0 });
 });

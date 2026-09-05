@@ -238,12 +238,70 @@ polkadot_host_0_1_fs_stat(path_pointer, path_length, record_pointer) -> status
 polkadot_host_0_1_fs_sync(handle) -> status
 polkadot_host_0_1_fs_close(handle) -> status
 polkadot_host_0_1_fs_remove(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_list(destination, capacity) -> record bytes | error
+polkadot_host_0_1_fs_mkdir(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_rmdir(path_pointer, path_length) -> status
+polkadot_host_0_1_fs_rename(old_pointer, old_length, new_pointer, new_length) -> status
+polkadot_host_0_1_fs_metadata(path_pointer, path_length, record_pointer) -> status
+polkadot_host_0_1_fs_fstat(handle, record_pointer) -> status
+polkadot_host_0_1_fs_list_directory(path_pointer, path_length, destination, capacity)
+    -> record bytes | error
 ```
 
-The first implementation uses a virtual filesystem with a Host-provided
-persistent `/home` mount. Removing an open file returns `DENIED`; a successful
-removal is reported separately from modified file contents so persistence
-adapters can delete the backing entry.
+All foreground, piped, and workspace processes in one supervisor tree share
+one authoritative `/home` namespace. Handles and seek positions are local to
+each process; open-path tracking is global. There are no copied file views or
+exit-time merges. Normal exit, fault, cancellation, and child removal release
+that process's handles without undoing completed writes.
+
+Open flags: READ=1, WRITE=2, CREATE=4, TRUNCATE=8, EXCLUSIVE=16, APPEND=32.
+EXCLUSIVE requires writable CREATE; APPEND requires WRITE and selects the
+current EOF atomically on each write. Unknown flags and invalid combinations
+fail before mutation. Exclusive collisions return EXISTS, never truncate.
+Besides existing errors -1 through -6, namespace errors are EXISTS=-7,
+NOT_DIRECTORY=-8, IS_DIRECTORY=-9, and NOT_EMPTY=-10.
+
+Directories are real entries, including an implicit `/home` root. Guest
+creation requires an existing parent; Host seed mounts synthesize missing
+parents. Paths are canonical UTF-8 `/home` paths, at most 200 bytes, with no
+empty, dot, dot-dot, NUL, or trailing-slash segments. Quotas are 64 files,
+256 non-root directories, 1 MiB per file, and 16 handles per process.
+Quota errors return LIMIT before changing the namespace or destination bytes.
+
+`fs_remove` removes files; `fs_rmdir` removes empty directories. Removal of
+an open file returns DENIED. Rename is an atomic namespace operation, with
+same-kind replacement and whole-subtree moves for directories; nonempty
+destination directories and cycles fail. Open source/destination paths,
+including descendants, return DENIED globally. Every failure preserves the
+old source and destination. A successful rename preserves the moved inode
+and mtime and updates the affected parent directories.
+
+The original `fs_stat` writes only a little-endian u32 size for a file.
+`fs_metadata` and `fs_fstat` write exactly 24 little-endian bytes:
+`kind:u32` (1=file, 2=directory), `size:u32` (zero for directories),
+`mtime_ns:u64`, `inode:u64`. Inodes are stable identities. Mutations use
+`max(wall_clock_ns, previous_clock_ns + 1)`, so same-size rewrites advance
+mtime even in one clock tick or during clock rollback; stat does not sample
+a fabricated current timestamp.
+
+`fs_list` retains its all-file-path record. `fs_list_directory` returns
+immediate children in UTF-8 byte order: u32 count, then repeated
+`name_length:u32`, basename bytes, `kind:u32`. Like `fs_list`, insufficient
+capacity returns the negative required length and writes no partial record.
+
+Embedders drain modified bytes, removed paths, and `take_filesystem_metadata`
+(`takeFilesystemMetadata` in JS) in the same turn and persist one atomic
+checkpoint. Metadata has version 1, decimal-string `nextInode`/`clockNs`, and
+sorted entries containing `path`, `kind`, decimal-string `mtimeNs`/`inode`.
+Export/import APIs support complete snapshots; restore mounts the exact file
+byte set first, then validates/imports metadata before starting children or
+opening handles. This preserves empty directories and modification times.
+Malformed snapshots are rejected atomically. Host mount/import are seed and
+restore operations, not guest writes, and do not emit mutation deltas.
+
+`fs_sync` establishes visibility only. In-memory atomicity is tested; neither
+this call nor successful guest exit promises durability across Host crashes.
+Dotli checkpoints bytes and metadata together in one IndexedDB record.
 
 ### `host.process`
 
@@ -260,11 +318,10 @@ foreground operation while the parent stays suspended in the hostcall:
 ```text
 polkadot_host_0_1_process_run(package_ptr, package_len, args_ptr, args_len)
     -> child exit status | error
-polkadot_host_0_1_fs_list(destination, capacity) -> record bytes | error
 ```
 
 The supervisor owns the process stack (max depth 4), grants the foreground
-process the terminal, and rebases the shared `/home` store when a child exits.
+process the terminal, and gives every child the same `/home` store.
 
 Piped background children implement pipes and `:!` filters without `fork`:
 
@@ -410,8 +467,8 @@ Invariants carried over from the terminal-computer supervisor:
   fault containment. A faulted child is reported through `workspace_wait`
   with the same status codes as `process_run` and is reaped, never
   resurrected.
-- The workspace guest sees only surface output bytes and child exit status.
-  It never reads child memory, files, or capability state.
+- The workspace guest sees surface output and child exit status, never child
+  memory. Its own `host.fs` grant accesses the same `/home` as its children.
 - Input is routed, not shared: the Host delivers input records exclusively to
   the workspace, which forwards bytes to at most one focused child per call.
   Host-authority cancellation (the Ctrl-] equivalent) always targets the

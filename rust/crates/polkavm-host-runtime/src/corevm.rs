@@ -130,6 +130,12 @@ enum ComputerCall {
     FsClose,
     FsRemove,
     FsList,
+    FsMkdir,
+    FsRmdir,
+    FsRename,
+    FsMetadata,
+    FsFstat,
+    FsListDirectory,
     ProcessRun,
     ProcessSpawn,
     ProcessWait,
@@ -169,6 +175,12 @@ fn computer_call_for(name: &[u8]) -> Option<ComputerCall> {
         b"polkadot_host_0_1_fs_close" => ComputerCall::FsClose,
         b"polkadot_host_0_1_fs_remove" => ComputerCall::FsRemove,
         b"polkadot_host_0_1_fs_list" => ComputerCall::FsList,
+        b"polkadot_host_0_1_fs_mkdir" => ComputerCall::FsMkdir,
+        b"polkadot_host_0_1_fs_rmdir" => ComputerCall::FsRmdir,
+        b"polkadot_host_0_1_fs_rename" => ComputerCall::FsRename,
+        b"polkadot_host_0_1_fs_metadata" => ComputerCall::FsMetadata,
+        b"polkadot_host_0_1_fs_fstat" => ComputerCall::FsFstat,
+        b"polkadot_host_0_1_fs_list_directory" => ComputerCall::FsListDirectory,
         b"polkadot_host_0_1_process_run" => ComputerCall::ProcessRun,
         b"polkadot_host_0_1_process_spawn" => ComputerCall::ProcessSpawn,
         b"polkadot_host_0_1_process_wait" => ComputerCall::ProcessWait,
@@ -1478,6 +1490,72 @@ impl Vm {
                     self.instance.write_memory(destination, &record)?;
                     self.instance.set_reg(Reg::A0, record.len() as u64);
                 }
+            }
+            ComputerCall::FsMkdir | ComputerCall::FsRmdir => {
+                let path = self.read_computer_path(a0, a1)?;
+                let result = match path {
+                    Some(path) => match call {
+                        ComputerCall::FsMkdir => self.computer.filesystem.mkdir(&path),
+                        _ => self.computer.filesystem.rmdir(&path),
+                    },
+                    None => crate::computer::STATUS_INVALID,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsRename => {
+                let a3 = self.instance.reg(Reg::A3);
+                let old = self.read_computer_path(a0, a1)?;
+                let new = self.read_computer_path(a2, a3)?;
+                let result = match (old, new) {
+                    (Some(old), Some(new)) => self.computer.filesystem.rename(&old, &new),
+                    _ => crate::computer::STATUS_INVALID,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsMetadata | ComputerCall::FsFstat => {
+                let (record, result) = match call {
+                    ComputerCall::FsMetadata => {
+                        let path = self.read_computer_path(a0, a1)?;
+                        let result = match path {
+                            Some(path) => self.computer.filesystem.metadata(&path),
+                            None => Err(crate::computer::STATUS_INVALID),
+                        };
+                        (guest_pointer(a2, "metadata record")?, result)
+                    }
+                    _ => (
+                        guest_pointer(a1, "fstat record")?,
+                        self.computer.filesystem.fstat(a0 as u32),
+                    ),
+                };
+                let result = match result {
+                    Ok(bytes) => {
+                        self.instance.write_memory(record, &bytes)?;
+                        0
+                    }
+                    Err(status) => status,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
+            }
+            ComputerCall::FsListDirectory => {
+                let a3 = self.instance.reg(Reg::A3);
+                let path = self.read_computer_path(a0, a1)?;
+                let destination = guest_pointer(a2, "directory listing destination")?;
+                let capacity = usize::try_from(a3)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_FS_TRANSFER);
+                let result = match path {
+                    Some(path) => self.computer.filesystem.list_directory(&path),
+                    None => Err(crate::computer::STATUS_INVALID),
+                };
+                let result = match result {
+                    Ok(record) if record.len() > capacity => -(record.len() as i32),
+                    Ok(record) => {
+                        self.instance.write_memory(destination, &record)?;
+                        record.len() as i32
+                    }
+                    Err(status) => status,
+                };
+                self.instance.set_reg(Reg::A0, status(result));
             }
             ComputerCall::ProcessRun => {
                 let a3 = self.instance.reg(Reg::A3);
