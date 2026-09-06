@@ -17,6 +17,10 @@ pub const INPUT_IME_DISABLED: u8 = 12;
 pub const INPUT_FOCUS: u8 = 13;
 pub const INPUT_WHEEL: u8 = 14;
 pub const INPUT_POINTER_CAPTURE: u8 = 15;
+pub const INPUT_SAFE_AREA_INSETS: u8 = 16;
+pub const INPUT_KEYBOARD_INSETS: u8 = 17;
+pub const INPUT_INSETS_HORIZONTAL: u8 = 0;
+pub const INPUT_INSETS_VERTICAL: u8 = 1;
 
 const CHUNK_LENGTH_MASK: u8 = 0x07;
 const CHUNK_FIRST: u8 = 0x40;
@@ -101,6 +105,49 @@ pub fn pointer_capture_record(active: bool) -> [u8; INPUT_EVENT_BYTES] {
     record
 }
 
+/// Encodes one safe-area update in physical surface pixels for
+/// [`ApplicationRuntime::send_input_records`](crate::ApplicationRuntime::send_input_records).
+pub fn safe_area_insets_records(
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+) -> [[u8; INPUT_EVENT_BYTES]; 2] {
+    insets_records(INPUT_SAFE_AREA_INSETS, left, top, right, bottom)
+}
+
+/// Encodes one virtual-keyboard occlusion update in physical surface pixels for
+/// [`ApplicationRuntime::send_input_records`](crate::ApplicationRuntime::send_input_records).
+pub fn keyboard_insets_records(
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+) -> [[u8; INPUT_EVENT_BYTES]; 2] {
+    insets_records(INPUT_KEYBOARD_INSETS, left, top, right, bottom)
+}
+
+fn insets_records(
+    event_type: u8,
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+) -> [[u8; INPUT_EVENT_BYTES]; 2] {
+    let mut horizontal = [0u8; INPUT_EVENT_BYTES];
+    horizontal[0] = event_type;
+    horizontal[1] = INPUT_INSETS_HORIZONTAL;
+    horizontal[2..4].copy_from_slice(&left.to_le_bytes());
+    horizontal[4..6].copy_from_slice(&right.to_le_bytes());
+
+    let mut vertical = [0u8; INPUT_EVENT_BYTES];
+    vertical[0] = event_type;
+    vertical[1] = INPUT_INSETS_VERTICAL;
+    vertical[2..4].copy_from_slice(&top.to_le_bytes());
+    vertical[4..6].copy_from_slice(&bottom.to_le_bytes());
+    [horizontal, vertical]
+}
+
 pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<()> {
     match record[0] {
         1..=7 => {
@@ -135,6 +182,11 @@ pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<
         INPUT_POINTER_CAPTURE => {
             if record[1] > 1 || record[2..].iter().any(|byte| *byte != 0) {
                 bail!("pointer capture record is malformed");
+            }
+        }
+        INPUT_SAFE_AREA_INSETS | INPUT_KEYBOARD_INSETS => {
+            if record[1] > INPUT_INSETS_VERTICAL || record[6..] != [0, 0] {
+                bail!("viewport insets record is malformed");
             }
         }
         _ => bail!("unsupported input record type {}", record[0]),
@@ -266,6 +318,29 @@ mod tests {
         assert_ne!(records[0][1] & CHUNK_FIRST, 0);
         assert_ne!(records[1][1] & CHUNK_LAST, 0);
         for record in &records {
+            validate_input_record(record).unwrap();
+        }
+    }
+
+    #[test]
+    fn viewport_inset_records_are_atomic_pairs() {
+        let safe_area = safe_area_insets_records(10, 20, 30, 40);
+        assert_eq!(
+            safe_area,
+            [
+                [INPUT_SAFE_AREA_INSETS, 0, 10, 0, 30, 0, 0, 0],
+                [INPUT_SAFE_AREA_INSETS, 1, 20, 0, 40, 0, 0, 0],
+            ]
+        );
+        let keyboard = keyboard_insets_records(50, 60, 70, 80);
+        assert_eq!(
+            keyboard,
+            [
+                [INPUT_KEYBOARD_INSETS, 0, 50, 0, 70, 0, 0, 0],
+                [INPUT_KEYBOARD_INSETS, 1, 60, 0, 80, 0, 0, 0],
+            ]
+        );
+        for record in safe_area.iter().chain(&keyboard) {
             validate_input_record(record).unwrap();
         }
     }
