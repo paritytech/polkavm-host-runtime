@@ -668,10 +668,7 @@ impl HostState {
         Some(frame)
     }
 
-    fn queue_host_frame_response(
-        &mut self,
-        bytes: Vec<u8>,
-    ) -> Result<(), HostFrameResponseError> {
+    fn queue_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<(), HostFrameResponseError> {
         if bytes.is_empty() || bytes.len() > MAX_HOST_FRAME_BYTES {
             return Err(HostFrameResponseError::InvalidFrame);
         }

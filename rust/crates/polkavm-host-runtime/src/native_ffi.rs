@@ -837,7 +837,10 @@ mod tests {
         runtime.stop().expect("stop runtime");
 
         assert_eq!(
-            runtime.take_save().expect("drain save after stop").as_deref(),
+            runtime
+                .take_save()
+                .expect("drain save after stop")
+                .as_deref(),
             Some(HOST_FRAME_SUCCESS)
         );
         assert_eq!(runtime.take_save().expect("save is drained"), None);
