@@ -20,6 +20,10 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 
 Hosts integrate through the `truapi-polkavm-host` bridge in [`paritytech/host-rust-core`](https://github.com/paritytech/host-rust-core). The bridge pins one immutable release of this repository and exposes the supported Rust API plus browser asset identity. Host applications do not pin this repository independently.
 
+Native UniFFI hosts mediate opaque TrUAPI frames through
+`take_host_frame_request()` and `send_host_frame_response()`; the runtime keeps
+the guest-facing `host_frame_send` / `host_frame_poll` queues bounded.
+
 ## Build and test
 
 ```bash

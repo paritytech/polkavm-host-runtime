@@ -477,6 +477,16 @@ impl NativePolkaVmRuntime {
         Ok(self.lock()?.take_gpu_batch().map(Into::into))
     }
 
+    pub fn take_host_frame_request(&self) -> Result<Option<Vec<u8>>, NativePolkaVmError> {
+        Ok(self.lock()?.take_host_frame_request())
+    }
+
+    pub fn send_host_frame_response(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
+        self.lock()?
+            .send_host_frame_response(bytes)
+            .map_err(NativePolkaVmError::runtime)
+    }
+
     pub fn take_ui_semantics(
         &self,
     ) -> Result<Option<NativePolkaVmUiSemanticsFrame>, NativePolkaVmError> {
@@ -526,6 +536,47 @@ mod tests {
             result,
             Err(NativePolkaVmError::DuplicateAsset { .. })
         ));
+    }
+
+    #[test]
+    fn native_ffi_roundtrips_an_opaque_host_frame() {
+        const PROGRAM: &[u8] = include_bytes!("../tests/fixtures/host-frame-roundtrip.polkavm");
+        const REQUEST: &[u8] = b"host-frame-conformance-request-v1";
+        const RESPONSE: &[u8] = b"host-frame-conformance-response-v1";
+        const SUCCESS: &[u8] = b"host-frame-roundtrip-ok";
+
+        let runtime = NativePolkaVmRuntime::new(
+            PROGRAM.to_vec(),
+            Vec::new(),
+            NativePolkaVmPresentationProfile::Framebuffer,
+            false,
+            10_000_000,
+        )
+        .expect("create native facade");
+
+        runtime.init().expect("initialize guest");
+        assert_eq!(
+            runtime
+                .take_host_frame_request()
+                .expect("take request")
+                .as_deref(),
+            Some(REQUEST)
+        );
+        assert_eq!(
+            runtime
+                .take_host_frame_request()
+                .expect("empty request queue"),
+            None
+        );
+
+        runtime
+            .send_host_frame_response(RESPONSE.to_vec())
+            .expect("queue response");
+        runtime.update().expect("deliver response");
+        assert_eq!(
+            runtime.take_save().expect("take save").as_deref(),
+            Some(SUCCESS)
+        );
     }
 
     #[test]
