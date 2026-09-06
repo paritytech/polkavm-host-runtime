@@ -540,12 +540,14 @@ impl NativePolkaVmRuntime {
 mod tests {
     use super::*;
     use polkavm::Reg;
+    use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::{asm, InstructionSetKind};
     use polkavm_common::writer::ProgramBlobBuilder;
 
     const HOST_FRAME_PROGRAM: &[u8] =
         include_bytes!("../tests/fixtures/host-frame-roundtrip.polkavm");
     const HOST_FRAME_RESPONSE: &[u8] = b"host-frame-conformance-response-v1";
+    const PRESERVED_LOG: &str = "guest log survives runtime stop";
 
     fn host_frame_runtime() -> Arc<NativePolkaVmRuntime> {
         NativePolkaVmRuntime::new(
@@ -568,6 +570,32 @@ mod tests {
         code.push(asm::ret());
         builder.set_code(&code, &[]);
         builder.into_vec().expect("build gas-exhausting guest")
+    }
+
+    fn logging_program() -> Vec<u8> {
+        let stack_size = 4 * 1024;
+        let memory = MemoryMapBuilder::new(64 * 1024)
+            .ro_data_size(PRESERVED_LOG.len() as u32)
+            .stack_size(stack_size)
+            .build()
+            .expect("build guest memory map");
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_ro_data_size(PRESERVED_LOG.len() as u32);
+        builder.set_ro_data(PRESERVED_LOG.as_bytes().to_vec());
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_log");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, memory.ro_data_address() as i32),
+                asm::load_imm(Reg::A1, PRESERVED_LOG.len() as i32),
+                asm::ecalli(0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        builder.into_vec().expect("build logging guest")
     }
 
     fn assert_stopped<T>(result: Result<T, NativePolkaVmError>) {
@@ -716,12 +744,23 @@ mod tests {
     }
 
     #[test]
-    fn stopped_runtime_keeps_log_drain_accessible() {
-        let runtime = host_frame_runtime();
-        runtime.init().expect("initialize guest");
+    fn stopped_runtime_preserves_queued_guest_logs() {
+        let runtime = NativePolkaVmRuntime::new(
+            logging_program(),
+            Vec::new(),
+            NativePolkaVmPresentationProfile::Framebuffer,
+            false,
+            10_000_000,
+        )
+        .expect("create native facade");
+        runtime.init().expect("initialize logging guest");
         runtime.stop().expect("stop runtime");
 
-        assert_eq!(runtime.take_log().expect("drain log after stop"), None);
+        assert_eq!(
+            runtime.take_log().expect("drain log after stop").as_deref(),
+            Some(PRESERVED_LOG)
+        );
+        assert_eq!(runtime.take_log().expect("log queue is drained"), None);
     }
 
     #[test]
