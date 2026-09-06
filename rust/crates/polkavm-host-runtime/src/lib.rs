@@ -659,6 +659,13 @@ impl HostState {
         self.host_frame_responses.push_back(bytes);
         Ok(())
     }
+
+    fn clear_host_frame_queues(&mut self) {
+        self.host_frame_requests.clear();
+        self.host_frame_request_bytes = 0;
+        self.host_frame_responses.clear();
+        self.host_frame_response_bytes = 0;
+    }
 }
 
 pub struct Runtime {
@@ -667,6 +674,7 @@ pub struct Runtime {
     max_gas_per_update: u64,
     last_gas_used: u64,
     backend: polkavm::BackendKind,
+    stopped: bool,
 }
 
 impl Runtime {
@@ -1278,10 +1286,26 @@ impl Runtime {
             max_gas_per_update,
             last_gas_used: 0,
             backend,
+            stopped: false,
         })
     }
 
+    pub(crate) fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.state.clear_host_frame_queues();
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     pub fn init(&mut self) -> Result<()> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
         self.state
@@ -1306,6 +1330,9 @@ impl Runtime {
     }
 
     pub fn update(&mut self) -> Result<()> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
         self.state
@@ -1437,6 +1464,14 @@ impl Runtime {
 
     pub fn send_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<()> {
         self.state.queue_host_frame_response(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_frame_queues_are_empty(&self) -> bool {
+        self.state.host_frame_requests.is_empty()
+            && self.state.host_frame_request_bytes == 0
+            && self.state.host_frame_responses.is_empty()
+            && self.state.host_frame_response_bytes == 0
     }
 
     #[cfg(target_arch = "wasm32")]

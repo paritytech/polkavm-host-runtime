@@ -23,6 +23,12 @@ Hosts integrate through the `truapi-polkavm-host` bridge in [`paritytech/host-ru
 Native UniFFI hosts mediate opaque TrUAPI frames through
 `take_host_frame_request()` and `send_host_frame_response()`; the runtime keeps
 the guest-facing `host_frame_send` / `host_frame_poll` queues bounded.
+Native callers terminate execution explicitly with `NativePolkaVmRuntime.stop()`.
+Guest execution and host-transport failures also stop the runtime; subsequent
+input, output, GPU, audio, and host-frame operations return
+`NativePolkaVmError::Stopped`, while `is_exited()` reports `true`. Consumers
+must regenerate their UniFFI bindings when updating to this API surface.
+
 
 ## Build and test
 

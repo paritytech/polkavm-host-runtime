@@ -34,6 +34,7 @@ pub struct CoreVmRuntime {
     audio_enabled: bool,
     max_gas_per_update: u64,
     exited: bool,
+    stopped: bool,
 }
 
 impl ApplicationRuntime {
@@ -100,20 +101,49 @@ impl ApplicationRuntime {
             pointer: None,
             max_gas_per_update,
             exited: false,
+            stopped: false,
         }))
     }
 
     pub fn init(&mut self) -> Result<()> {
-        match self {
+        if self.is_stopped() {
+            return Err(anyhow!("runtime is stopped"));
+        }
+        let result = match self {
             Self::Cooperative(runtime) => runtime.init(),
             Self::CoreVm(_) => Ok(()),
+        };
+        if result.is_err() {
+            self.stop();
         }
+        result
     }
 
     pub fn update(&mut self) -> Result<()> {
-        match self {
+        if self.is_stopped() {
+            return Err(anyhow!("runtime is stopped"));
+        }
+        let result = match self {
             Self::Cooperative(runtime) => runtime.update(),
             Self::CoreVm(runtime) => runtime.update(),
+        };
+        if result.is_err() {
+            self.stop();
+        }
+        result
+    }
+
+    pub fn stop(&mut self) {
+        match self {
+            Self::Cooperative(runtime) => runtime.stop(),
+            Self::CoreVm(runtime) => runtime.stop(),
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        match self {
+            Self::Cooperative(runtime) => runtime.is_stopped(),
+            Self::CoreVm(runtime) => runtime.stopped,
         }
     }
 
@@ -241,6 +271,9 @@ impl ApplicationRuntime {
     }
 
     pub fn take_host_frame_request(&mut self) -> Option<Vec<u8>> {
+        if self.is_stopped() {
+            return None;
+        }
         match self {
             Self::Cooperative(runtime) => runtime.take_host_frame_request(),
             Self::CoreVm(runtime) => runtime.vm.take_host_frame_request(),
@@ -248,13 +281,20 @@ impl ApplicationRuntime {
     }
 
     pub fn send_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<()> {
-        match self {
+        if self.is_stopped() {
+            return Err(anyhow!("runtime is stopped"));
+        }
+        let result = match self {
             Self::Cooperative(runtime) => runtime.send_host_frame_response(bytes),
             Self::CoreVm(runtime) => runtime
                 .vm
                 .send_host_frame_response(bytes)
                 .map_err(anyhow::Error::msg),
+        };
+        if result.is_err() {
+            self.stop();
         }
+        result
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -307,7 +347,7 @@ impl ApplicationRuntime {
     }
 
     pub fn is_exited(&self) -> bool {
-        matches!(self, Self::CoreVm(runtime) if runtime.exited)
+        self.is_stopped() || matches!(self, Self::CoreVm(runtime) if runtime.exited)
     }
 
     pub fn take_save(&mut self) -> Option<Vec<u8>> {
@@ -319,6 +359,14 @@ impl ApplicationRuntime {
 }
 
 impl CoreVmRuntime {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.vm.clear_host_frame_queues();
+    }
+
     fn update(&mut self) -> Result<()> {
         if self.exited {
             return Ok(());

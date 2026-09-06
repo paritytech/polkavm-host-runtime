@@ -622,6 +622,13 @@ impl Vm {
         Ok(())
     }
 
+    pub(crate) fn clear_host_frame_queues(&mut self) {
+        self.host_frame_requests.clear();
+        self.host_frame_request_bytes = 0;
+        self.host_frame_responses.clear();
+        self.host_frame_response_bytes = 0;
+    }
+
     pub fn set_gas(&mut self, gas: u64) {
         self.instance.set_gas(gas.min(i64::MAX as u64) as i64);
     }
