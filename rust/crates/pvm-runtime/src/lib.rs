@@ -59,11 +59,13 @@ pub use tri2d::{
     MAX_TRI2D_VERTICES, TRI2D_HEADER_BYTES, TRI2D_MAGIC, TRI2D_VERSION,
 };
 pub use ui::{
-    encode_text_input, focus_record, ime_state_record, wheel_record, TextInputKind,
-    UiSemanticAction, UiSemanticNode, UiSemanticRole, UiSemanticSnapshot, UiSemanticsFrame,
-    INPUT_FOCUS, INPUT_IME_COMMIT, INPUT_IME_DISABLED, INPUT_IME_ENABLED, INPUT_IME_PREEDIT,
-    INPUT_TEXT_COMMIT, INPUT_WHEEL, MAX_UI_SEMANTICS_BYTES, MAX_UI_SEMANTIC_NODES,
-    MAX_UI_SEMANTIC_STRING_BYTES, MAX_UI_TEXT_BYTES,
+    encode_text_input, focus_record, ime_state_record, keyboard_insets_records,
+    safe_area_insets_records, wheel_record, TextInputKind, UiSemanticAction, UiSemanticNode,
+    UiSemanticRole, UiSemanticSnapshot, UiSemanticsFrame, INPUT_FOCUS, INPUT_IME_COMMIT,
+    INPUT_IME_DISABLED, INPUT_IME_ENABLED, INPUT_IME_PREEDIT, INPUT_INSETS_HORIZONTAL,
+    INPUT_INSETS_VERTICAL, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS, INPUT_TEXT_COMMIT,
+    INPUT_WHEEL, MAX_UI_SEMANTICS_BYTES, MAX_UI_SEMANTIC_NODES, MAX_UI_SEMANTIC_STRING_BYTES,
+    MAX_UI_TEXT_BYTES,
 };
 
 pub const ABI_VERSION: u32 = 1;
@@ -579,6 +581,17 @@ impl HostState {
             {
                 self.input.remove(position);
             }
+        } else if matches!(
+            record[0],
+            ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
+        ) {
+            if let Some(position) = self
+                .input
+                .iter()
+                .rposition(|queued| queued[0] == record[0] && queued[1] == record[1])
+            {
+                self.input.remove(position);
+            }
         } else if record[0] == InputEventType::PointerMove as u8
             && self
                 .input
@@ -611,14 +624,36 @@ impl HostState {
         Ok(())
     }
 
-    fn queue_input_records(&mut self, records: Vec<[u8; INPUT_EVENT_BYTES]>) -> Result<()> {
-        if self.input.len().saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
-            bail!("input queue cannot accept a complete text event");
-        }
-        for record in &records {
+    fn queue_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
+        for record in records {
             ui::validate_input_record(record)?;
         }
-        self.input.extend(records);
+        let inset_type = match records {
+            [horizontal, vertical]
+                if matches!(
+                    horizontal[0],
+                    ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
+                ) && vertical[0] == horizontal[0]
+                    && horizontal[1] == ui::INPUT_INSETS_HORIZONTAL
+                    && vertical[1] == ui::INPUT_INSETS_VERTICAL =>
+            {
+                Some(horizontal[0])
+            }
+            _ => None,
+        };
+        let retained_len = inset_type.map_or(self.input.len(), |event_type| {
+            self.input
+                .iter()
+                .filter(|record| record[0] != event_type)
+                .count()
+        });
+        if retained_len.saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
+            bail!("input queue cannot accept a complete input event");
+        }
+        if let Some(event_type) = inset_type {
+            self.input.retain(|record| record[0] != event_type);
+        }
+        self.input.extend(records.iter().copied());
         Ok(())
     }
 
@@ -1352,9 +1387,15 @@ impl Runtime {
         self.state.queue_input_record(record)
     }
 
+    /// Queues one logical input event encoded as multiple records without
+    /// exposing a partial event to the guest.
+    pub fn send_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
+        self.state.queue_input_records(records)
+    }
+
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
-        self.state
-            .queue_input_records(ui::encode_text_input(kind, text)?)
+        let records = ui::encode_text_input(kind, text)?;
+        self.state.queue_input_records(&records)
     }
 
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
@@ -2027,6 +2068,21 @@ mod tests {
             2_560
         );
 
+        state
+            .queue_input_records(&ui::safe_area_insets_records(10, 20, 30, 40))
+            .unwrap();
+        state
+            .queue_input_records(&ui::safe_area_insets_records(50, 60, 70, 80))
+            .unwrap();
+        let insets = state
+            .input
+            .iter()
+            .filter(|event| event[0] == ui::INPUT_SAFE_AREA_INSETS)
+            .collect::<Vec<_>>();
+        assert_eq!(insets.len(), 2);
+        assert_eq!(u16::from_le_bytes(insets[0][2..4].try_into().unwrap()), 50);
+        assert_eq!(u16::from_le_bytes(insets[1][2..4].try_into().unwrap()), 60);
+
         for index in 0..(MAX_QUEUED_INPUT_EVENTS + 100) {
             state.queue_input(InputEvent {
                 event_type: InputEventType::KeyDown,
@@ -2050,11 +2106,41 @@ mod tests {
             x: 3_000,
             y: 2_000,
         });
+
         assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
         assert_eq!(
             state.input.back().unwrap()[0],
             InputEventType::SurfaceMetrics as u8
         );
+    }
+    #[test]
+    fn failed_atomic_inset_update_preserves_the_previous_records() {
+        let mut state = HostState::new(
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            false,
+            false,
+        );
+        let key = InputEvent {
+            event_type: InputEventType::KeyDown,
+            code: 0,
+            x: 0,
+            y: 0,
+        }
+        .encode();
+        state
+            .input
+            .extend(core::iter::repeat_n(key, MAX_QUEUED_INPUT_EVENTS - 1));
+        state
+            .queue_input_record(ui::safe_area_insets_records(10, 20, 30, 40)[0])
+            .unwrap();
+        let before = state.input.clone();
+
+        assert!(state
+            .queue_input_records(&ui::safe_area_insets_records(50, 60, 70, 80))
+            .is_err());
+        assert_eq!(state.input, before);
     }
 
     #[test]
