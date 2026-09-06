@@ -334,11 +334,28 @@ pub extern "C" fn polkavm_browser_send_gpu_event() -> u32 {
     })
 }
 
+/// Returns 0 on admission, 1 on a terminal/invalid response, and 2 on retryable backpressure.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
-    status(|host| {
+    HOST.with(|host| {
+        let mut host = host.borrow_mut();
+        host.error.clear();
         let bytes = std::mem::take(&mut host.staging);
-        host.running()?.send_host_frame_response(bytes)
+        let result = match &mut host.phase {
+            Phase::Running(runtime) => runtime.send_host_frame_response(bytes),
+            _ => Err(crate::HostFrameResponseError::RuntimeStopped),
+        };
+        match result {
+            Ok(()) => 0,
+            Err(error) => {
+                host.error = error.to_string();
+                if error == crate::HostFrameResponseError::QueueFull {
+                    2
+                } else {
+                    1
+                }
+            }
+        }
     })
 }
 

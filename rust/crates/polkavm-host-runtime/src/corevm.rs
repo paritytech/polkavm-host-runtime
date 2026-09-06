@@ -607,15 +607,18 @@ impl Vm {
         Some(frame)
     }
 
-    pub fn send_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+    pub fn send_host_frame_response(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), crate::HostFrameResponseError> {
         if bytes.is_empty() || bytes.len() > crate::MAX_HOST_FRAME_BYTES {
-            return Err("invalid host-frame response frame".into());
+            return Err(crate::HostFrameResponseError::InvalidFrame);
         }
         if self.host_frame_responses.len() == crate::MAX_QUEUED_HOST_FRAMES
             || self.host_frame_response_bytes.saturating_add(bytes.len())
                 > crate::MAX_QUEUED_HOST_FRAME_BYTES
         {
-            return Err("host-frame response queue overflow".into());
+            return Err(crate::HostFrameResponseError::QueueFull);
         }
         self.host_frame_response_bytes += bytes.len();
         self.host_frame_responses.push_back(bytes);

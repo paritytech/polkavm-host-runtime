@@ -362,6 +362,90 @@ test("native-Wasm and translated backends round-trip opaque host frames", async 
   }
 });
 
+test("host-frame response backpressure is retryable in both backends", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/host-frame-roundtrip.polkavm",
+    ),
+  );
+  const responseBytes = new TextEncoder().encode(
+    "host-frame-conformance-response-v1",
+  );
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: `host-frame-backpressure-${forceInterpreter}`,
+        forceInterpreter,
+      },
+    });
+    await waitForMessage(messages, "host-frame-request");
+
+    for (let index = 0; index < 32; index += 1) {
+      receiver.onmessage({
+        data: {
+          type: "host-frame-response",
+          bytes: bytesBuffer(responseBytes),
+        },
+      });
+    }
+    receiver.onmessage({
+      data: {
+        type: "host-frame-response",
+        bytes: bytesBuffer(responseBytes),
+      },
+    });
+
+    assert.deepEqual(
+      messages.find(
+        (message) => message.type === "host-frame-response-rejected",
+      ),
+      { type: "host-frame-response-rejected", reason: "queue-full" },
+    );
+    assert.equal(messages.some((message) => message.type === "error"), false);
+    assert.equal(
+      messages.some((message) => message.type === "terminated"),
+      false,
+    );
+
+    await waitForMessage(messages, "save");
+    const rejectionCount = messages.filter(
+      (message) => message.type === "host-frame-response-rejected",
+    ).length;
+    receiver.onmessage({
+      data: {
+        type: "host-frame-response",
+        bytes: bytesBuffer(responseBytes),
+      },
+    });
+    await settle();
+    assert.equal(
+      messages.filter(
+        (message) => message.type === "host-frame-response-rejected",
+      ).length,
+      rejectionCount,
+    );
+    assert.equal(
+      messages.some((message) => message.type === "terminated"),
+      false,
+    );
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("native-Wasm and translated backends validate and emit UI output v1", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

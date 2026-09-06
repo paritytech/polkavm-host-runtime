@@ -4,9 +4,9 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, ComputerContext, Frame, GpuBatch, InputEvent, InputEventType, PresentationProfile,
-    Runtime, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
-    MAX_FRAME_BYTES,
+    AudioChunk, ComputerContext, Frame, GpuBatch, HostFrameResponseError, InputEvent,
+    InputEventType, PresentationProfile, Runtime, TextInputKind, Tri2dFrame, UiOutputFrame,
+    UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -280,18 +280,18 @@ impl ApplicationRuntime {
         }
     }
 
-    pub fn send_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+    pub fn send_host_frame_response(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), HostFrameResponseError> {
         if self.is_stopped() {
-            return Err(anyhow!("runtime is stopped"));
+            return Err(HostFrameResponseError::RuntimeStopped);
         }
         let result = match self {
             Self::Cooperative(runtime) => runtime.send_host_frame_response(bytes),
-            Self::CoreVm(runtime) => runtime
-                .vm
-                .send_host_frame_response(bytes)
-                .map_err(anyhow::Error::msg),
+            Self::CoreVm(runtime) => runtime.vm.send_host_frame_response(bytes),
         };
-        if result.is_err() {
+        if result == Err(HostFrameResponseError::InvalidFrame) {
             self.stop();
         }
         result

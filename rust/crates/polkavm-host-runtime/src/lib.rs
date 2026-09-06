@@ -135,6 +135,29 @@ pub const MAX_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_HOST_FRAMES: usize = 32;
 const MAX_QUEUED_HOST_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
+/// Failure to admit a Host response into the bounded guest-facing queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostFrameResponseError {
+    /// The response is empty or exceeds [`MAX_HOST_FRAME_BYTES`].
+    InvalidFrame,
+    /// The bounded response queue has no capacity; the caller may retry after an update.
+    QueueFull,
+    /// The runtime has reached a terminal state.
+    RuntimeStopped,
+}
+
+impl std::fmt::Display for HostFrameResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidFrame => "invalid host-frame response",
+            Self::QueueFull => "host-frame response queue is full",
+            Self::RuntimeStopped => "runtime is stopped",
+        })
+    }
+}
+
+impl std::error::Error for HostFrameResponseError {}
+
 pub(crate) fn validate_program_configuration(
     program_len: usize,
     max_gas_per_update: u64,
@@ -645,15 +668,18 @@ impl HostState {
         Some(frame)
     }
 
-    fn queue_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+    fn queue_host_frame_response(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), HostFrameResponseError> {
         if bytes.is_empty() || bytes.len() > MAX_HOST_FRAME_BYTES {
-            return Err(anyhow!("invalid host-frame response"));
+            return Err(HostFrameResponseError::InvalidFrame);
         }
         if self.host_frame_responses.len() == MAX_QUEUED_HOST_FRAMES
             || self.host_frame_response_bytes.saturating_add(bytes.len())
                 > MAX_QUEUED_HOST_FRAME_BYTES
         {
-            return Err(anyhow!("host-frame response queue overflow"));
+            return Err(HostFrameResponseError::QueueFull);
         }
         self.host_frame_response_bytes += bytes.len();
         self.host_frame_responses.push_back(bytes);
@@ -1462,7 +1488,10 @@ impl Runtime {
         self.state.take_host_frame_request()
     }
 
-    pub fn send_host_frame_response(&mut self, bytes: Vec<u8>) -> Result<()> {
+    pub fn send_host_frame_response(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), HostFrameResponseError> {
         self.state.queue_host_frame_response(bytes)
     }
 

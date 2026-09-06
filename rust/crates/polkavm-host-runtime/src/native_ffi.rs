@@ -3,9 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
-    INPUT_EVENT_BYTES,
+    ApplicationRuntime, AudioChunk, Frame, GpuBatch, HostFrameResponseError, InputEvent,
+    InputEventType, PresentationProfile, TextInputKind, Tri2dFrame, UiOutputFrame,
+    UiSemanticsFrame, INPUT_EVENT_BYTES,
 };
 #[cfg(feature = "native-gpu")]
 use crate::{NativeGpuFrame, NativeGpuRenderer};
@@ -210,6 +210,8 @@ pub enum NativePolkaVmError {
     Runtime { detail: String },
     #[error("PolkaVM runtime is stopped")]
     Stopped,
+    #[error("host-frame response queue is full")]
+    HostFrameResponseQueueFull,
     #[error("asset path appears more than once: {path}")]
     DuplicateAsset { path: String },
     #[error("PolkaVM runtime mutex was poisoned")]
@@ -506,11 +508,16 @@ impl NativePolkaVmRuntime {
 
     pub fn send_host_frame_response(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
-        if let Err(error) = runtime.send_host_frame_response(bytes) {
-            runtime.stop();
-            return Err(NativePolkaVmError::runtime(error));
+        match runtime.send_host_frame_response(bytes) {
+            Ok(()) => Ok(()),
+            Err(HostFrameResponseError::InvalidFrame) => Err(NativePolkaVmError::runtime(
+                HostFrameResponseError::InvalidFrame,
+            )),
+            Err(HostFrameResponseError::QueueFull) => {
+                Err(NativePolkaVmError::HostFrameResponseQueueFull)
+            }
+            Err(HostFrameResponseError::RuntimeStopped) => Err(NativePolkaVmError::Stopped),
         }
-        Ok(())
     }
 
     pub fn take_ui_semantics(
@@ -532,7 +539,7 @@ impl NativePolkaVmRuntime {
     }
 
     pub fn take_save(&self) -> Result<Option<Vec<u8>>, NativePolkaVmError> {
-        Ok(self.lock_running()?.take_save())
+        Ok(self.lock()?.take_save())
     }
 }
 
@@ -547,6 +554,7 @@ mod tests {
     const HOST_FRAME_PROGRAM: &[u8] =
         include_bytes!("../tests/fixtures/host-frame-roundtrip.polkavm");
     const HOST_FRAME_RESPONSE: &[u8] = b"host-frame-conformance-response-v1";
+    const HOST_FRAME_SUCCESS: &[u8] = b"host-frame-roundtrip-ok";
     const PRESERVED_LOG: &str = "guest log survives runtime stop";
 
     fn host_frame_runtime() -> Arc<NativePolkaVmRuntime> {
@@ -596,6 +604,31 @@ mod tests {
             &[],
         );
         builder.into_vec().expect("build logging guest")
+    }
+
+    fn host_frame_polling_program() -> Vec<u8> {
+        let stack_size = 4 * 1024;
+        let memory = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(1)
+            .stack_size(stack_size)
+            .build()
+            .expect("build guest memory map");
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(1);
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_frame_poll");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, memory.rw_data_address() as i32),
+                asm::load_imm(Reg::A1, 1),
+                asm::ecalli(0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        builder.into_vec().expect("build host-frame polling guest")
     }
 
     fn assert_stopped<T>(result: Result<T, NativePolkaVmError>) {
@@ -744,6 +777,36 @@ mod tests {
     }
 
     #[test]
+    fn host_frame_response_backpressure_is_retryable() {
+        let runtime = NativePolkaVmRuntime::new(
+            host_frame_polling_program(),
+            Vec::new(),
+            NativePolkaVmPresentationProfile::Framebuffer,
+            false,
+            10_000_000,
+        )
+        .expect("create native facade");
+        runtime.init().expect("initialize polling guest");
+
+        for response in 0..crate::MAX_QUEUED_HOST_FRAMES {
+            runtime
+                .send_host_frame_response(vec![response as u8])
+                .expect("fill bounded response queue");
+        }
+        assert!(matches!(
+            runtime.send_host_frame_response(vec![255]),
+            Err(NativePolkaVmError::HostFrameResponseQueueFull)
+        ));
+        assert!(!runtime.is_exited().expect("queue pressure is nonterminal"));
+
+        runtime.update().expect("guest drains one response");
+        runtime
+            .send_host_frame_response(vec![255])
+            .expect("retry response after guest drain");
+        assert!(!runtime.is_exited().expect("retry keeps runtime alive"));
+    }
+
+    #[test]
     fn stopped_runtime_preserves_queued_guest_logs() {
         let runtime = NativePolkaVmRuntime::new(
             logging_program(),
@@ -761,6 +824,23 @@ mod tests {
             Some(PRESERVED_LOG)
         );
         assert_eq!(runtime.take_log().expect("log queue is drained"), None);
+    }
+
+    #[test]
+    fn stopped_runtime_preserves_pending_save() {
+        let runtime = host_frame_runtime();
+        runtime.init().expect("initialize guest");
+        runtime
+            .send_host_frame_response(HOST_FRAME_RESPONSE.to_vec())
+            .expect("queue response");
+        runtime.update().expect("guest submits save");
+        runtime.stop().expect("stop runtime");
+
+        assert_eq!(
+            runtime.take_save().expect("drain save after stop").as_deref(),
+            Some(HOST_FRAME_SUCCESS)
+        );
+        assert_eq!(runtime.take_save().expect("save is drained"), None);
     }
 
     #[test]

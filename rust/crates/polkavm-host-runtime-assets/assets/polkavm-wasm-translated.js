@@ -791,12 +791,14 @@
       }
       if (
         this.hostFrameResponses.length === MAX_HOST_FRAMES ||
-        this.hostFrameResponseBytes + bytes.byteLength > MAX_QUEUED_HOST_FRAME_BYTES
+        this.hostFrameResponseBytes + bytes.byteLength >
+          MAX_QUEUED_HOST_FRAME_BYTES
       ) {
-        throw new Error("translated host-frame response queue overflow");
+        return false;
       }
       this.hostFrameResponses.push(bytes.slice());
       this.hostFrameResponseBytes += bytes.byteLength;
+      return true;
     }
 
     stop() {
