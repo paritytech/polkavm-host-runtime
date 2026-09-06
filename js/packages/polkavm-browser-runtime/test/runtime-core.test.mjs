@@ -356,6 +356,15 @@ test("native-Wasm and translated backends round-trip opaque host frames", async 
     });
     const save = await waitForMessage(messages, "save");
     assert.deepEqual(new Uint8Array(save.bytes), successBytes);
+    assert.equal(
+      messages.some(
+        (message) =>
+          message.type === "host-frame-response-accepted" ||
+          message.type === "host-frame-response-rejected",
+      ),
+      false,
+      "responses without seq must not produce delivery acks",
+    );
 
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
@@ -392,26 +401,43 @@ test("host-frame response backpressure is retryable in both backends", async () 
     });
     await waitForMessage(messages, "host-frame-request");
 
-    for (let index = 0; index < 32; index += 1) {
+    const acks = () =>
+      messages.filter(
+        (message) =>
+          message.type === "host-frame-response-accepted" ||
+          message.type === "host-frame-response-rejected",
+      );
+
+    for (let seq = 0; seq < 33; seq += 1) {
       receiver.onmessage({
         data: {
           type: "host-frame-response",
           bytes: bytesBuffer(responseBytes),
+          seq,
         },
       });
     }
+
+    assert.deepEqual(acks(), [
+      ...Array.from({ length: 32 }, (_, seq) => ({
+        type: "host-frame-response-accepted",
+        seq,
+      })),
+      { type: "host-frame-response-rejected", reason: "queue-full", seq: 32 },
+    ]);
+
     receiver.onmessage({
       data: {
         type: "host-frame-response",
         bytes: bytesBuffer(responseBytes),
       },
     });
-
     assert.deepEqual(
-      messages.find(
+      messages.findLast(
         (message) => message.type === "host-frame-response-rejected",
       ),
       { type: "host-frame-response-rejected", reason: "queue-full" },
+      "responses without seq keep the legacy rejection shape",
     );
     assert.equal(messages.some((message) => message.type === "error"), false);
     assert.equal(
@@ -420,22 +446,18 @@ test("host-frame response backpressure is retryable in both backends", async () 
     );
 
     await waitForMessage(messages, "save");
-    const rejectionCount = messages.filter(
-      (message) => message.type === "host-frame-response-rejected",
-    ).length;
+    const ackCount = acks().length;
     receiver.onmessage({
       data: {
         type: "host-frame-response",
         bytes: bytesBuffer(responseBytes),
+        seq: 32,
       },
     });
     await settle();
-    assert.equal(
-      messages.filter(
-        (message) => message.type === "host-frame-response-rejected",
-      ).length,
-      rejectionCount,
-    );
+    assert.deepEqual(acks().slice(ackCount), [
+      { type: "host-frame-response-accepted", seq: 32 },
+    ]);
     assert.equal(
       messages.some((message) => message.type === "terminated"),
       false,
