@@ -524,7 +524,7 @@ impl NativePolkaVmRuntime {
     }
 
     pub fn take_log(&self) -> Result<Option<String>, NativePolkaVmError> {
-        Ok(self.lock_running()?.take_log())
+        Ok(self.lock()?.take_log())
     }
 
     pub fn is_exited(&self) -> Result<bool, NativePolkaVmError> {
@@ -713,6 +713,15 @@ mod tests {
         assert_stopped(runtime.send_host_frame_response(HOST_FRAME_RESPONSE.to_vec()));
         assert_stopped(runtime.take_audio());
         assert_stopped(runtime.gpu_ready());
+    }
+
+    #[test]
+    fn stopped_runtime_keeps_log_drain_accessible() {
+        let runtime = host_frame_runtime();
+        runtime.init().expect("initialize guest");
+        runtime.stop().expect("stop runtime");
+
+        assert_eq!(runtime.take_log().expect("drain log after stop"), None);
     }
 
     #[test]
