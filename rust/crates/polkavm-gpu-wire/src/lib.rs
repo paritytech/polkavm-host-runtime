@@ -105,6 +105,7 @@ pub enum GpuEventType {
     SubmissionComplete = 5,
     SurfaceChanged = 6,
     DeviceLost = 7,
+    DeviceRestored = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -18,6 +18,7 @@ const context = vm.createContext({
   Uint8Array,
   onmessage: null,
   postMessage() {},
+  GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01 },
 });
 vm.runInContext(
   `${source}\nglobalThis.gpuWorkerTest = { GpuEngine, parseCommand, parseCommands };`,
@@ -105,8 +106,12 @@ test("rejects writable storage buffer layouts in the vertex stage", () => {
 });
 
 test("validates compute pipeline dispatch batches", () => {
-  const shader = new TextEncoder().encode("@compute @workgroup_size(1) fn cs_main() {}");
-  const shaderPayload = new Uint8Array(8 + Math.ceil(shader.byteLength / 4) * 4);
+  const shader = new TextEncoder().encode(
+    "@compute @workgroup_size(1) fn cs_main() {}",
+  );
+  const shaderPayload = new Uint8Array(
+    8 + Math.ceil(shader.byteLength / 4) * 4,
+  );
   const shaderView = new DataView(shaderPayload.buffer);
   shaderView.setUint32(0, handle(1), true);
   shaderView.setUint32(4, shader.byteLength, true);
@@ -132,20 +137,7 @@ test("validates compute pipeline dispatch batches", () => {
 test("rejects nested render pass inside compute pass", () => {
   const batch = commands([
     [25, new Uint8Array()],
-    [
-      12,
-      u32s([
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0x3f800000,
-        0x3f800000,
-      ]),
-    ],
+    [12, u32s([0, 0, 1, 0, 0, 0, 0, 0x3f800000, 0x3f800000])],
   ]);
   const engine = validationEngine();
 
@@ -265,4 +257,132 @@ test("rejects more compilations than the per-batch bound", () => {
     () => engine.validate({ sequence: 1, commands: shaderCommands(33) }),
     /too many GPU compilations/,
   );
+});
+
+function eventType(bytes) {
+  return new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  ).getUint16(6, true);
+}
+
+function lostEngine(overrides = {}) {
+  const engine = Object.create(GpuEngine.prototype);
+  Object.assign(engine, {
+    canvas: { width: 320, height: 240 },
+    requirements: {},
+    // A lost device leaves the engine parked with its dead resource table.
+    resources: new Map([[1, { value: { destroy() {} } }]]),
+    handleSlots: new Map([[1, 1]]),
+    limits: Array.from({ length: 21 }, () => 4096),
+    physicalWidth: 320,
+    physicalHeight: 240,
+    logicalWidth: 320,
+    logicalHeight: 240,
+    scale: 1,
+    formatId: 1,
+    format: "bgra8unorm",
+    surfaceGeneration: 1,
+    deviceGeneration: 1,
+    lastSequence: 7,
+    pendingBatches: 2,
+    testReadbacksRemaining: 0,
+    testDeviceLossPending: false,
+    stopped: true,
+    disposed: false,
+    restoreAttempts: 0,
+    device: { destroy() {} },
+    context: { configure() {} },
+    ...overrides,
+  });
+  return engine;
+}
+
+function captureMessages() {
+  const messages = [];
+  const previous = context.postMessage;
+  context.postMessage = (message) => messages.push(message);
+  return {
+    messages,
+    restore() {
+      context.postMessage = previous;
+    },
+  };
+}
+
+test("a rebuilt device is published to the guest with fresh capabilities", async () => {
+  const engine = lostEngine();
+  const replacement = {
+    device: {
+      addEventListener() {},
+      lost: new Promise(() => {}),
+      destroy() {},
+    },
+    context: { configure() {} },
+    format: "bgra8unorm",
+    limits: Array.from({ length: 21 }, () => 2048),
+  };
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => replacement;
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+
+  assert.equal(engine.stopped, false, "the engine accepts batches again");
+  assert.equal(engine.device, replacement.device);
+  assert.equal(engine.deviceGeneration, 2, "the guest can see a new device");
+  assert.equal(engine.resources.size, 0, "handles died with the old device");
+  assert.equal(engine.handleSlots.size, 0);
+  assert.equal(engine.lastSequence, 0, "submission sequencing restarts");
+  assert.equal(engine.pendingBatches, 0);
+  assert.deepEqual(
+    capture.messages.map((message) => message.type),
+    ["capabilities", "event"],
+    "capabilities land before the restored event so a guest can read them",
+  );
+  assert.equal(eventType(capture.messages[1].bytes), 8);
+});
+
+test("a device that cannot be rebuilt reports an error instead of a restore", async () => {
+  const engine = lostEngine();
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    throw new Error("WebGPU adapter is unavailable");
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+
+  assert.equal(engine.stopped, true, "the surface stays down");
+  assert.equal(engine.deviceGeneration, 1);
+  assert.deepEqual(
+    capture.messages.map((message) => message.type),
+    ["error"],
+  );
+});
+
+test("a permanently broken adapter stops being rebuilt", async () => {
+  const engine = lostEngine({ restoreAttempts: 3 });
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    throw new Error("unreachable");
+  };
+  try {
+    await engine.restore();
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+  }
+
+  assert.equal(attempts, 0, "the attempt ceiling is honoured");
 });
