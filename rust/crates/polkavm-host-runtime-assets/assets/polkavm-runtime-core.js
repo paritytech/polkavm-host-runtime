@@ -27,6 +27,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MAX_ASSET_FILE_BYTES = 128 * 1024 * 1024;
   const MAX_ASSET_BYTES = 256 * 1024 * 1024;
   const MOTION_SAMPLE_BYTES = 48;
+  // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
+  // update carry a single axis, so a Host sends them through the dedicated
+  // `view-insets` message that queues the pair together; the runtime rejects a
+  // lone axis arriving as an ordinary input record.
+  const INPUT_SAFE_AREA_INSETS = 16;
+  const INPUT_KEYBOARD_INSETS = 17;
+  const MAX_INSET_PIXELS = 65535;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -615,7 +622,18 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function sendInput(bytes) {
-    if (!running || bytes.byteLength !== 8) {
+    if (bytes.byteLength !== 8) {
+      return;
+    }
+    if (
+      bytes[0] === INPUT_SAFE_AREA_INSETS ||
+      bytes[0] === INPUT_KEYBOARD_INSETS
+    ) {
+      throw new Error(
+        "viewport insets must be sent with the view-insets message",
+      );
+    }
+    if (!running) {
       return;
     }
     if (translated) {
@@ -623,7 +641,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       return;
     }
     if (bytes[0] <= 7) {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const view = new DataView(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength,
+      );
       check(
         pvm.polkavm_browser_send_input(
           bytes[0],
@@ -639,6 +661,34 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     check(
       pvm.polkavm_browser_send_input_record(),
       "send PolkaVM browser extended input",
+    );
+  }
+
+  function sendViewInsets(eventType, left, top, right, bottom) {
+    if (
+      eventType !== INPUT_SAFE_AREA_INSETS &&
+      eventType !== INPUT_KEYBOARD_INSETS
+    ) {
+      throw new Error("invalid PolkaVM browser inset event type");
+    }
+    for (const value of [left, top, right, bottom]) {
+      if (!Number.isInteger(value) || value < 0 || value > MAX_INSET_PIXELS) {
+        throw new Error("invalid PolkaVM browser inset value");
+      }
+    }
+    if (!running) {
+      return;
+    }
+    if (translated) {
+      translated.sendViewInsets(eventType, left, top, right, bottom);
+      return;
+    }
+    if (typeof pvm.polkavm_browser_send_view_insets !== "function") {
+      throw new Error("PolkaVM browser runtime has an incompatible ABI");
+    }
+    check(
+      pvm.polkavm_browser_send_view_insets(eventType, left, top, right, bottom),
+      "send PolkaVM browser view insets",
     );
   }
 
@@ -776,6 +826,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "view-insets") {
+      try {
+        sendViewInsets(
+          message.eventType,
+          message.left,
+          message.top,
+          message.right,
+          message.bottom,
+        );
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

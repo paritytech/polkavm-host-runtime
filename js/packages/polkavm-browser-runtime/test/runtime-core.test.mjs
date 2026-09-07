@@ -888,7 +888,11 @@ test("both browser backends answer the pointer capture hostcall", async () => {
     "arm, undefined request, release, arm",
   );
   const request = await waitForMessage(messages, "pointer-capture");
-  assert.equal(request.capture, true, "the newest guest request reaches the Host");
+  assert.equal(
+    request.capture,
+    true,
+    "the newest guest request reaches the Host",
+  );
   const compiled = await waitForMessage(messages, "compiled");
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
@@ -937,4 +941,205 @@ test("both browser backends answer the pointer capture hostcall", async () => {
     "revoking support drops the request the Host has not served",
   );
   supported.stop();
+});
+
+test("both browser backends take viewport insets as a whole pair", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/motion-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "view-insets",
+    },
+  });
+  await waitForMessage(messages, "ready");
+  receiver.onmessage({
+    data: {
+      type: "view-insets",
+      eventType: 16,
+      left: 0,
+      top: 47,
+      right: 0,
+      bottom: 34,
+    },
+  });
+  receiver.onmessage({
+    data: {
+      type: "view-insets",
+      eventType: 17,
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 640,
+    },
+  });
+  await settle();
+  assert.equal(
+    messages.some((message) => message.type === "error"),
+    false,
+    "the interpreter accepts safe-area and keyboard updates",
+  );
+
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.sendViewInsets(16, 0, 47, 0, 34);
+  translated.sendViewInsets(16, 0, 132, 0, 34);
+  translated.sendViewInsets(17, 0, 0, 0, 640);
+  const queued = translated.input.map((record) => [
+    record[0],
+    record[1],
+    record[2] | (record[3] << 8),
+    record[4] | (record[5] << 8),
+  ]);
+  assert.deepEqual(
+    queued,
+    [
+      [16, 0, 0, 0],
+      [16, 1, 132, 34],
+      [17, 0, 0, 0],
+      [17, 1, 0, 640],
+    ],
+    "the newest update of each source supersedes the queued one, axes intact",
+  );
+  translated.stop();
+});
+
+test("a guest buffer that ends mid-pair waits for the whole update", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/motion-test.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "view-insets-poll",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.sendInput(new Uint8Array([1, 4, 0, 0, 0, 0, 0, 0]));
+  translated.sendViewInsets(16, 0, 47, 0, 34);
+  assert.equal(
+    translated.pollableInputCount(2),
+    1,
+    "a buffer that ends between the axes takes the key only",
+  );
+  assert.equal(
+    translated.pollableInputCount(3),
+    3,
+    "room for both axes delivers the whole update",
+  );
+  assert.equal(
+    translated.pollableInputCount(1),
+    1,
+    "a buffer too small for a pair still makes progress",
+  );
+  translated.stop();
+});
+
+test("the browser endpoint rejects malformed viewport insets", async () => {
+  for (const message of [
+    {
+      type: "view-insets",
+      eventType: 15,
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+    },
+    {
+      type: "view-insets",
+      eventType: 16,
+      left: -1,
+      top: 0,
+      right: 0,
+      bottom: 0,
+    },
+    {
+      type: "view-insets",
+      eventType: 16,
+      left: 0,
+      top: 0.5,
+      right: 0,
+      bottom: 0,
+    },
+    {
+      type: "view-insets",
+      eventType: 17,
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 65_536,
+    },
+  ]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({ data: message });
+    await settle();
+    assert.equal(
+      messages.some((posted) => posted.type === "error"),
+      true,
+      `an out-of-contract inset update is refused: ${JSON.stringify(message)}`,
+    );
+  }
+});
+
+test("an inset record cannot enter through the ordinary input channel", async () => {
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "input",
+      bytes: bytesBuffer(new Uint8Array([16, 0, 10, 0, 20, 0, 0, 0])),
+    },
+  });
+  await settle();
+  const error = messages.find((message) => message.type === "error");
+  assert.match(
+    error?.message ?? "",
+    /view-insets message/,
+    "a lone axis is refused instead of tearing the pair",
+  );
 });
