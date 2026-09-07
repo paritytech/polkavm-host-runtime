@@ -601,13 +601,13 @@ this ABI.
 host_log(pointer: u32, length: u32) -> ()
 ```
 
-The Host copies at most the v2 log-byte limit and decodes the bytes as lossy
+The Host copies at most the v1 log-byte limit and decodes the bytes as lossy
 UTF-8 for diagnostics. Logs are not application storage and MUST NOT affect
 application behavior.
 
 ## ABI v1 resource bounds
 
-The initial v2 implementation applies the following ceilings:
+The initial v1 implementation applies the following ceilings:
 
 ```text
 program bytes                         64 MiB

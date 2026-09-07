@@ -196,9 +196,9 @@ mod tests {
     use super::AppDescriptor;
     use crate::PresentationProfile;
 
-    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
-    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
-    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":2,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
+    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
+    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
+    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
 
     #[test]
     fn omitted_required_features_default_to_empty() {
@@ -223,11 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_previous_runtime_abi() {
-        let previous = String::from_utf8(FRAMEBUFFER.to_vec())
+    fn rejects_an_unknown_runtime_abi() {
+        // The published contract is ABI 1; a Host must refuse a manifest that
+        // asks for a boundary it does not implement rather than guess.
+        let unknown = String::from_utf8(FRAMEBUFFER.to_vec())
             .unwrap()
-            .replace("\"abiVersion\":2", "\"abiVersion\":1");
-        assert!(AppDescriptor::parse_exact(previous.as_bytes(), previous.as_bytes()).is_err());
+            .replace("\"abiVersion\":1", "\"abiVersion\":2");
+        assert!(AppDescriptor::parse_exact(unknown.as_bytes(), unknown.as_bytes()).is_err());
     }
 
     #[test]
