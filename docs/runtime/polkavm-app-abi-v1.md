@@ -290,10 +290,18 @@ code  x       y
 1     top     bottom
 ```
 
-Bytes 6–7 are zero. The Host MUST queue both records together whenever one
-source changes and after surface metrics change. A Host that cannot observe a
-source emits no records for it; the guest treats an absent source as four zero
-insets. Virtual-keyboard insets describe the edge-connected occlusion while a
+Bytes 6–7 are zero. The record with `code` 0 MUST precede the record with
+`code` 1, and the Host MUST queue both records together whenever one source
+changes and after surface metrics change: the runtime rejects a lone record and
+delivers a queued pair in one poll unless the guest's buffer is smaller than
+two records. `left` plus `right` MUST NOT exceed the surface width and `top`
+plus `bottom` MUST NOT exceed the surface height, so a guest can subtract them
+without producing an inverted rectangle. A Host that cannot observe a source
+emits no records for it; the guest treats an absent source as four zero insets.
+A Host that has emitted a non-zero pair MUST emit a zero pair once that source
+stops occluding the surface — a dismissed keyboard or a rotation that removes a
+cutout — because the guest keeps the last pair it received until then.
+Virtual-keyboard insets describe the edge-connected occlusion while a
 Host-owned text-input agent is active. A floating keyboard that touches no
 surface edge is not representable and does not reduce the rectangular content
 area. Safe-area and keyboard values remain separate so a guest can diagnose

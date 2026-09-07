@@ -585,13 +585,10 @@ impl HostState {
             record[0],
             ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
         ) {
-            if let Some(position) = self
-                .input
-                .iter()
-                .rposition(|queued| queued[0] == record[0] && queued[1] == record[1])
-            {
-                self.input.remove(position);
-            }
+            // One half of an inset update carries a single axis, so accepting it
+            // here would let the guest read the new axis beside the previous
+            // update's other axis. `queue_input_records` is the only way in.
+            bail!("viewport insets must be queued as a complete pair");
         } else if record[0] == InputEventType::PointerMove as u8
             && self
                 .input
@@ -601,24 +598,10 @@ impl HostState {
             self.input.pop_back();
         }
         if self.input.len() == MAX_QUEUED_INPUT_EVENTS {
-            let discardable = self
-                .input
-                .iter()
-                .position(|queued| queued[0] == InputEventType::PointerMove as u8)
-                .or_else(|| {
-                    self.input.iter().position(|queued| {
-                        matches!(
-                            queued[0],
-                            value if value == InputEventType::PointerDelta as u8
-                                || value == ui::INPUT_WHEEL
-                        )
-                    })
-                });
-            if let Some(position) = discardable {
-                self.input.remove(position);
-            } else {
+            let Some(position) = self.discardable_input_position() else {
                 bail!("input queue is full");
-            }
+            };
+            self.input.remove(position);
         }
         self.input.push_back(record);
         Ok(())
@@ -628,33 +611,89 @@ impl HostState {
         for record in records {
             ui::validate_input_record(record)?;
         }
-        let inset_type = match records {
-            [horizontal, vertical]
-                if matches!(
-                    horizontal[0],
-                    ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
-                ) && vertical[0] == horizontal[0]
-                    && horizontal[1] == ui::INPUT_INSETS_HORIZONTAL
-                    && vertical[1] == ui::INPUT_INSETS_VERTICAL =>
-            {
-                Some(horizontal[0])
-            }
-            _ => None,
-        };
+        let inset_type = inset_pair_type(records)?;
         let retained_len = inset_type.map_or(self.input.len(), |event_type| {
             self.input
                 .iter()
                 .filter(|record| record[0] != event_type)
                 .count()
         });
-        if retained_len.saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
+        // Insets and text chunks are edge-triggered: losing one loses the update
+        // for good, so a saturated queue gives up the same pointer and wheel
+        // samples the single-record path discards. Count the room first: the
+        // queue must not be mutated by an update that cannot be completed.
+        let discardable_len = inset_type.map_or_else(
+            || self.discardable_input_count(|_| true),
+            |event_type| self.discardable_input_count(|record| record[0] != event_type),
+        );
+        if retained_len
+            .saturating_sub(discardable_len)
+            .saturating_add(records.len())
+            > MAX_QUEUED_INPUT_EVENTS
+        {
             bail!("input queue cannot accept a complete input event");
         }
         if let Some(event_type) = inset_type {
             self.input.retain(|record| record[0] != event_type);
         }
+        while self.input.len().saturating_add(records.len()) > MAX_QUEUED_INPUT_EVENTS {
+            let Some(position) = self.discardable_input_position() else {
+                bail!("input queue is full");
+            };
+            self.input.remove(position);
+        }
         self.input.extend(records.iter().copied());
         Ok(())
+    }
+
+    /// Position of the oldest record the guest can lose without losing state:
+    /// pointer samples are superseded by the next one, wheel deltas accumulate.
+    fn discardable_input_position(&self) -> Option<usize> {
+        self.input
+            .iter()
+            .position(|queued| queued[0] == InputEventType::PointerMove as u8)
+            .or_else(|| {
+                self.input.iter().position(|queued| {
+                    matches!(
+                        queued[0],
+                        value if value == InputEventType::PointerDelta as u8
+                            || value == ui::INPUT_WHEEL
+                    )
+                })
+            })
+    }
+
+    /// How many of the records matching `retained` the queue could give up.
+    fn discardable_input_count(
+        &self,
+        retained: impl Fn(&[u8; INPUT_EVENT_BYTES]) -> bool,
+    ) -> usize {
+        self.input
+            .iter()
+            .filter(|record| retained(record) && is_discardable_input(record))
+            .count()
+    }
+
+    /// How many queued records a guest buffer of `capacity` records receives.
+    ///
+    /// An inset update carries one axis per record, so a buffer that ends
+    /// between them would hand the guest a new axis beside a stale one. The
+    /// pair stays queued for the next poll instead — except for a buffer that
+    /// could never hold both records, which would otherwise wedge the queue.
+    fn pollable_input_len(&self, capacity: usize) -> usize {
+        let available = capacity.min(self.input.len());
+        if capacity < 2 || available == 0 {
+            return available;
+        }
+        let last = &self.input[available - 1];
+        if matches!(
+            last[0],
+            ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
+        ) && last[1] == ui::INPUT_INSETS_HORIZONTAL
+        {
+            return available - 1;
+        }
+        available
     }
 
     fn queue_ui_semantics(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -695,6 +734,46 @@ impl HostState {
         self.truapi_response_bytes += bytes.len();
         self.truapi_responses.push_back(bytes);
         Ok(())
+    }
+}
+
+/// True for records the guest can lose without losing state: a pointer sample
+/// is superseded by the next one and wheel deltas are accumulated by the Host.
+fn is_discardable_input(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
+    matches!(
+        record[0],
+        value if value == InputEventType::PointerMove as u8
+            || value == InputEventType::PointerDelta as u8
+            || value == ui::INPUT_WHEEL
+    )
+}
+
+/// Classifies a batch that carries viewport insets.
+///
+/// Returns the inset event type when `records` is exactly one well-formed
+/// update — the horizontal record followed by the vertical record of a single
+/// type — `None` when the batch carries no insets at all, and an error for any
+/// other shape. Only the complete ordered pair supersedes the queued update, so
+/// a batch this function cannot classify would accumulate instead of coalescing.
+fn inset_pair_type(records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<Option<u8>> {
+    let carries_insets = records.iter().any(|record| {
+        matches!(
+            record[0],
+            ui::INPUT_SAFE_AREA_INSETS | ui::INPUT_KEYBOARD_INSETS
+        )
+    });
+    if !carries_insets {
+        return Ok(None);
+    }
+    match records {
+        [horizontal, vertical]
+            if horizontal[0] == vertical[0]
+                && horizontal[1] == ui::INPUT_INSETS_HORIZONTAL
+                && vertical[1] == ui::INPUT_INSETS_VERTICAL =>
+        {
+            Ok(Some(horizontal[0]))
+        }
+        _ => bail!("viewport insets must be queued as one horizontal and vertical pair"),
     }
 }
 
@@ -1092,8 +1171,9 @@ impl Runtime {
                  pointer: u32,
                  capacity: u32|
                  -> Result<u32> {
-                    let event_count =
-                        (capacity as usize / INPUT_EVENT_BYTES).min(caller.user_data.input.len());
+                    let event_count = caller
+                        .user_data
+                        .pollable_input_len(capacity as usize / INPUT_EVENT_BYTES);
                     let byte_count = event_count
                         .checked_mul(INPUT_EVENT_BYTES)
                         .ok_or_else(|| anyhow!("input byte count overflow"))?;
@@ -2113,34 +2193,107 @@ mod tests {
             InputEventType::SurfaceMetrics as u8
         );
     }
-    #[test]
-    fn failed_atomic_inset_update_preserves_the_previous_records() {
-        let mut state = HostState::new(
+
+    fn test_state() -> HostState {
+        HostState::new(
             HashMap::new(),
             PresentationProfile::Framebuffer,
             false,
             false,
             false,
-        );
-        let key = InputEvent {
+        )
+    }
+
+    fn key_record() -> [u8; INPUT_EVENT_BYTES] {
+        InputEvent {
             event_type: InputEventType::KeyDown,
             code: 0,
             x: 0,
             y: 0,
         }
-        .encode();
-        state
-            .input
-            .extend(core::iter::repeat_n(key, MAX_QUEUED_INPUT_EVENTS - 1));
-        state
-            .queue_input_record(ui::safe_area_insets_records(10, 20, 30, 40)[0])
-            .unwrap();
+        .encode()
+    }
+
+    fn pointer_record() -> [u8; INPUT_EVENT_BYTES] {
+        InputEvent {
+            event_type: InputEventType::PointerMove,
+            code: 0,
+            x: 1,
+            y: 1,
+        }
+        .encode()
+    }
+
+    #[test]
+    fn a_single_inset_axis_is_rejected() {
+        let mut state = test_state();
+        let [horizontal, vertical] = ui::safe_area_insets_records(10, 20, 30, 40);
+
+        assert!(state.queue_input_record(horizontal).is_err());
+        assert!(state.queue_input_records(&[horizontal]).is_err());
+        assert!(state.queue_input_records(&[vertical, horizontal]).is_err());
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn failed_atomic_inset_update_preserves_the_previous_records() {
+        let mut state = test_state();
+        state.input.extend(core::iter::repeat_n(
+            key_record(),
+            MAX_QUEUED_INPUT_EVENTS - 1,
+        ));
         let before = state.input.clone();
 
         assert!(state
             .queue_input_records(&ui::safe_area_insets_records(50, 60, 70, 80))
             .is_err());
         assert_eq!(state.input, before);
+    }
+
+    #[test]
+    fn a_saturated_queue_gives_up_pointer_samples_for_an_inset_update() {
+        let mut state = test_state();
+        state
+            .input
+            .extend(core::iter::repeat_n(pointer_record(), 2));
+        state.input.extend(core::iter::repeat_n(
+            key_record(),
+            MAX_QUEUED_INPUT_EVENTS - 2,
+        ));
+
+        state
+            .queue_input_records(&ui::safe_area_insets_records(1, 2, 3, 4))
+            .expect("an inset update outranks queued pointer samples");
+
+        assert_eq!(state.input.len(), MAX_QUEUED_INPUT_EVENTS);
+        assert!(!state
+            .input
+            .iter()
+            .any(|record| record[0] == InputEventType::PointerMove as u8));
+        assert_eq!(
+            state
+                .input
+                .iter()
+                .filter(|record| record[0] == ui::INPUT_SAFE_AREA_INSETS)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_poll_never_splits_an_inset_pair() {
+        let mut state = test_state();
+        state.input.push_back(key_record());
+        state
+            .queue_input_records(&ui::safe_area_insets_records(1, 2, 3, 4))
+            .unwrap();
+
+        // The buffer ends between the two halves, so only the key is delivered.
+        assert_eq!(state.pollable_input_len(2), 1);
+        // Room for the whole pair delivers everything.
+        assert_eq!(state.pollable_input_len(3), 3);
+        // A one-record buffer would never make progress, so it tears instead.
+        assert_eq!(state.pollable_input_len(1), 1);
     }
 
     #[test]

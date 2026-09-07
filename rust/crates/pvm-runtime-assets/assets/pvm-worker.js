@@ -19,6 +19,10 @@
   const MOTION_ERROR_INVALID_GUEST_RANGE = -3;
   const MOTION_ERROR_BUFFER_TOO_SMALL = -4;
   const INPUT_POINTER_CAPTURE = 15;
+  const INPUT_SAFE_AREA_INSETS = 16;
+  const INPUT_KEYBOARD_INSETS = 17;
+  const INPUT_INSETS_HORIZONTAL = 0;
+  const INPUT_INSETS_VERTICAL = 1;
   const POINTER_CAPTURE_IMPORT = "host_pointer_capture";
   const POINTER_CAPTURE_RELEASE = 0;
   const POINTER_CAPTURE_ARM = 1;
@@ -215,7 +219,9 @@
         return null;
       }
       ime = { rect, cursorRect };
-    } else if (bytes.subarray(16, UI_OUTPUT_HEADER_BYTES).some((byte) => byte)) {
+    } else if (
+      bytes.subarray(16, UI_OUTPUT_HEADER_BYTES).some((byte) => byte)
+    ) {
       return null;
     }
 
@@ -726,6 +732,58 @@
       }
     }
 
+    /**
+     * Queues one viewport-inset update as the pair the guest ABI defines.
+     *
+     * The two records carry one axis each, so they are queued together and
+     * supersede the queued update of the same type: a guest must never read a
+     * new axis beside the previous update's other axis. CoreVM guests have no
+     * inset records, so the update is dropped for them.
+     */
+    sendViewInsets(eventType, left, top, right, bottom) {
+      if (this.stopped || this.coreVm) {
+        return;
+      }
+      const horizontal = new Uint8Array(INPUT_EVENT_BYTES);
+      horizontal[0] = eventType;
+      horizontal[1] = INPUT_INSETS_HORIZONTAL;
+      const vertical = new Uint8Array(INPUT_EVENT_BYTES);
+      vertical[0] = eventType;
+      vertical[1] = INPUT_INSETS_VERTICAL;
+      const horizontalView = new DataView(horizontal.buffer);
+      horizontalView.setUint16(2, left, true);
+      horizontalView.setUint16(4, right, true);
+      const verticalView = new DataView(vertical.buffer);
+      verticalView.setUint16(2, top, true);
+      verticalView.setUint16(4, bottom, true);
+      this.input = this.input.filter((record) => record[0] !== eventType);
+      while (this.input.length > MAX_INPUT_EVENTS - 2) {
+        this.input.shift();
+      }
+      this.input.push(horizontal, vertical);
+    }
+
+    /**
+     * How many queued records a guest buffer of `slots` records receives.
+     *
+     * A buffer that ends between the two halves of an inset update would hand
+     * the guest a new axis beside a stale one, so the pair waits for the next
+     * poll. A buffer too small to ever hold both is served as-is rather than
+     * stalling behind a pair it can never take.
+     */
+    pollableInputCount(slots) {
+      const available = Math.min(slots, this.input.length);
+      if (slots < 2 || available === 0) {
+        return available;
+      }
+      const last = this.input[available - 1];
+      const startsPair =
+        (last[0] === INPUT_SAFE_AREA_INSETS ||
+          last[0] === INPUT_KEYBOARD_INSETS) &&
+        last[1] === INPUT_INSETS_HORIZONTAL;
+      return startsPair ? available - 1 : available;
+    }
+
     setMotionAvailability(availability) {
       if (
         !Number.isInteger(availability) ||
@@ -891,7 +949,6 @@
         this.#setReg(8, normalized >> 32n);
       }
     }
-
 
     #u32(value) {
       return Number(value & 0xffffffffn) >>> 0;
@@ -1068,10 +1125,7 @@
         }
         case "host_ui_output_submit": {
           const length = this.#u32(a1);
-          if (
-            length < UI_OUTPUT_HEADER_BYTES ||
-            length > MAX_UI_OUTPUT_BYTES
-          ) {
+          if (length < UI_OUTPUT_HEADER_BYTES || length > MAX_UI_OUTPUT_BYTES) {
             this.#setReg(7, 1n);
             return false;
           }
@@ -1186,10 +1240,8 @@
         }
         case "host_poll_input": {
           const capacity = this.#u32(a1);
-          const count = Math.min(
-            Math.floor(capacity / INPUT_EVENT_BYTES),
-            this.input.length,
-          );
+          const slots = Math.floor(capacity / INPUT_EVENT_BYTES);
+          const count = this.pollableInputCount(slots);
           const output = new Uint8Array(count * INPUT_EVENT_BYTES);
           for (let index = 0; index < count; index++) {
             output.set(this.input.shift(), index * INPUT_EVENT_BYTES);
@@ -1844,6 +1896,13 @@ globalThis.createPvmRuntime = (endpoint) => {
   const MAX_ASSET_FILE_BYTES = 128 * 1024 * 1024;
   const MAX_ASSET_BYTES = 256 * 1024 * 1024;
   const MOTION_SAMPLE_BYTES = 48;
+  // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
+  // update carry a single axis, so a Host sends them through the dedicated
+  // `view-insets` message that queues the pair together; the runtime rejects a
+  // lone axis arriving as an ordinary input record.
+  const INPUT_SAFE_AREA_INSETS = 16;
+  const INPUT_KEYBOARD_INSETS = 17;
+  const MAX_INSET_PIXELS = 65535;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -2432,7 +2491,18 @@ globalThis.createPvmRuntime = (endpoint) => {
   }
 
   function sendInput(bytes) {
-    if (!running || bytes.byteLength !== 8) {
+    if (bytes.byteLength !== 8) {
+      return;
+    }
+    if (
+      bytes[0] === INPUT_SAFE_AREA_INSETS ||
+      bytes[0] === INPUT_KEYBOARD_INSETS
+    ) {
+      throw new Error(
+        "viewport insets must be sent with the view-insets message",
+      );
+    }
+    if (!running) {
       return;
     }
     if (translated) {
@@ -2440,7 +2510,11 @@ globalThis.createPvmRuntime = (endpoint) => {
       return;
     }
     if (bytes[0] <= 7) {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const view = new DataView(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength,
+      );
       check(
         pvm.pvm_browser_send_input(
           bytes[0],
@@ -2456,6 +2530,34 @@ globalThis.createPvmRuntime = (endpoint) => {
     check(
       pvm.pvm_browser_send_input_record(),
       "send PolkaVM browser extended input",
+    );
+  }
+
+  function sendViewInsets(eventType, left, top, right, bottom) {
+    if (
+      eventType !== INPUT_SAFE_AREA_INSETS &&
+      eventType !== INPUT_KEYBOARD_INSETS
+    ) {
+      throw new Error("invalid PolkaVM browser inset event type");
+    }
+    for (const value of [left, top, right, bottom]) {
+      if (!Number.isInteger(value) || value < 0 || value > MAX_INSET_PIXELS) {
+        throw new Error("invalid PolkaVM browser inset value");
+      }
+    }
+    if (!running) {
+      return;
+    }
+    if (translated) {
+      translated.sendViewInsets(eventType, left, top, right, bottom);
+      return;
+    }
+    if (typeof pvm.pvm_browser_send_view_insets !== "function") {
+      throw new Error("PolkaVM browser runtime has an incompatible ABI");
+    }
+    check(
+      pvm.pvm_browser_send_view_insets(eventType, left, top, right, bottom),
+      "send PolkaVM browser view insets",
     );
   }
 
@@ -2592,6 +2694,20 @@ globalThis.createPvmRuntime = (endpoint) => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "view-insets") {
+      try {
+        sendViewInsets(
+          message.eventType,
+          message.left,
+          message.top,
+          message.right,
+          message.bottom,
+        );
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
