@@ -187,6 +187,32 @@ The call reads the oldest queued WebGPU event.
      GPU error defined by the selected WebGPU contract
 ```
 
+#### Device loss and restoration
+
+A browser or driver may take the GPU device away at any time — a driver reset,
+a backgrounded tab, memory pressure — and the App did nothing wrong when it
+happens. The Host reports the transition through two events:
+
+```text
+7  device lost
+8  device restored
+```
+
+On `device lost` every resource handle the guest holds is dead and every
+in-flight submission is abandoned; the Host will not accept batches until the
+device comes back. A Host that can rebuild the device MUST then publish fresh
+capabilities through `host_gpu_capabilities` and emit `device restored`; the
+guest re-reads capabilities, re-creates its resources with the handles it
+wants, and resumes drawing. The surface generation and device generation in the
+capabilities record both identify the new device, so a guest that caches either
+can detect the change.
+
+A guest MUST NOT treat `device lost` as fatal on its own. A Host that cannot
+rebuild the device emits no `device restored` and terminates the application
+through its ordinary lifecycle, which is the Host's decision to make, not a
+trap the guest raises. A Host MUST bound its rebuild attempts so a permanently
+broken adapter cannot loop.
+
 ### Host-frame transport
 
 Every ABI v1 application receives a bounded transport for opaque request and
