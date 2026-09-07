@@ -3,9 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
-    INPUT_EVENT_BYTES,
+    keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, Frame,
+    GpuBatch, InputEvent, InputEventType, PresentationProfile, TextInputKind, Tri2dFrame,
+    UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
 };
 #[cfg(feature = "native-gpu")]
 use crate::{NativeGpuFrame, NativeGpuRenderer};
@@ -321,6 +321,30 @@ impl NativePvmRuntime {
         })?;
         self.lock()?
             .send_input_record(record)
+            .map_err(NativePvmError::runtime)
+    }
+
+    pub fn send_safe_area_insets(
+        &self,
+        left: u16,
+        top: u16,
+        right: u16,
+        bottom: u16,
+    ) -> Result<(), NativePvmError> {
+        self.lock()?
+            .send_input_records(&safe_area_insets_records(left, top, right, bottom))
+            .map_err(NativePvmError::runtime)
+    }
+
+    pub fn send_keyboard_insets(
+        &self,
+        left: u16,
+        top: u16,
+        right: u16,
+        bottom: u16,
+    ) -> Result<(), NativePvmError> {
+        self.lock()?
+            .send_input_records(&keyboard_insets_records(left, top, right, bottom))
             .map_err(NativePvmError::runtime)
     }
 

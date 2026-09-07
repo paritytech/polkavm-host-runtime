@@ -3,8 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
-    PresentationProfile, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
+    keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, Frame,
+    GpuBatch, InputEvent, InputEventType, PresentationProfile, Tri2dFrame, UiOutputFrame,
+    UiSemanticsFrame, INPUT_EVENT_BYTES, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS,
     MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
 };
 use anyhow::{anyhow, Result};
@@ -393,6 +394,28 @@ pub extern "C" fn pvm_browser_send_input_record() -> u32 {
             .try_into()
             .map_err(|_| anyhow!("extended input record must contain {INPUT_EVENT_BYTES} bytes"))?;
         host.running()?.send_input_record(record)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn pvm_browser_send_view_insets(
+    event_type: u32,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+) -> u32 {
+    status(|host| {
+        let left = u16::try_from(left).map_err(|_| anyhow!("left inset exceeds u16"))?;
+        let top = u16::try_from(top).map_err(|_| anyhow!("top inset exceeds u16"))?;
+        let right = u16::try_from(right).map_err(|_| anyhow!("right inset exceeds u16"))?;
+        let bottom = u16::try_from(bottom).map_err(|_| anyhow!("bottom inset exceeds u16"))?;
+        let records = match u8::try_from(event_type) {
+            Ok(INPUT_SAFE_AREA_INSETS) => safe_area_insets_records(left, top, right, bottom),
+            Ok(INPUT_KEYBOARD_INSETS) => keyboard_insets_records(left, top, right, bottom),
+            _ => return Err(anyhow!("invalid PolkaVM browser inset event type")),
+        };
+        host.running()?.send_input_records(&records)
     })
 }
 

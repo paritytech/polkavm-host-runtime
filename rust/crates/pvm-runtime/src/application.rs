@@ -185,6 +185,13 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn send_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_input_records(records),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support extended input records")),
+        }
+    }
+
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_text_input(kind, text),

@@ -269,6 +269,8 @@ ABI v1 event types are:
 13  focus (`code` is 0 or 1)
 14  wheel delta (`x` and `y` are signed i16)
 15  pointer capture (`code` is 0 or 1)
+16  safe-area inset pair (`code` is 0 or 1)
+17  virtual-keyboard occlusion inset pair (`code` is 0 or 1)
 ```
 
 Pointer button, position, and delta records are baseline optional input. An App
@@ -277,6 +279,33 @@ pointer source simply emits no pointer records, and that absence is not a
 launch failure. Pointer capture is Host policy and is never selected by the
 manifest. The guest arms capture through the pointer-capture hostcall below,
 and the Host decides when an activation is eligible.
+
+Safe-area and virtual-keyboard occlusion values are unsigned physical pixels
+measured inward from the current render-surface edges. Each complete update is
+an atomic pair:
+
+```text
+code  x       y
+0     left    right
+1     top     bottom
+```
+
+Bytes 6–7 are zero. The record with `code` 0 MUST precede the record with
+`code` 1, and the Host MUST queue both records together whenever one source
+changes and after surface metrics change: the runtime rejects a lone record and
+delivers a queued pair in one poll unless the guest's buffer is smaller than
+two records. `left` plus `right` MUST NOT exceed the surface width and `top`
+plus `bottom` MUST NOT exceed the surface height, so a guest can subtract them
+without producing an inverted rectangle. A Host that cannot observe a source
+emits no records for it; the guest treats an absent source as four zero insets.
+A Host that has emitted a non-zero pair MUST emit a zero pair once that source
+stops occluding the surface — a dismissed keyboard or a rotation that removes a
+cutout — because the guest keeps the last pair it received until then.
+Virtual-keyboard insets describe the edge-connected occlusion while a
+Host-owned text-input agent is active. A floating keyboard that touches no
+surface edge is not representable and does not reduce the rectangular content
+area. Safe-area and keyboard values remain separate so a guest can diagnose
+each source and combine them without double-counting overlap.
 
 Text and IME records use `code` bits 0–2 as a payload length from zero through
 six, bit 6 for the first chunk, and bit 7 for the last chunk. Bytes 2–7 contain
