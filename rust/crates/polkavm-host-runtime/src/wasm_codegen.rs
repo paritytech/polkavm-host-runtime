@@ -9,7 +9,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use polkavm::program::{Instruction as PvmInstruction, ParsedInstruction, RawReg};
 use polkavm::{MemoryMapBuilder, ProgramBlob, Reg, RETURN_TO_HOST};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
@@ -24,11 +23,18 @@ const STATUS_TRAP: i32 = -3;
 const STATUS_OUT_OF_GAS: i32 = -4;
 const REGISTER_COUNT: u32 = 13;
 
+// Keep both the dispatch nesting and the worst-case function body bounded. A
+// PolkaVM block can be arbitrarily long; splitting it must not add gas charges.
+const BLOCKS_PER_FUNCTION: usize = 128;
+const INSTRUCTIONS_PER_BLOCK: usize = 16;
+const RESOLVERS_PER_FUNCTION: usize = 128;
+
 const TYPE_BLOCK: u32 = 0;
 const TYPE_BINARY_I64: u32 = 1;
 const TYPE_BEGIN: u32 = 2;
 const TYPE_SET_GAS: u32 = 3;
 const TYPE_UNARY_I64: u32 = 4;
+const TYPE_RESOLVER: u32 = 5;
 
 const GLOBAL_PC: u32 = REGISTER_COUNT;
 const GLOBAL_GAS: u32 = GLOBAL_PC + 1;
@@ -101,7 +107,9 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     let layout = build_layout(&blob)?;
     let targets = collect_block_targets(&blob, &instructions)?;
     let (blocks, block_by_pc) = build_blocks(&instructions, &targets)?;
-    let jump_targets: Vec<_> = blob.jump_table().into_iter().collect();
+    let jump_targets = blob.jump_table();
+    let block_group_count = blocks.len().div_ceil(BLOCKS_PER_FUNCTION) as u32;
+    let resolver_group_count = jump_targets.len().div_ceil(RESOLVERS_PER_FUNCTION as u32);
 
     let mut module = Module::new();
     let mut types = TypeSection::new();
@@ -114,12 +122,13 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
         .function([ValType::I32, ValType::I64], [ValType::I32]);
     types.ty().function([ValType::I64], []);
     types.ty().function([ValType::I64], [ValType::I64]);
+    types.ty().function([ValType::I32], [ValType::I32]);
     module.section(&types);
 
     let helper_count = 3u32;
     let block_base = helper_count;
-    let resolver_base = block_base + blocks.len() as u32;
-    let dispatcher_index = resolver_base + jump_targets.len() as u32;
+    let resolver_base = block_base + block_group_count;
+    let dispatcher_index = resolver_base + resolver_group_count;
     let begin_index = dispatcher_index + 1;
     let set_gas_index = begin_index + 1;
 
@@ -127,11 +136,11 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     functions.function(TYPE_BINARY_I64);
     functions.function(TYPE_UNARY_I64);
     functions.function(TYPE_UNARY_I64);
-    for _ in &blocks {
+    for _ in 0..block_group_count {
         functions.function(TYPE_BLOCK);
     }
-    for _ in &jump_targets {
-        functions.function(TYPE_BLOCK);
+    for _ in 0..resolver_group_count {
+        functions.function(TYPE_RESOLVER);
     }
     functions.function(TYPE_BLOCK);
     functions.function(TYPE_BEGIN);
@@ -141,8 +150,8 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     let mut table = TableSection::new();
     table.table(TableType {
         element_type: RefType::FUNCREF,
-        minimum: (blocks.len() + jump_targets.len()) as u64,
-        maximum: Some((blocks.len() + jump_targets.len()) as u64),
+        minimum: u64::from(block_group_count + resolver_group_count),
+        maximum: Some(u64::from(block_group_count + resolver_group_count)),
         table64: false,
         shared: false,
     });
@@ -213,8 +222,7 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     exports.export("trap_pc", ExportKind::Global, GLOBAL_TRAP_PC);
     module.section(&exports);
 
-    let table_functions: Vec<u32> =
-        (block_base..resolver_base + jump_targets.len() as u32).collect();
+    let table_functions: Vec<u32> = (block_base..dispatcher_index).collect();
     let mut elements = ElementSection::new();
     elements.active(
         Some(0),
@@ -231,32 +239,42 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     let context = EmitContext {
         layout,
         block_by_pc: &block_by_pc,
-        jump_table_len: jump_targets.len() as u32,
-        resolver_table_base: blocks.len() as u32,
+        jump_table_len: jump_targets.len(),
+        resolver_table_base: block_group_count,
         block_function_base: block_base,
+        control_targets: &targets,
         mulhu_function: 0,
         bswap32_function: 1,
         metered_targets: &metered_targets,
         bswap64_function: 2,
         is_64_bit: blob.is_64_bit(),
     };
-    for block in &blocks {
-        code.function(&emit_block(&context, block)?);
+    for group in blocks.chunks(BLOCKS_PER_FUNCTION) {
+        code.function(&emit_block_group(&context, group)?);
     }
-    for target in &jump_targets {
+    for start in (0..jump_targets.len()).step_by(RESOLVERS_PER_FUNCTION) {
+        let count = (jump_targets.len() - start).min(RESOLVERS_PER_FUNCTION as u32);
         let mut function = Function::new([]);
-        function.instruction(&W::I32Const(
-            block_by_pc
-                .get(&target.0)
-                .copied()
-                .map(|index| index as i32)
-                .unwrap_or(STATUS_TRAP),
-        ));
+        emit_switch(&mut function, count as usize, 0, RESOLVERS_PER_FUNCTION);
+        for index in start..start + count {
+            let target = jump_targets
+                .get_by_index(index)
+                .expect("jump table index is in bounds");
+            function.instruction(&W::End);
+            function.instruction(&W::I32Const(
+                block_by_pc
+                    .get(target.0)
+                    .expect("validated jump target has a block") as i32,
+            ));
+            function.instruction(&W::Return);
+        }
+        function.instruction(&W::End);
+        function.instruction(&W::Unreachable);
         function.instruction(&W::End);
         code.function(&function);
     }
-    code.function(&emit_dispatcher());
-    code.function(&emit_begin());
+    code.function(&emit_dispatcher(blocks.len() as u32));
+    code.function(&emit_begin(dispatcher_index));
     code.function(&emit_set_gas());
     module.section(&code);
 
@@ -396,77 +414,95 @@ fn direct_target(kind: PvmInstruction) -> Option<u32> {
 fn collect_block_targets(
     blob: &ProgramBlob,
     instructions: &[ParsedInstruction],
-) -> Result<BTreeSet<u32>> {
-    let valid: BTreeSet<_> = instructions
-        .iter()
-        .map(|instruction| instruction.offset.0)
-        .collect();
-    let mut targets = BTreeSet::from([instructions[0].offset.0]);
-    for export in blob.exports() {
-        targets.insert(export.program_counter().0);
-    }
-    for target in blob.jump_table() {
-        targets.insert(target.0);
-    }
+) -> Result<Vec<u32>> {
+    // Flat sorted indexes avoid a tree node and a second instruction allocation
+    // for each of the millions of blocks in a large guest.
+    let mut targets = vec![instructions[0].offset.0];
+    targets.extend(blob.exports().map(|export| export.program_counter().0));
+    targets.extend(blob.jump_table().into_iter().map(|target| target.0));
     for instruction in instructions {
         if let Some(target) = direct_target(instruction.kind) {
-            targets.insert(target);
+            targets.push(target);
         }
-        if is_terminator(instruction.kind) && valid.contains(&instruction.next_offset.0) {
-            targets.insert(instruction.next_offset.0);
+        if is_terminator(instruction.kind)
+            && instruction.next_offset.0 <= instructions.last().unwrap().offset.0
+        {
+            targets.push(instruction.next_offset.0);
         }
     }
-    if let Some(invalid) = targets.iter().find(|target| !valid.contains(target)) {
-        bail!("PolkaVM control-flow target {invalid} is not an instruction");
+    targets.sort_unstable();
+    targets.dedup();
+    for &target in &targets {
+        if instructions
+            .binary_search_by_key(&target, |instruction| instruction.offset.0)
+            .is_err()
+        {
+            bail!("PolkaVM control-flow target {target} is not an instruction");
+        }
     }
     Ok(targets)
 }
 
-type BlockLayout = (Vec<Vec<ParsedInstruction>>, BTreeMap<u32, u32>);
-
-fn build_blocks(
-    instructions: &[ParsedInstruction],
-    targets: &BTreeSet<u32>,
-) -> Result<BlockLayout> {
-    let mut blocks = Vec::new();
-    let mut current = Vec::new();
-    for instruction in instructions {
-        if targets.contains(&instruction.offset.0) && !current.is_empty() {
-            blocks.push(std::mem::take(&mut current));
-        }
-        current.push(*instruction);
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-    let mut block_by_pc = BTreeMap::new();
-    for (index, block) in blocks.iter().enumerate() {
-        block_by_pc.insert(block[0].offset.0, index as u32);
-    }
-    Ok((blocks, block_by_pc))
+struct BlockMap {
+    pcs: Vec<u32>,
 }
 
-fn collect_metered_targets(instructions: &[ParsedInstruction]) -> BTreeSet<u32> {
-    let mut targets = BTreeSet::new();
+impl BlockMap {
+    fn get(&self, pc: u32) -> Option<u32> {
+        self.pcs.binary_search(&pc).ok().map(|index| index as u32)
+    }
+}
+
+type BlockLayout<'a> = (Vec<&'a [ParsedInstruction]>, BlockMap);
+
+fn build_blocks<'a>(
+    instructions: &'a [ParsedInstruction],
+    targets: &[u32],
+) -> Result<BlockLayout<'a>> {
+    let mut blocks = Vec::new();
+    let mut pcs = Vec::new();
+    let mut start = 0;
+    let mut next_target = 1;
+    for index in 1..instructions.len() {
+        let is_target = targets.get(next_target) == Some(&instructions[index].offset.0);
+        if is_target {
+            next_target += 1;
+        }
+        if is_target || index - start == INSTRUCTIONS_PER_BLOCK {
+            pcs.push(instructions[start].offset.0);
+            blocks.push(&instructions[start..index]);
+            start = index;
+        }
+    }
+    pcs.push(instructions[start].offset.0);
+    blocks.push(&instructions[start..]);
+    Ok((blocks, BlockMap { pcs }))
+}
+
+fn collect_metered_targets(instructions: &[ParsedInstruction]) -> Vec<u32> {
+    let mut targets = Vec::new();
     for instruction in instructions {
         if let Some(target) = direct_target(instruction.kind) {
             if target <= instruction.offset.0 {
-                targets.insert(target);
+                targets.push(target);
             }
         }
     }
+    targets.sort_unstable();
+    targets.dedup();
     targets
 }
 
 struct EmitContext<'a> {
     layout: Layout,
-    block_by_pc: &'a BTreeMap<u32, u32>,
+    block_by_pc: &'a BlockMap,
     jump_table_len: u32,
     resolver_table_base: u32,
     block_function_base: u32,
+    control_targets: &'a [u32],
     mulhu_function: u32,
     bswap32_function: u32,
-    metered_targets: &'a BTreeSet<u32>,
+    metered_targets: &'a [u32],
     bswap64_function: u32,
     is_64_bit: bool,
 }
@@ -583,18 +619,31 @@ fn emit_bswap64() -> Function {
     f
 }
 
-fn emit_dispatcher() -> Function {
+fn emit_dispatcher(block_count: u32) -> Function {
     let mut f = Function::new([]);
     f.instruction(&W::GlobalGet(GLOBAL_PC));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::I32Const(block_count as i32));
+    f.instruction(&W::I32GeU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::I32Const(STATUS_TRAP));
+    f.instruction(&W::Return);
+    f.instruction(&W::End);
+    emit_dispatch_from_pc(&mut f);
     f.instruction(&W::End);
     f
 }
 
-fn emit_begin() -> Function {
+fn emit_dispatch_from_pc(f: &mut Function) {
+    f.instruction(&W::GlobalGet(GLOBAL_PC));
+    f.instruction(&W::I32Const(BLOCKS_PER_FUNCTION.trailing_zeros() as i32));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::ReturnCallIndirect {
+        type_index: TYPE_BLOCK,
+        table_index: 0,
+    });
+}
+
+fn emit_begin(dispatcher_index: u32) -> Function {
     let mut f = Function::new([]);
     f.instruction(&W::I64Const(RETURN_TO_HOST as i64));
     f.instruction(&W::GlobalSet(Reg::RA.to_u32()));
@@ -602,11 +651,7 @@ fn emit_begin() -> Function {
     f.instruction(&W::GlobalSet(GLOBAL_PC));
     f.instruction(&W::LocalGet(1));
     f.instruction(&W::GlobalSet(GLOBAL_GAS));
-    f.instruction(&W::LocalGet(0));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::ReturnCall(dispatcher_index));
     f.instruction(&W::End);
     f
 }
@@ -619,11 +664,7 @@ fn emit_set_gas() -> Function {
     f
 }
 
-fn encode_metadata(
-    blob: &ProgramBlob,
-    block_by_pc: &BTreeMap<u32, u32>,
-    layout: Layout,
-) -> Result<Vec<u8>> {
+fn encode_metadata(blob: &ProgramBlob, block_by_pc: &BlockMap, layout: Layout) -> Result<Vec<u8>> {
     let mut bytes = b"EPM2".to_vec();
     bytes.extend_from_slice(&u32::from(blob.is_64_bit()).to_le_bytes());
     for value in [
@@ -663,8 +704,7 @@ fn encode_metadata(
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.extend_from_slice(name);
         let block = block_by_pc
-            .get(&export.program_counter().0)
-            .copied()
+            .get(export.program_counter().0)
             .ok_or_else(|| anyhow!("export target is not a translated block"))?;
         bytes.extend_from_slice(&block.to_le_bytes());
     }
@@ -686,20 +726,49 @@ fn emit_gas_charge(f: &mut Function) {
     f.instruction(&W::End);
 }
 
-fn emit_block(context: &EmitContext<'_>, block: &[ParsedInstruction]) -> Result<Function> {
-    let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
-    if context.metered_targets.contains(&block[0].offset.0) {
-        emit_gas_charge(&mut f);
+// Emit a bounded br_table switch. The extra outer label is the invalid selector
+// path; callers emit one End and one terminating case per entry, then close it.
+fn emit_switch(f: &mut Function, count: usize, local: u32, capacity: usize) {
+    for _ in 0..=count {
+        f.instruction(&W::Block(BlockType::Empty));
     }
+    f.instruction(&W::LocalGet(local));
+    f.instruction(&W::I32Const((capacity - 1) as i32));
+    f.instruction(&W::I32And);
+    let labels: Vec<u32> = (0..count as u32).collect();
+    f.instruction(&W::BrTable(Cow::Owned(labels), count as u32));
+}
 
-    for instruction in block {
-        if emit_instruction(context, &mut f, instruction)? {
-            f.instruction(&W::End);
-            return Ok(f);
+fn emit_block_group(
+    context: &EmitContext<'_>,
+    blocks: &[&[ParsedInstruction]],
+) -> Result<Function> {
+    let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
+    f.instruction(&W::GlobalGet(GLOBAL_PC));
+    f.instruction(&W::LocalSet(LOCAL_ADDR));
+    emit_switch(&mut f, blocks.len(), LOCAL_ADDR, BLOCKS_PER_FUNCTION);
+    for block in blocks {
+        f.instruction(&W::End);
+        if context
+            .metered_targets
+            .binary_search(&block[0].offset.0)
+            .is_ok()
+        {
+            emit_gas_charge(&mut f);
+        }
+        let mut terminated = false;
+        for instruction in *block {
+            if emit_instruction(context, &mut f, instruction)? {
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            emit_block_target(context, &mut f, block.last().unwrap().next_offset.0)?;
         }
     }
-    let next = block.last().unwrap().next_offset.0;
-    emit_block_target(context, &mut f, next)?;
+    f.instruction(&W::End);
+    f.instruction(&W::Unreachable);
     f.instruction(&W::End);
     Ok(f)
 }
@@ -707,10 +776,13 @@ fn emit_block(context: &EmitContext<'_>, block: &[ParsedInstruction]) -> Result<
 fn emit_block_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Result<()> {
     let target = context
         .block_by_pc
-        .get(&pc)
-        .copied()
+        .get(pc)
         .ok_or_else(|| anyhow!("translated fallthrough target {pc} is missing"))?;
-    f.instruction(&W::ReturnCall(context.block_function_base + target));
+    f.instruction(&W::I32Const(target as i32));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
+    f.instruction(&W::ReturnCall(
+        context.block_function_base + target / BLOCKS_PER_FUNCTION as u32,
+    ));
     Ok(())
 }
 
@@ -1089,46 +1161,35 @@ fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32
     f.instruction(&W::If(BlockType::Empty));
     emit_trap(f, pc);
     f.instruction(&W::End);
+    // The resolver takes the full jump-table index and switches on its low
+    // bits. Only one table entry/function is needed per resolver group.
     f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::I32Const(RESOLVERS_PER_FUNCTION.trailing_zeros() as i32));
+    f.instruction(&W::I32ShrU);
     f.instruction(&W::I32Const(context.resolver_table_base as i32));
     f.instruction(&W::I32Add);
     f.instruction(&W::CallIndirect {
-        type_index: TYPE_BLOCK,
+        type_index: TYPE_RESOLVER,
         table_index: 0,
     });
-    f.instruction(&W::LocalSet(LOCAL_ADDR));
-    if meter {
-        let current_block = context
-            .block_by_pc
-            .range(..=pc)
-            .next_back()
-            .map(|(_, index)| *index)
-            .unwrap_or(0);
-        f.instruction(&W::LocalGet(LOCAL_ADDR));
-        f.instruction(&W::I32Const(current_block as i32));
-        f.instruction(&W::I32LeU);
-        f.instruction(&W::If(BlockType::Empty));
-        emit_gas_charge(f);
-        f.instruction(&W::End);
-    } else {
-        let current_block = context
-            .block_by_pc
-            .range(..=pc)
-            .next_back()
-            .map(|(_, index)| *index)
-            .unwrap_or(0);
-        f.instruction(&W::LocalGet(LOCAL_ADDR));
-        f.instruction(&W::I32Const(current_block as i32));
-        f.instruction(&W::I32Eq);
-        f.instruction(&W::If(BlockType::Empty));
-        emit_gas_charge(f);
-        f.instruction(&W::End);
-    }
+    f.instruction(&W::LocalTee(LOCAL_ADDR));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
+    // Resume at the resolved destination, not at the source block: a fused
+    // load-and-jump may already have overwritten the register holding its target.
+    // Compare against the original control-flow block, not an artificial split.
+    let current_pc = context.control_targets[context
+        .control_targets
+        .partition_point(|target| *target <= pc)
+        - 1];
+    let current_block = context.block_by_pc.get(current_pc).unwrap();
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::I32Const(current_block as i32));
+    f.instruction(if meter { &W::I32LeU } else { &W::I32Eq });
+    f.instruction(&W::If(BlockType::Empty));
+    emit_gas_charge(f);
+    f.instruction(&W::End);
+    emit_dispatch_from_pc(f);
 }
 
 fn written_register(kind: PvmInstruction) -> Option<RawReg> {
@@ -1298,8 +1359,7 @@ fn emit_instruction(
             f.instruction(&W::GlobalSet(GLOBAL_ECALL));
             let next = context
                 .block_by_pc
-                .get(&instruction.next_offset.0)
-                .copied()
+                .get(instruction.next_offset.0)
                 .ok_or_else(|| anyhow!("ecall continuation is not a block"))?;
             f.instruction(&W::I32Const(next as i32));
             f.instruction(&W::GlobalSet(GLOBAL_PC));
@@ -2068,13 +2128,17 @@ fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: Raw
 
 #[cfg(test)]
 mod tests {
-    use super::{translate, STATUS_FINISHED};
+    use super::{
+        translate, BLOCKS_PER_FUNCTION, INSTRUCTIONS_PER_BLOCK, STATUS_ECALL, STATUS_FINISHED,
+        STATUS_OUT_OF_GAS, STATUS_TRAP,
+    };
     use polkavm::program::{assemble, InstructionSetKind};
     use polkavm::{
         BackendKind, Config, Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg,
         RETURN_TO_HOST,
     };
-    use wasmi::{Engine as WasmEngine, Linker, Module as WasmModule, Store, Val};
+    use polkavm_common::{program::asm, writer::ProgramBlobBuilder};
+    use wasmi::{Engine as WasmEngine, Instance, Linker, Module as WasmModule, Store, Val};
 
     fn interpreter_registers(program: &[u8]) -> [u64; 13] {
         let blob = ProgramBlob::parse(program.into()).expect("parse differential fixture");
@@ -2101,7 +2165,7 @@ mod tests {
         Reg::ALL.map(|reg| instance.reg(reg))
     }
 
-    fn translated_registers(program: &[u8]) -> [u64; 13] {
+    fn translated_instance(program: &[u8]) -> (Store<()>, Instance) {
         let wasm = translate(program).expect("translate differential fixture");
         let engine = WasmEngine::default();
         let module = WasmModule::new(&engine, &wasm[..]).expect("compile translated fixture");
@@ -2112,6 +2176,11 @@ mod tests {
             .expect("instantiate translated fixture")
             .start(&mut store)
             .expect("start translated fixture");
+        (store, instance)
+    }
+
+    fn translated_registers(program: &[u8]) -> [u64; 13] {
+        let (mut store, instance) = translated_instance(program);
         let begin = instance
             .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
             .expect("translated begin export");
@@ -2255,5 +2324,271 @@ mod tests {
                 ret
             "#,
         );
+    }
+
+    #[test]
+    fn grouped_direct_and_indirect_jumps_match_interpreter() {
+        let count = 2 * BLOCKS_PER_FUNCTION as u32 + 1;
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_export_by_basic_block(count - 1, b"tail");
+        let mut instructions = Vec::new();
+        for index in 0..count {
+            instructions.push(asm::add_imm_64(Reg::A0, Reg::A0, 1));
+            if index + 1 == count {
+                instructions.push(asm::ret());
+            } else if index % 2 == 0 {
+                instructions.push(asm::load_imm(Reg::A1, (2 * (index + 2)) as i32));
+                instructions.push(asm::jump_indirect(Reg::A1, 0));
+            } else {
+                instructions.push(asm::jump(index + 1));
+            }
+        }
+        builder.set_code(&instructions, &(0..count).collect::<Vec<_>>());
+        let program = builder.into_vec().unwrap();
+        assert_eq!(
+            translated_registers(&program),
+            interpreter_registers(&program)
+        );
+
+        // Resource growth is part of the browser contract, not just execution:
+        // a function/table entry per guest block or jump target breaks real apps.
+        let wasm = translate(&program).unwrap();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            match payload.unwrap() {
+                wasmparser::Payload::FunctionSection(section) => {
+                    assert!(section.count() < count / 4);
+                }
+                wasmparser::Payload::TableSection(section) => {
+                    for table in section {
+                        assert!(table.unwrap().ty.initial < u64::from(count / 4));
+                    }
+                }
+                wasmparser::Payload::CustomSection(section)
+                    if section.name() == "epoca.pvm.meta" =>
+                {
+                    // The final EPM2 export is tail. Its token must retain both
+                    // the group and the slot, not merely name a Wasm function.
+                    let data = section.data();
+                    let entry = i32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+                    let (mut store, instance) = translated_instance(&program);
+                    let begin = instance
+                        .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                        .unwrap();
+                    assert_eq!(begin.call(&mut store, (entry, 1)).unwrap(), STATUS_FINISHED);
+                    assert_eq!(
+                        instance
+                            .get_global(&store, Reg::A0.name_non_abi())
+                            .unwrap()
+                            .get(&store)
+                            .i64(),
+                        Some(1),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn long_straight_line_block_crosses_groups_without_charging_gas() {
+        let count = BLOCKS_PER_FUNCTION * INSTRUCTIONS_PER_BLOCK + 1;
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        let mut instructions = vec![asm::add_imm_64(Reg::A0, Reg::A0, 1); count];
+        instructions.push(asm::ret());
+        builder.set_code(&instructions, &[]);
+        let program = builder.into_vec().unwrap();
+        assert_eq!(
+            translated_registers(&program),
+            interpreter_registers(&program)
+        );
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(count as i64),
+        );
+    }
+
+    #[test]
+    fn gas_resume_does_not_restart_the_entrypoint() {
+        let program = assemble(
+            Some(InstructionSetKind::Latest64),
+            r#"
+            %stack_size = 4096
+            pub @main:
+            a0 = 0
+            jump @loop
+            @loop:
+            a0 = a0 + 1
+            jump @loop if a0 <u 3
+            ret
+        "#,
+        )
+        .unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        let gas = instance
+            .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+        gas.call(&mut store, 3).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(2),
+        );
+        gas.call(&mut store, 2).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_FINISHED);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn indirect_gas_resume_preserves_fused_jump_side_effects() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        let mut instructions = vec![
+            asm::jump(2),
+            asm::add_imm_64(Reg::A0, Reg::A0, 1),
+            asm::ret(),
+        ];
+        instructions.extend(std::iter::repeat_n(
+            asm::add_imm_64(Reg::A2, Reg::A2, 1),
+            INSTRUCTIONS_PER_BLOCK + 1,
+        ));
+        instructions.push(asm::load_imm(Reg::A1, 2));
+        instructions.push(asm::load_imm_and_jump_indirect(Reg::A1, Reg::A1, 999, 0));
+        builder.set_code(&instructions, &[1]);
+        let program = builder.into_vec().unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        let gas = instance
+            .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+        gas.call(&mut store, 2).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_FINISHED);
+        for (reg, value) in [
+            (Reg::A0, 1),
+            (Reg::A1, 999),
+            (Reg::A2, INSTRUCTIONS_PER_BLOCK as i64 + 1),
+        ] {
+            assert_eq!(
+                instance
+                    .get_global(&store, reg.name_non_abi())
+                    .unwrap()
+                    .get(&store)
+                    .i64(),
+                Some(value),
+            );
+        }
+    }
+
+    #[test]
+    fn hostcall_resume_across_groups_reports_exact_trap_pc() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_import(b"host_test");
+        let count = BLOCKS_PER_FUNCTION * INSTRUCTIONS_PER_BLOCK;
+        let mut instructions = vec![asm::add_imm_64(Reg::A0, Reg::A0, 1); count];
+        instructions.push(asm::ecalli(0));
+        instructions.push(asm::trap());
+        builder.set_code(&instructions, &[]);
+        let program = builder.into_vec().unwrap();
+        let blob = ProgramBlob::parse((&program[..]).into()).unwrap();
+        let trap_pc = blob
+            .instructions()
+            .find(|instruction| instruction.kind == asm::trap())
+            .unwrap()
+            .offset
+            .0;
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_ECALL);
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_TRAP);
+        assert_eq!(
+            instance
+                .get_global(&store, "trap_pc")
+                .unwrap()
+                .get(&store)
+                .i32(),
+            Some(trap_pc as i32),
+        );
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(count as i64),
+        );
+    }
+
+    #[test]
+    fn indirect_group_padding_is_not_a_valid_jump_target() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.set_code(&[asm::jump_indirect(Reg::A1, 0), asm::ret()], &vec![1; 129]);
+        let program = builder.into_vec().unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let target = instance.get_global(&store, Reg::A1.name_non_abi()).unwrap();
+        for address in [0, 1, 260] {
+            target.set(&mut store, Val::I64(address)).unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_TRAP);
+            assert_eq!(
+                instance
+                    .get_global(&store, "trap_pc")
+                    .unwrap()
+                    .get(&store)
+                    .i32(),
+                Some(0)
+            );
+        }
+        for address in [2, 258, RETURN_TO_HOST as i64] {
+            target.set(&mut store, Val::I64(address)).unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+        }
     }
 }

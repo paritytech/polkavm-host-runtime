@@ -224,7 +224,7 @@ function validationEngine() {
   });
 }
 
-function commands(items) {
+function commands(items, sequence = 1n) {
   const commandBytes = items.reduce(
     (total, [, payload]) => total + 8 + payload.byteLength,
     0,
@@ -235,7 +235,7 @@ function commands(items) {
   view.setUint16(4, 1, true);
   view.setUint32(8, bytes.byteLength, true);
   view.setUint32(12, items.length, true);
-  view.setBigUint64(16, 1n, true);
+  view.setBigUint64(16, sequence, true);
   let offset = 24;
   for (const [opcode, payload] of items) {
     view.setUint16(offset, opcode, true);
@@ -257,6 +257,144 @@ test("rejects more compilations than the per-batch bound", () => {
     () => engine.validate({ sequence: 1, commands: shaderCommands(33) }),
     /too many GPU compilations/,
   );
+});
+
+function offscreenTextureCommands() {
+  const texture = new Uint8Array(24);
+  const textureView = new DataView(texture.buffer);
+  textureView.setUint32(0, handle(1), true);
+  textureView.setUint32(4, 64, true);
+  textureView.setUint32(8, 64, true);
+  textureView.setUint16(12, 1, true);
+  textureView.setUint16(14, 1, true);
+  textureView.setUint16(16, 7, true); // R8Unorm path coverage texture.
+  textureView.setUint8(18, 1);
+  textureView.setUint32(20, 0x14, true); // TEXTURE_BINDING | RENDER_ATTACHMENT.
+
+  const view = new Uint8Array(20);
+  const descriptor = new DataView(view.buffer);
+  descriptor.setUint32(0, handle(2), true);
+  descriptor.setUint32(4, handle(1), true);
+  descriptor.setUint16(8, 7, true);
+  descriptor.setUint8(10, 1);
+  descriptor.setUint8(11, 1);
+  descriptor.setUint16(14, 1, true);
+  descriptor.setUint16(18, 1, true);
+  return [[3, texture], [23, view]];
+}
+
+function renderPass(colorView, flags = 2, generation = 1) {
+  return [
+    [12, u32s([colorView, 0, generation, flags, 0, 0, 0, 0x3f800000, 0x3f800000])],
+    [21, new Uint8Array()],
+  ];
+}
+
+test("renders to a new texture without acquiring the surface and reuses it in a later batch", async () => {
+  const engine = validationEngine();
+  const offscreenView = {};
+  const surfaceView = {};
+  const attachments = [];
+  let surfaceAcquisitions = 0;
+  let submissions = 0;
+  Object.assign(engine, {
+    context: {
+      getCurrentTexture() {
+        surfaceAcquisitions++;
+        return { createView: () => surfaceView };
+      },
+    },
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      createTexture: () => ({ createView: () => offscreenView }),
+      createCommandEncoder: () => ({
+        beginRenderPass(descriptor) {
+          attachments.push(descriptor.colorAttachments[0]);
+          return { end() {} };
+        },
+        finish: () => ({}),
+      }),
+      queue: {
+        submit() { submissions++; },
+        onSubmittedWorkDone: async () => {},
+      },
+    },
+    emitBatchRejected() {
+      assert.fail("valid attachment batch was rejected");
+    },
+  });
+
+  await engine.execute(commands([
+    ...offscreenTextureCommands(),
+    ...renderPass(handle(2)),
+  ]));
+
+  assert.equal(surfaceAcquisitions, 0);
+  assert.equal(submissions, 1);
+  assert.equal(attachments[0].view, offscreenView);
+  assert.equal(attachments[0].loadOp, "clear");
+  assert.equal(attachments[0].storeOp, "store");
+
+  await engine.execute(commands([
+    ...renderPass(handle(2), 3),
+    ...renderPass(0),
+    ...renderPass(0, 3),
+  ], 2n));
+
+  assert.equal(submissions, 2);
+  assert.equal(engine.lastSequence, 2);
+  assert.equal(attachments[1].view, offscreenView);
+  assert.equal(attachments[1].loadOp, "load");
+  assert.equal(surfaceAcquisitions, 1);
+  assert.equal(attachments[2].view, surfaceView);
+  assert.equal(attachments[2].loadOp, "clear");
+  assert.equal(attachments[3].view, surfaceView);
+  assert.equal(attachments[3].loadOp, "load");
+});
+
+test("rejects missing, wrong-type and deleted color attachments before any GPU mutation", async t => {
+  for (const [name, colorView, removeView] of [
+    ["missing", handle(3), false],
+    ["wrong type", handle(1), false],
+    ["deleted", handle(2), true],
+  ]) {
+    await t.test(name, async () => {
+      const engine = validationEngine();
+      const rejected = [];
+      engine.device = {
+        pushErrorScope() { assert.fail("invalid batch reached the GPU"); },
+      };
+      engine.emitBatchRejected = (...args) => rejected.push(args);
+      const setup = offscreenTextureCommands();
+      if (removeView) {
+        setup.push([11, u32s([handle(2)])]);
+      }
+
+      await engine.execute(commands([...setup, ...renderPass(colorView)]));
+
+      assert.equal(rejected.length, 1);
+      assert.equal(rejected[0][0], setup.length);
+      assert.equal(rejected[0][1], 1);
+      assert.equal(rejected[0][2], 1);
+      assert.equal(engine.resources.size, 0);
+      assert.equal(engine.handleSlots.size, 0);
+      assert.equal(engine.lastSequence, 0n);
+    });
+  }
+});
+
+test("requires the current surface generation for both texture and surface attachments", () => {
+  for (const colorView of [0, handle(2)]) {
+    const engine = validationEngine();
+    assert.throws(
+      () => engine.validate(parseCommands(commands([
+        ...offscreenTextureCommands(),
+        ...renderPass(colorView, 2, 2),
+      ]))),
+      error => error.commandIndex === 2 && error.errorCode === 4,
+    );
+  }
 });
 
 function eventType(bytes) {
