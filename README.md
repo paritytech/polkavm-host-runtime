@@ -26,6 +26,10 @@ the guest-facing `host_frame_send` / `host_frame_poll` queues bounded.
 
 The browser compiler emits real Wasm instructions in groups of up to 128 basic blocks rather than a Wasm function for every block. Straight-line blocks are split at 16 instructions without adding gas charges, and indirect jump targets use bounded resolver groups. This bounds individual function bodies and avoids browser function-count limits for large guests while preserving the exported execution ABI, hostcall continuations, and gas-resume checkpoints.
 
+Render passes support both the surface (`color_view = 0`) and registered texture
+views on browser and native hosts. Offscreen passes preserve the surface and use
+the same generation and resource-handle validation as surface passes.
+
 ## Build and test
 
 ```bash
