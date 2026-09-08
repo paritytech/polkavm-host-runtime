@@ -144,8 +144,8 @@ test("rejects nested render pass inside compute pass", () => {
   assert.throws(() => engine.validate(parseCommands(batch)), /nested GPU pass/);
 });
 
-test("completes a validated batch without render commands", async () => {
-  let completions = 0;
+test("completes a validated batch without waiting for the GPU queue", async () => {
+  let fences = 0;
   const engine = Object.create(GpuEngine.prototype);
   Object.assign(engine, {
     stopped: false,
@@ -159,7 +159,7 @@ test("completes a validated batch without render commands", async () => {
       popErrorScope: async () => null,
       queue: {
         onSubmittedWorkDone: async () => {
-          completions++;
+          fences++;
         },
       },
     },
@@ -177,7 +177,7 @@ test("completes a validated batch without render commands", async () => {
 
   await engine.execute(batch);
 
-  assert.equal(completions, 1);
+  assert.equal(fences, 0);
   assert.equal(engine.lastSequence, 1);
 });
 
