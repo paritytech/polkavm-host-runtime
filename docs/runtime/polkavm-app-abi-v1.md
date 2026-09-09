@@ -567,6 +567,23 @@ It is not wall-clock time.
 sleep allowance for the current call. A Host MAY return earlier than the
 requested duration.
 
+### Host core services
+
+Cooperative applications may also import the resource-independent operations
+from the experimental `polkadot-host/0.1/core` interface:
+
+```text
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
+```
+
+The clock call writes a little-endian `u64` count of nanoseconds since the Unix
+epoch. The random call fills exactly the requested bytes from a Host CSPRNG.
+It rejects zero-length requests with `-3`, rejects requests larger than 4 KiB
+with `-6`, and otherwise returns zero. Invalid writable guest ranges fail the
+execution. These imports add wall time and entropy; they do not opt the
+application into the separate application-computer lifecycle.
+
 ### Audio
 
 ```text

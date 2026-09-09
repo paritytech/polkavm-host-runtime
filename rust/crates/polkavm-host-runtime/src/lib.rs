@@ -37,8 +37,8 @@ pub use computer::{
     FS_OPEN_READ, FS_OPEN_TRUNCATE, FS_OPEN_WRITE, MAX_BACKGROUND_PROCESSES,
     MAX_COMPUTER_CONTEXT_BYTES, MAX_COMPUTER_CONTEXT_ENTRIES, MAX_COMPUTER_DIRECTORIES,
     MAX_COMPUTER_FILES, MAX_COMPUTER_FILE_BYTES, MAX_COMPUTER_PATH_BYTES, MAX_COMPUTER_PROCESSES,
-    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES,
-    MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
+    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_RANDOM_BYTES,
+    MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
 };
 pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
 pub use manifest::AppDescriptor;
@@ -46,10 +46,12 @@ pub use manifest::AppDescriptor;
 use anyhow::{anyhow, bail, Context, Result};
 pub use polkavm::BackendKind;
 use polkavm::{CallError, Config, Engine, Instance, Linker, Module, ProgramBlob};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub use tri2d::{
     Tri2dFrame, MAX_TRI2D_BYTES, MAX_TRI2D_COMMANDS, MAX_TRI2D_DRAWS, MAX_TRI2D_INDICES,
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
@@ -370,6 +372,8 @@ struct HostClock {
     started: Instant,
     #[cfg(target_arch = "wasm32")]
     now_ms: u64,
+    #[cfg(target_arch = "wasm32")]
+    wall_time_ns: u64,
 }
 
 impl HostClock {
@@ -379,6 +383,8 @@ impl HostClock {
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
             now_ms: 0,
+            #[cfg(target_arch = "wasm32")]
+            wall_time_ns: 0,
         }
     }
 
@@ -390,6 +396,21 @@ impl HostClock {
         #[cfg(target_arch = "wasm32")]
         {
             self.now_ms
+        }
+    }
+
+    fn wall_time_ns(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.wall_time_ns
         }
     }
 
@@ -405,6 +426,24 @@ impl HostClock {
     #[cfg(target_arch = "wasm32")]
     fn set_time_ms(&mut self, time_ms: u64) {
         self.now_ms = self.now_ms.max(time_ms);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn set_wall_time_ms(&mut self, time_ms: u64) {
+        self.wall_time_ns = time_ms.saturating_mul(1_000_000);
+    }
+}
+
+fn fresh_random_seed() -> Result<[u8; 32]> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|error| anyhow!("seed application CSPRNG: {error}"))?;
+        Ok(seed)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        bail!("browser application runtime requires a host-provided random seed")
     }
 }
 
@@ -493,6 +532,7 @@ struct HostState {
     input: VecDeque<[u8; INPUT_EVENT_BYTES]>,
     assets: HashMap<String, Vec<u8>>,
     clock: HostClock,
+    random: ChaCha20Rng,
     logs: VecDeque<String>,
     save: Option<Vec<u8>>,
     hostcall_bytes_remaining: usize,
@@ -521,6 +561,7 @@ impl HostState {
         audio_enabled: bool,
         uses_motion: bool,
         uses_pointer_capture: bool,
+        random_seed: [u8; 32],
     ) -> Self {
         Self {
             frame: None,
@@ -538,6 +579,7 @@ impl HostState {
             input: VecDeque::new(),
             assets,
             clock: HostClock::new(),
+            random: ChaCha20Rng::from_seed(random_seed),
             logs: VecDeque::new(),
             save: None,
             hostcall_bytes_remaining: 0,
@@ -850,6 +892,7 @@ impl Runtime {
             audio_enabled,
             max_gas_per_update,
             backend,
+            fresh_random_seed()?,
         )
     }
 
@@ -860,6 +903,7 @@ impl Runtime {
         audio_enabled: bool,
         max_gas_per_update: u64,
         backend: BackendKind,
+        random_seed: [u8; 32],
     ) -> Result<Self> {
         let imports = blob.imports();
         let uses_motion = imports
@@ -1276,6 +1320,50 @@ impl Runtime {
 
         linker
             .define_typed(
+                "polkadot_host_0_1_core_clock_wall",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(size_of::<u64>())?;
+                    caller
+                        .instance
+                        .write_memory(
+                            destination,
+                            &caller.user_data.clock.wall_time_ns().to_le_bytes(),
+                        )
+                        .map_err(|error| anyhow!("write guest wall clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_wall")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_random",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let length = length as usize;
+                    caller.user_data.charge_hostcall(0)?;
+                    if length == 0 {
+                        return Ok(computer::STATUS_INVALID);
+                    }
+                    if length > MAX_RANDOM_BYTES {
+                        return Ok(computer::STATUS_LIMIT);
+                    }
+                    caller.user_data.charge_hostcall_bytes(length)?;
+                    let mut bytes = [0u8; MAX_RANDOM_BYTES];
+                    caller.user_data.random.fill_bytes(&mut bytes[..length]);
+                    caller
+                        .instance
+                        .write_memory(destination, &bytes[..length])
+                        .map_err(|error| anyhow!("write guest random bytes: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_random")?;
+
+        linker
+            .define_typed(
                 "host_sleep_ms",
                 |caller: polkavm::Caller<'_, HostState>, duration_ms: u32| -> Result<()> {
                     caller.user_data.charge_hostcall(0)?;
@@ -1420,6 +1508,7 @@ impl Runtime {
                 audio_enabled,
                 uses_motion,
                 uses_pointer_capture,
+                random_seed,
             ),
             max_gas_per_update,
             last_gas_used: 0,
@@ -1624,6 +1713,11 @@ impl Runtime {
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
         self.state.clock.set_time_ms(time_ms);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_wall_time_ms(&mut self, time_ms: u64) {
+        self.state.clock.set_wall_time_ms(time_ms);
     }
 
     pub fn take_frame(&mut self) -> Option<Frame> {
