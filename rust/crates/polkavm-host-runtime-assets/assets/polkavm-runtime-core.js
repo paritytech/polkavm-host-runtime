@@ -260,10 +260,15 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "startup", stage: "first-update-started" });
     }
     const before = performance.now();
+    const wallTimeMs = Date.now();
     try {
       if (translated) {
         translated.update(before - startedAt);
       } else {
+        check(
+          pvm.polkavm_browser_set_wall_time_ms(wallTimeMs),
+          "set PolkaVM browser wall clock",
+        );
         check(
           pvm.polkavm_browser_update(before - startedAt),
           "update PolkaVM browser guest",
@@ -543,6 +548,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         "begin PolkaVM browser launch",
       );
       postMessage({ type: "startup", stage: "interpreter-launch-begun" });
+      stage(crypto.getRandomValues(new Uint8Array(32)));
+      check(
+        pvm.polkavm_browser_launch_set_random_seed(),
+        "seed PolkaVM browser CSPRNG",
+      );
       postMessage({ type: "startup", stage: "interpreter-mounting-assets" });
       for (const asset of message.assets) {
         addAsset(asset);
@@ -582,6 +592,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
         pendingGpuCapabilities = null;
       }
+      check(
+        pvm.polkavm_browser_set_wall_time_ms(Date.now()),
+        "set PolkaVM browser wall clock",
+      );
       postMessage({ type: "startup", stage: "interpreter-initializing" });
       try {
         check(pvm.polkavm_browser_init(), "initialize PolkaVM browser guest");
@@ -796,7 +810,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       return;
     }
     stage(bytes);
-    check(pvm.polkavm_browser_send_gpu_event(), "send PolkaVM browser GPU event");
+    check(
+      pvm.polkavm_browser_send_gpu_event(),
+      "send PolkaVM browser GPU event",
+    );
   }
 
   function sendHostFrameResponse(bytes) {
@@ -902,10 +919,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "host-frame-response") {
       try {
         const seq = message.seq;
-        if (
-          seq !== undefined &&
-          (!Number.isSafeInteger(seq) || seq < 0)
-        ) {
+        if (seq !== undefined && (!Number.isSafeInteger(seq) || seq < 0)) {
           throw new Error(
             "invalid PolkaVM browser host frame response sequence",
           );

@@ -2264,6 +2264,7 @@ mod tests {
             false,
             false,
             false,
+            [0; 32],
         );
         for coordinate in 0..10_000u16 {
             state.queue_input(InputEvent {
@@ -2357,6 +2358,7 @@ mod tests {
             false,
             false,
             false,
+            [0; 32],
         )
     }
 
@@ -2460,6 +2462,7 @@ mod tests {
             false,
             false,
             false,
+            [0; 32],
         );
         assert!(state.queue_host_frame_response(Vec::new()).is_err());
         assert!(state
