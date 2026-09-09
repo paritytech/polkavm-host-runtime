@@ -257,6 +257,42 @@ test("compiler backend returns complete u64 clock values to 32-bit guests", asyn
   translated.stop();
 });
 
+test("graphics runtimes expose wall clock and secure random core services", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/application-core-services.polkavm",
+    ),
+  );
+  const success = new TextEncoder().encode("application-core-services-ok");
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "tri2d",
+        audioEnabled: false,
+        cacheKey: `application-core-services-${String(forceInterpreter)}`,
+        forceInterpreter,
+      },
+    });
+
+    const save = await waitForMessage(messages, "save");
+    assert.deepEqual(save.bytes, success);
+    const ready = await waitForMessage(messages, "ready");
+    assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("compiler startup keeps the newest GPU capabilities", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -439,7 +475,10 @@ test("host-frame response backpressure is retryable in both backends", async () 
       { type: "host-frame-response-rejected", reason: "queue-full" },
       "responses without seq keep the legacy rejection shape",
     );
-    assert.equal(messages.some((message) => message.type === "error"), false);
+    assert.equal(
+      messages.some((message) => message.type === "error"),
+      false,
+    );
     assert.equal(
       messages.some((message) => message.type === "terminated"),
       false,

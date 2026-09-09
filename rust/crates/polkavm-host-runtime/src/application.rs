@@ -63,6 +63,26 @@ impl ApplicationRuntime {
         max_gas_per_update: u64,
         backend: polkavm::BackendKind,
     ) -> Result<Self> {
+        Self::new_with_backend_and_random_seed(
+            program,
+            assets,
+            presentation,
+            audio_enabled,
+            max_gas_per_update,
+            backend,
+            crate::fresh_random_seed()?,
+        )
+    }
+
+    pub(crate) fn new_with_backend_and_random_seed(
+        program: &[u8],
+        assets: HashMap<String, Vec<u8>>,
+        presentation: PresentationProfile,
+        audio_enabled: bool,
+        max_gas_per_update: u64,
+        backend: polkavm::BackendKind,
+        random_seed: [u8; 32],
+    ) -> Result<Self> {
         crate::validate_launch_inputs(program, &assets, max_gas_per_update)?;
         let blob = ProgramBlob::parse(program.into()).context("parse PolkaVM program")?;
         crate::validate_blob(&blob)?;
@@ -75,6 +95,7 @@ impl ApplicationRuntime {
                 audio_enabled,
                 max_gas_per_update,
                 backend,
+                random_seed,
             )
             .map(Self::Cooperative);
         }
@@ -309,6 +330,13 @@ impl ApplicationRuntime {
         match self {
             Self::Cooperative(runtime) => runtime.set_time_ms(time_ms),
             Self::CoreVm(runtime) => runtime.vm.set_time_ms(time_ms),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_wall_time_ms(&mut self, time_ms: u64) {
+        if let Self::Cooperative(runtime) = self {
+            runtime.set_wall_time_ms(time_ms);
         }
     }
 
