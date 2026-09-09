@@ -24,6 +24,7 @@
   const INPUT_INSETS_HORIZONTAL = 0;
   const INPUT_INSETS_VERTICAL = 1;
   const POINTER_CAPTURE_IMPORT = "host_pointer_capture";
+  const UPDATE_AFTER_IMPORT = "host_update_after";
   const POINTER_CAPTURE_RELEASE = 0;
   const POINTER_CAPTURE_ARM = 1;
   const POINTER_CAPTURE_RELEASED = 0;
@@ -45,9 +46,12 @@
   const MAX_UI_SEMANTIC_STRING_BYTES = 1024;
   const UI_OUTPUT_HEADER_BYTES = 48;
   const UI_OUTPUT_COMMAND_HEADER_BYTES = 8;
-  const MAX_UI_OUTPUT_BYTES = 256 * 1024;
+  const MAX_UI_COPY_IMAGE_BYTES = 4 * 1024 * 1024;
+  const MAX_UI_OUTPUT_BYTES = MAX_UI_COPY_IMAGE_BYTES + 256 * 1024;
   const MAX_UI_OUTPUT_COMMANDS = 64;
   const MAX_UI_COPY_TEXT_BYTES = 64 * 1024;
+  const MAX_UI_COPY_IMAGE_PIXELS = 1024 * 1024;
+  const MAX_UI_COPY_IMAGE_DIMENSION = 2048;
   const MAX_UI_OPEN_URL_BYTES = 8 * 1024;
   const UI_CURSOR_ICONS = Object.freeze([
     "default",
@@ -243,14 +247,15 @@
         if (payloadEnd > bytes.byteLength) {
           return null;
         }
-        const payload = strictDecoder.decode(
-          bytes.subarray(payloadStart, payloadEnd),
-        );
+        const payloadBytes = bytes.subarray(payloadStart, payloadEnd);
         if (opcode === 1) {
           if (commandFlags !== 0 || payloadLength > MAX_UI_COPY_TEXT_BYTES) {
             return null;
           }
-          commands.push({ type: "copy-text", text: payload });
+          commands.push({
+            type: "copy-text",
+            text: strictDecoder.decode(payloadBytes),
+          });
         } else if (opcode === 2) {
           if (
             (commandFlags & ~1) !== 0 ||
@@ -261,8 +266,36 @@
           }
           commands.push({
             type: "open-url",
-            url: payload,
+            url: strictDecoder.decode(payloadBytes),
             newSurface: (commandFlags & 1) !== 0,
+          });
+        } else if (opcode === 3) {
+          if (commandFlags !== 0 || payloadLength < 8) {
+            return null;
+          }
+          const payloadView = new DataView(
+            bytes.buffer,
+            bytes.byteOffset + payloadStart,
+            payloadLength,
+          );
+          const width = payloadView.getUint32(0, true);
+          const height = payloadView.getUint32(4, true);
+          const pixelBytes = payloadLength - 8;
+          if (
+            width === 0 ||
+            height === 0 ||
+            width > MAX_UI_COPY_IMAGE_DIMENSION ||
+            height > MAX_UI_COPY_IMAGE_DIMENSION ||
+            width * height > MAX_UI_COPY_IMAGE_PIXELS ||
+            width * height * 4 !== pixelBytes
+          ) {
+            return null;
+          }
+          commands.push({
+            type: "copy-image",
+            width,
+            height,
+            rgba: payloadBytes.subarray(8),
           });
         } else {
           return null;
@@ -545,6 +578,7 @@
         request: null,
       };
       this.timeMs = null;
+      this.updateAfterMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
       this.hostcallBytes = 0;
@@ -590,6 +624,14 @@
 
     usesPointerCapture() {
       return this.imports.includes(POINTER_CAPTURE_IMPORT);
+    }
+
+    usesUpdateScheduling() {
+      return this.imports.includes(UPDATE_AFTER_IMPORT);
+    }
+
+    updateAfterMilliseconds() {
+      return this.updateAfterMs;
     }
 
     setPointerCaptureSupported(supported) {
@@ -646,6 +688,7 @@
         return;
       }
       this.timeMs = timeMs;
+      this.updateAfterMs = null;
       this.gpuSubmits = 0;
       this.hostFrameRequests = 0;
       this.uiSemanticsSubmitted = false;
@@ -673,10 +716,40 @@
         return;
       }
       if (!this.coreVm) {
-        if (this.input.length === MAX_INPUT_EVENTS) {
-          this.input.shift();
+        const copy = bytes.slice();
+        const type = copy[0];
+        if (type === 7) {
+          const existing = this.input.findLastIndex(
+            (event) => event[0] === type,
+          );
+          if (existing !== -1) {
+            this.input.splice(existing, 1);
+          }
+        } else if (type === 5 && this.input.at(-1)?.[0] === 5) {
+          this.input[this.input.length - 1] = copy;
+          return;
+        } else if (type === 19) {
+          const existing = this.input.findLastIndex(
+            (event) => event[0] === type && event[1] === copy[1],
+          );
+          if (existing !== -1) {
+            this.input.splice(existing, 1);
+          }
         }
-        this.input.push(bytes.slice());
+        if (this.input.length === MAX_INPUT_EVENTS) {
+          const discardable = this.input.findIndex(
+            (event) =>
+              event[0] === 5 ||
+              event[0] === 6 ||
+              event[0] === 14 ||
+              event[0] === 19,
+          );
+          if (discardable === -1) {
+            throw new Error("translated PolkaVM input queue is full");
+          }
+          this.input.splice(discardable, 1);
+        }
+        this.input.push(copy);
         return;
       }
       const view = new DataView(
@@ -1257,6 +1330,14 @@
         case POINTER_CAPTURE_IMPORT: {
           const status = this.#requestPointerCapture(this.#u32(a0));
           this.#setReg(7, BigInt(status));
+          return false;
+        }
+        case UPDATE_AFTER_IMPORT: {
+          const delayMs = this.#u32(a0);
+          this.updateAfterMs =
+            this.updateAfterMs === null
+              ? delayMs
+              : Math.min(this.updateAfterMs, delayMs);
           return false;
         }
         case "host_time_ms": {
@@ -1889,7 +1970,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
   };
 
-  const FRAME_INTERVAL_MS = 1000 / 60;
+  const LEGACY_FRAME_INTERVAL_MS = 1000 / 60;
   const MAX_GAS_PER_UPDATE = 10_000_000_000;
   const MAX_TRANSLATED_LOOPS_PER_UPDATE = 50_000_000;
   const MAX_PROGRAM_BYTES = 64 * 1024 * 1024;
@@ -1905,6 +1986,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const INPUT_SAFE_AREA_INSETS = 16;
   const INPUT_KEYBOARD_INSETS = 17;
   const MAX_INSET_PIXELS = 65535;
+  const UPDATE_AFTER_IDLE = 0xffffffff;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -1914,6 +1996,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let backend = "interpreter";
   let running = false;
   let disposed = false;
+  let demandDriven = false;
+  let tickPending = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
   let pointerCaptureSupported = false;
@@ -1923,7 +2007,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let updateCount = 0;
   const updateSamples = [];
   const tickChannel = new MessageChannel();
-  tickChannel.port1.onmessage = tick;
+  tickChannel.port1.onmessage = () => {
+    tickPending = false;
+    tick();
+  };
 
   function stopRuntime() {
     if (disposed) {
@@ -2122,6 +2209,48 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({ type: "pointer-capture", capture: request });
   }
 
+  function scheduleTick(delayMs) {
+    if (!running) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = undefined;
+    if (delayMs <= 0) {
+      if (!tickPending) {
+        tickPending = true;
+        tickChannel.port2.postMessage(null);
+      }
+      return;
+    }
+    if (tickPending) {
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (!running || tickPending) {
+        return;
+      }
+      tickPending = true;
+      tickChannel.port2.postMessage(null);
+    }, delayMs);
+  }
+
+  function wake() {
+    if (demandDriven) {
+      scheduleTick(0);
+    }
+  }
+
+  function requestedUpdateDelay() {
+    if (!demandDriven) {
+      return LEGACY_FRAME_INTERVAL_MS;
+    }
+    const delay = translated
+      ? translated.updateAfterMilliseconds()
+      : pvm.polkavm_browser_update_after_ms();
+    return delay === UPDATE_AFTER_IDLE ? null : delay;
+  }
+
   function tick() {
     if (!running) {
       return;
@@ -2177,11 +2306,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         updateMaxMs: sorted[sorted.length - 1],
       });
     }
-    const delay = FRAME_INTERVAL_MS - elapsed;
-    if (delay > 0) {
-      timer = setTimeout(tick, delay);
-    } else {
-      tickChannel.port2.postMessage(null);
+    const requestedDelay = requestedUpdateDelay();
+    if (requestedDelay !== null) {
+      scheduleTick(Math.max(0, requestedDelay - elapsed));
     }
   }
 
@@ -2473,6 +2600,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     const usesPointerCapture = translated
       ? translated.usesPointerCapture()
       : pvm.polkavm_browser_uses_pointer_capture() === 1;
+    demandDriven = translated
+      ? translated.usesUpdateScheduling()
+      : typeof pvm.polkavm_browser_uses_update_scheduling === "function" &&
+        pvm.polkavm_browser_uses_update_scheduling() === 1;
     startedAt = performance.now();
     running = true;
     postMessage({
@@ -2480,6 +2611,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       backend,
       usesMotion,
       usesPointerCapture,
+      usesUpdateScheduling: demandDriven,
       cacheHit,
       translationMs,
       compilationMs,
@@ -2489,7 +2621,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     for (const { output, transfers } of pendingOutputs) {
       postMessage(output, transfers);
     }
-    tick();
+    scheduleTick(0);
   }
 
   function sendInput(bytes) {
@@ -2667,7 +2799,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       return;
     }
     stage(bytes);
-    check(pvm.polkavm_browser_send_gpu_event(), "send PolkaVM browser GPU event");
+    check(
+      pvm.polkavm_browser_send_gpu_event(),
+      "send PolkaVM browser GPU event",
+    );
   }
 
   function sendHostFrameResponse(bytes) {
@@ -2697,6 +2832,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2711,6 +2847,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           message.right,
           message.bottom,
         );
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2719,6 +2856,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion-status") {
       try {
         setMotionAvailability(message.availability);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2730,6 +2868,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture support");
         }
         setPointerCaptureSupported(message.supported);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2741,6 +2880,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture state");
         }
         setPointerCaptureActive(message.active);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2749,6 +2889,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion") {
       try {
         sendMotionSample(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2757,6 +2898,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-capabilities") {
       try {
         sendGpuCapabilities(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2765,6 +2907,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-event") {
       try {
         sendGpuEvent(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2773,15 +2916,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "host-frame-response") {
       try {
         const seq = message.seq;
-        if (
-          seq !== undefined &&
-          (!Number.isSafeInteger(seq) || seq < 0)
-        ) {
+        if (seq !== undefined && (!Number.isSafeInteger(seq) || seq < 0)) {
           throw new Error(
             "invalid PolkaVM browser host frame response sequence",
           );
         }
         if (sendHostFrameResponse(new Uint8Array(message.bytes))) {
+          wake();
           if (seq !== undefined) {
             postMessage({ type: "host-frame-response-accepted", seq });
           }
