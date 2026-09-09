@@ -40,6 +40,10 @@ pub enum NativePolkaVmInputEventType {
     PointerMove,
     PointerDelta,
     SurfaceMetrics,
+    TouchStart,
+    TouchMove,
+    TouchEnd,
+    TouchCancel,
 }
 
 impl From<NativePolkaVmInputEventType> for InputEventType {
@@ -52,6 +56,10 @@ impl From<NativePolkaVmInputEventType> for InputEventType {
             NativePolkaVmInputEventType::PointerMove => Self::PointerMove,
             NativePolkaVmInputEventType::PointerDelta => Self::PointerDelta,
             NativePolkaVmInputEventType::SurfaceMetrics => Self::SurfaceMetrics,
+            NativePolkaVmInputEventType::TouchStart => Self::TouchStart,
+            NativePolkaVmInputEventType::TouchMove => Self::TouchMove,
+            NativePolkaVmInputEventType::TouchEnd => Self::TouchEnd,
+            NativePolkaVmInputEventType::TouchCancel => Self::TouchCancel,
         }
     }
 }

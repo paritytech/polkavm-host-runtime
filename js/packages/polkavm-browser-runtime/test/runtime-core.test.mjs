@@ -171,6 +171,71 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
   }
 });
 
+test("demand-driven guests idle until an external event wakes them", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  let updates = 0;
+  globalThis.TranslatedPolkaVmRuntime = class {
+    initialize() {}
+    usesMotion() {
+      return false;
+    }
+    usesPointerCapture() {
+      return false;
+    }
+    usesUpdateScheduling() {
+      return true;
+    }
+    updateAfterMilliseconds() {
+      return null;
+    }
+    update() {
+      updates++;
+    }
+    sendInput() {}
+    setPointerCaptureSupported() {}
+    takePointerCaptureRequest() {
+      return null;
+    }
+    stop() {}
+  };
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: new Uint8Array([1]),
+        compiledModule: new WebAssembly.Module(
+          new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
+        ),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "demand-driven-idle",
+      },
+    });
+    const ready = await waitForMessage(messages, "ready");
+    assert.equal(ready.usesUpdateScheduling, true);
+    while (updates < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(updates, 1);
+
+    receiver.onmessage({ data: { type: "input", bytes: new Uint8Array(8) } });
+    while (updates < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(updates, 2);
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+  }
+});
+
 test("compiler backend enforces the declared graphics profile", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -439,7 +504,10 @@ test("host-frame response backpressure is retryable in both backends", async () 
       { type: "host-frame-response-rejected", reason: "queue-full" },
       "responses without seq keep the legacy rejection shape",
     );
-    assert.equal(messages.some((message) => message.type === "error"), false);
+    assert.equal(
+      messages.some((message) => message.type === "error"),
+      false,
+    );
     assert.equal(
       messages.some((message) => message.type === "terminated"),
       false,

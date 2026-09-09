@@ -167,6 +167,21 @@ impl ApplicationRuntime {
             Self::CoreVm(runtime) => runtime.vm.uses_pointer_capture(),
         }
     }
+    /// True when the cooperative guest opts into Host-scheduled updates.
+    pub fn uses_update_scheduling(&self) -> bool {
+        match self {
+            Self::Cooperative(runtime) => runtime.uses_update_scheduling(),
+            Self::CoreVm(_) => false,
+        }
+    }
+
+    /// Requested delay after the latest update, or `None` to wait for Host input.
+    pub fn update_after_ms(&self) -> Option<u32> {
+        match self {
+            Self::Cooperative(runtime) => runtime.update_after_ms(),
+            Self::CoreVm(_) => None,
+        }
+    }
 
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
         match self {
@@ -524,7 +539,11 @@ impl CoreVmRuntime {
                     self.vm.send_mouse_move(delta_x, delta_y);
                 }
             }
-            InputEventType::SurfaceMetrics => {}
+            InputEventType::SurfaceMetrics
+            | InputEventType::TouchStart
+            | InputEventType::TouchMove
+            | InputEventType::TouchEnd
+            | InputEventType::TouchCancel => {}
         }
     }
 }
