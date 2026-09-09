@@ -324,6 +324,14 @@ impl NativePolkaVmRuntime {
         Ok(self.lock()?.uses_motion())
     }
 
+    pub fn uses_update_scheduling(&self) -> Result<bool, NativePolkaVmError> {
+        Ok(self.lock()?.uses_update_scheduling())
+    }
+
+    pub fn update_after_ms(&self) -> Result<Option<u32>, NativePolkaVmError> {
+        Ok(self.lock()?.update_after_ms())
+    }
+
     pub fn last_gas_used(&self) -> Result<u64, NativePolkaVmError> {
         Ok(self.lock()?.last_gas_used())
     }
