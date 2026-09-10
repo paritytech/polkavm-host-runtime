@@ -977,7 +977,6 @@ test("both browser backends cancel active mediated input on teardown", async () 
     await waitForMessage(messages, "terminated");
   }
 });
-
 test("native-Wasm and translated backends validate and emit UI output v1", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
