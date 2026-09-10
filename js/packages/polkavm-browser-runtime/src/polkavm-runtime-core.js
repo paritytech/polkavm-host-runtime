@@ -38,6 +38,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MAX_INSET_PIXELS = 65535;
   const UPDATE_AFTER_IDLE = 0xffffffff;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
+  const CORE_STATUS_DENIED = -5;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
@@ -348,15 +349,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "startup", stage: "first-update-started" });
     }
     const before = performance.now();
-    const wallTimeMs = Date.now();
     try {
       if (translated) {
         translated.update(before - startedAt);
       } else {
-        check(
-          pvm.polkavm_browser_set_wall_time_ms(wallTimeMs),
-          "set PolkaVM browser wall clock",
-        );
         check(
           pvm.polkavm_browser_update(before - startedAt),
           "update PolkaVM browser guest",
@@ -554,7 +550,35 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     let compilerFallbackReason;
     let compilerFallbackStage;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
-    pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
+    const runtimeImports = {
+      polkavm_browser: {
+        clock_wall_ms: () => Date.now(),
+        random_fill: (pointer, length) => {
+          if (pvm == null) {
+            return CORE_STATUS_DENIED;
+          }
+          try {
+            const browserCrypto = globalThis.crypto;
+            if (typeof browserCrypto?.getRandomValues !== "function") {
+              return CORE_STATUS_DENIED;
+            }
+            const bytes = new Uint8Array(length >>> 0);
+            browserCrypto.getRandomValues(bytes);
+            new Uint8Array(
+              pvm.memory.buffer,
+              pointer >>> 0,
+              length >>> 0,
+            ).set(bytes);
+            return 0;
+          } catch {
+            return CORE_STATUS_DENIED;
+          }
+        },
+      },
+    };
+    pvm = (
+      await WebAssembly.instantiate(message.runtime, runtimeImports)
+    ).instance.exports;
     if (pvm.polkavm_browser_abi_version() !== 2) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
@@ -608,7 +632,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
           );
           compilerStage = "compiler-translating-parts";
-          pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
+          pvm = (
+            await WebAssembly.instantiate(message.runtime, runtimeImports)
+          ).instance.exports;
           stage(program);
           const translationStarted = performance.now();
           check(
@@ -688,7 +714,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
       }
       if (pvm === null) {
-        pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
+        pvm = (
+          await WebAssembly.instantiate(message.runtime, runtimeImports)
+        ).instance.exports;
       }
       let presentation = 0;
       if (message.graphicsProfile === "tri2d") {
@@ -713,11 +741,6 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         "begin PolkaVM browser launch",
       );
       postMessage({ type: "startup", stage: "interpreter-launch-begun" });
-      stage(crypto.getRandomValues(new Uint8Array(32)));
-      check(
-        pvm.polkavm_browser_launch_set_random_seed(),
-        "seed PolkaVM browser CSPRNG",
-      );
       postMessage({ type: "startup", stage: "interpreter-mounting-assets" });
       for (const asset of message.assets) {
         addAsset(asset);
@@ -764,10 +787,6 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
         pendingGpuCapabilities = null;
       }
-      check(
-        pvm.polkavm_browser_set_wall_time_ms(Date.now()),
-        "set PolkaVM browser wall clock",
-      );
       postMessage({ type: "startup", stage: "interpreter-initializing" });
       try {
         check(pvm.polkavm_browser_init(), "initialize PolkaVM browser guest");

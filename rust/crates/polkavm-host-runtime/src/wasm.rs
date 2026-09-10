@@ -17,6 +17,26 @@ use std::collections::HashMap;
 const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_STAGING_BYTES: usize = MAX_ASSET_FILE_BYTES + MAX_ASSET_NAME_BYTES;
 
+#[link(wasm_import_module = "polkavm_browser")]
+unsafe extern "C" {
+    #[link_name = "clock_wall_ms"]
+    fn browser_clock_wall_ms() -> f64;
+    #[link_name = "random_fill"]
+    fn browser_random_fill(pointer: *mut u8, length: usize) -> i32;
+}
+
+pub(crate) fn wall_clock_ns() -> u64 {
+    let milliseconds = unsafe { browser_clock_wall_ms() };
+    if !milliseconds.is_finite() || milliseconds < 0.0 {
+        return 0;
+    }
+    (milliseconds as u64).saturating_mul(1_000_000)
+}
+
+pub(crate) fn fill_random(bytes: &mut [u8]) -> i32 {
+    unsafe { browser_random_fill(bytes.as_mut_ptr(), bytes.len()) }
+}
+
 struct Launch {
     program: Vec<u8>,
     assets: HashMap<String, Vec<u8>>,
@@ -24,7 +44,6 @@ struct Launch {
     max_gas_per_update: u64,
     audio_enabled: bool,
     presentation: PresentationProfile,
-    random_seed: Option<[u8; 32]>,
 }
 
 enum Phase {
@@ -192,7 +211,6 @@ fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) 
             max_gas_per_update: max_gas_per_update.into(),
             audio_enabled: audio_enabled == 1,
             presentation,
-            random_seed: None,
         });
         Ok(())
     })
@@ -252,23 +270,6 @@ pub extern "C" fn polkavm_browser_launch_add_asset(path_length: u32) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn polkavm_browser_launch_set_random_seed() -> u32 {
-    status(|host| {
-        let bytes = std::mem::take(&mut host.staging);
-        let seed: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("PolkaVM browser random seed must contain exactly 32 bytes"))?;
-        let Phase::Building(launch) = &mut host.phase else {
-            return Err(anyhow!(
-                "PolkaVM browser launch is not accepting a random seed"
-            ));
-        };
-        launch.random_seed = Some(seed);
-        Ok(())
-    })
-}
-
-#[no_mangle]
 pub extern "C" fn polkavm_browser_launch_start() -> u32 {
     status(|host| {
         let phase = std::mem::replace(&mut host.phase, Phase::Empty);
@@ -276,17 +277,13 @@ pub extern "C" fn polkavm_browser_launch_start() -> u32 {
             host.phase = phase;
             return Err(anyhow!("PolkaVM browser launch is not ready"));
         };
-        let random_seed = launch
-            .random_seed
-            .ok_or_else(|| anyhow!("PolkaVM browser launch is missing a random seed"))?;
-        let runtime = ApplicationRuntime::new_with_backend_and_random_seed(
+        let runtime = ApplicationRuntime::new_with_backend(
             &launch.program,
             launch.assets,
             launch.presentation,
             launch.audio_enabled,
             launch.max_gas_per_update,
             BackendKind::Interpreter,
-            random_seed,
         )?;
         host.phase = Phase::Running(runtime);
         Ok(())
@@ -421,18 +418,6 @@ pub extern "C" fn polkavm_browser_send_mediated_input_result(handle: u32, result
 #[no_mangle]
 pub extern "C" fn polkavm_browser_init() -> u32 {
     status(|host| host.running()?.init())
-}
-
-#[no_mangle]
-pub extern "C" fn polkavm_browser_set_wall_time_ms(time_ms: f64) -> u32 {
-    status(|host| {
-        if !time_ms.is_finite() || time_ms < 0.0 {
-            return Err(anyhow!("invalid PolkaVM browser wall-clock timestamp"));
-        }
-        host.running()?
-            .set_wall_time_ms(time_ms.min(u64::MAX as f64) as u64);
-        Ok(())
-    })
 }
 
 #[no_mangle]

@@ -541,7 +541,7 @@ test("compiler backend returns complete u64 clock values to 32-bit guests", asyn
   translated.stop();
 });
 
-test("graphics runtimes expose wall clock and secure random core services", async () => {
+test("both browser backends expose application core clocks and entropy", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
   );
@@ -551,9 +551,9 @@ test("graphics runtimes expose wall clock and secure random core services", asyn
       "rust/crates/polkavm-host-runtime/tests/fixtures/application-core-services.polkavm",
     ),
   );
-  const success = new TextEncoder().encode("application-core-services-ok");
 
   for (const forceInterpreter of [false, true]) {
+    const wallBefore = BigInt(Date.now()) * 1_000_000n;
     const { messages, receiver } = endpoint();
     receiver.onmessage({
       data: {
@@ -569,13 +569,89 @@ test("graphics runtimes expose wall clock and secure random core services", asyn
     });
 
     const save = await waitForMessage(messages, "save");
-    assert.deepEqual(save.bytes, success);
     const ready = await waitForMessage(messages, "ready");
     assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
     assert.equal(ready.compilerFallbackReason, undefined);
     assert.equal(ready.compilerFallbackStage, undefined);
+    const bytes = new Uint8Array(save.bytes);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const wallAfter = BigInt(Date.now()) * 1_000_000n;
+    assert.equal(bytes.byteLength, 56);
+    assert.equal(view.getInt32(24, true), 0);
+    assert.equal(view.getInt32(28, true), 0);
+    assert.equal(view.getInt32(32, true), 0);
+    assert.equal(view.getInt32(36, true), 0);
+    assert.ok(view.getBigUint64(8, true) >= view.getBigUint64(0, true));
+    assert.ok(view.getBigUint64(16, true) >= wallBefore);
+    assert.ok(view.getBigUint64(16, true) <= wallAfter);
+    assert.ok(bytes.subarray(40).some((byte) => byte !== 0));
+
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
+  }
+});
+
+test("both browser backends deny unavailable or failing entropy without modifying the destination", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/application-core-services.polkavm",
+    ),
+  );
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  try {
+    for (const browserCrypto of [
+      undefined,
+      {
+        getRandomValues(bytes) {
+          bytes.fill(0xa5, 0, Math.ceil(bytes.byteLength / 2));
+          throw new Error("entropy provider failed after a partial fill");
+        },
+      },
+    ]) {
+      Object.defineProperty(globalThis, "crypto", {
+        configurable: true,
+        value: browserCrypto,
+      });
+      for (const forceInterpreter of [false, true]) {
+        const { messages, receiver } = endpoint();
+        try {
+          receiver.onmessage({
+            data: {
+              type: "start",
+              runtime: bytesBuffer(runtime),
+              program: bytesBuffer(program),
+              assets: [],
+              graphicsProfile: "tri2d",
+              audioEnabled: false,
+              cacheKey: `application-core-services-entropy-failure-${forceInterpreter}`,
+              forceInterpreter,
+            },
+          });
+          const ready = await waitForMessage(messages, "ready");
+          assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+          assert.equal(ready.compilerFallbackReason, undefined);
+          const save = await waitForMessage(messages, "save");
+          const bytes = new Uint8Array(save.bytes);
+          const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          assert.equal(bytes.byteLength, 56);
+          assert.equal(view.getInt32(36, true), -5);
+          assert.deepEqual(bytes.subarray(40), new Uint8Array(16));
+        } finally {
+          receiver.onmessage?.({ data: { type: "stop" } });
+          await waitForMessage(messages, "terminated");
+        }
+      }
+    }
+  } finally {
+    if (originalCrypto) {
+      Object.defineProperty(globalThis, "crypto", originalCrypto);
+    } else {
+      delete globalThis.crypto;
+    }
   }
 });
 

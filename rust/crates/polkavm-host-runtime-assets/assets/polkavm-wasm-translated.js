@@ -10,6 +10,7 @@
   const STATUS_TRAP = -3;
   const STATUS_OUT_OF_GAS = -4;
   const CORE_STATUS_INVALID = -3;
+  const CORE_STATUS_DENIED = -5;
   const CORE_STATUS_LIMIT = -6;
   const INPUT_EVENT_BYTES = 8;
   const MOTION_SAMPLE_BYTES = 48;
@@ -1523,26 +1524,6 @@
           this.#setReg(7, BigInt(status));
           return false;
         }
-        case "polkadot_host_0_1_core_clock_wall":
-          this.#chargeBytes(8);
-          this.#writeU64(this.#u32(a0), BigInt(Date.now()) * 1_000_000n);
-          this.#setReg(7, 0n);
-          return false;
-        case "polkadot_host_0_1_core_random": {
-          const length = this.#u32(a1);
-          if (length === 0) {
-            this.#setReg(7, BigInt(CORE_STATUS_INVALID));
-            return false;
-          }
-          if (length > MAX_CORE_RANDOM_BYTES) {
-            this.#setReg(7, BigInt(CORE_STATUS_LIMIT));
-            return false;
-          }
-          this.#chargeBytes(length);
-          crypto.getRandomValues(this.#range(this.#u32(a0), length, true));
-          this.#setReg(7, 0n);
-          return false;
-        }
         case "host_input_register": {
           const kindLength = this.#u32(a1);
           const mediaTypeLength = this.#u32(a3);
@@ -1624,6 +1605,50 @@
             this.updateAfterMs === null
               ? delayMs
               : Math.min(this.updateAfterMs, delayMs);
+          return false;
+        }
+        case "polkadot_host_0_1_core_clock_monotonic": {
+          this.#chargeBytes(8);
+          const timeMs =
+            this.timeMs ?? performance.now() - this.clockStartedAt;
+          this.#writeU64(
+            this.#u32(a0),
+            BigInt(Math.max(0, Math.trunc(timeMs * 1_000_000))),
+          );
+          this.#setReg(7, 0n);
+          return false;
+        }
+        case "polkadot_host_0_1_core_clock_wall":
+          this.#chargeBytes(8);
+          this.#writeU64(this.#u32(a0), BigInt(Date.now()) * 1_000_000n);
+          this.#setReg(7, 0n);
+          return false;
+        case "polkadot_host_0_1_core_random": {
+          const length = this.#u32(a1);
+          if (length === 0) {
+            this.#setReg(7, BigInt(CORE_STATUS_INVALID));
+            return false;
+          }
+          if (length > MAX_CORE_RANDOM_BYTES) {
+            this.#setReg(7, BigInt(CORE_STATUS_LIMIT));
+            return false;
+          }
+          this.#chargeBytes(length);
+          let bytes;
+          try {
+            const browserCrypto = globalThis.crypto;
+            if (typeof browserCrypto?.getRandomValues !== "function") {
+              this.#setReg(7, BigInt(CORE_STATUS_DENIED));
+              return false;
+            }
+            bytes = new Uint8Array(length);
+            browserCrypto.getRandomValues(bytes);
+          } catch {
+            this.#setReg(7, BigInt(CORE_STATUS_DENIED));
+            return false;
+          }
+          this.#range(this.#u32(a0), length, true).set(bytes);
+          this.#setReg(7, 0n);
           return false;
         }
         case "host_time_ms": {
@@ -1896,6 +1921,7 @@
         case "host_frame_poll":
         case "host_motion_read":
         case POINTER_CAPTURE_IMPORT:
+        case "polkadot_host_0_1_core_clock_monotonic":
         case "polkadot_host_0_1_core_clock_wall":
         case "polkadot_host_0_1_core_random":
         case UPDATE_AFTER_IMPORT:

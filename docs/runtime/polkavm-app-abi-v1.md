@@ -665,29 +665,29 @@ host_time_ms() -> u64
 host_sleep_ms(duration_ms: u32) -> ()
 ```
 
+Applications may also use the versioned `host.core` clock and entropy operations:
+
+```text
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
+```
+
+The clock operations write a little-endian `u64` nanosecond value and return
+zero. The monotonic clock is scoped to the execution; the wall clock is Unix
+time. `core_random` fills exactly the requested bytes, at most 4 KiB, from the
+Host CSPRNG. It returns `-3` for an empty request, `-5` when secure entropy is
+unavailable, and `-6` above the per-call limit. A failed entropy request does
+not write the guest destination. Invalid writable guest ranges fail the
+execution. These imports do not opt the application into the separate
+application-computer lifecycle.
+
 `host_time_ms` returns a monotonic millisecond clock scoped to the execution.
 It is not wall-clock time.
 
 `host_sleep_ms` yields or advances runtime time by no more than the remaining
 sleep allowance for the current call. A Host MAY return earlier than the
 requested duration.
-
-### Host core services
-
-Cooperative applications may also import the resource-independent operations
-from the experimental `polkadot-host/0.1/core` interface:
-
-```text
-polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
-polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
-```
-
-The clock call writes a little-endian `u64` count of nanoseconds since the Unix
-epoch. The random call fills exactly the requested bytes from a Host CSPRNG.
-It rejects zero-length requests with `-3`, rejects requests larger than 4 KiB
-with `-6`, and otherwise returns zero. Invalid writable guest ranges fail the
-execution. These imports add wall time and entropy; they do not opt the
-application into the separate application-computer lifecycle.
 
 ### Audio
 

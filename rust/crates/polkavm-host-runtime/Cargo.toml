@@ -21,8 +21,6 @@ polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c
 polkavm-gpu-wire = { version = "0.3.0", path = "../polkavm-gpu-wire", features = ["tri2d-validation"] }
 polkavm-motion-wire = { version = "0.3.0", path = "../polkavm-motion-wire" }
 polkavm-ui-wire = { version = "0.3.0", path = "../polkavm-ui-wire" }
-rand_chacha = "0.9"
-rand_core = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-encoder = "0.240"
