@@ -384,6 +384,52 @@ test("compiler backend returns complete u64 clock values to 32-bit guests", asyn
   translated.stop();
 });
 
+test("both browser backends expose application core clocks and entropy", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/app-core-services.polkavm",
+    ),
+  );
+
+  for (const forceInterpreter of [false, true]) {
+    const wallBefore = BigInt(Date.now()) * 1_000_000n;
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: `app-core-services-${forceInterpreter}`,
+        forceInterpreter,
+      },
+    });
+
+    const save = await waitForMessage(messages, "save");
+    const bytes = new Uint8Array(save.bytes);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const wallAfter = BigInt(Date.now()) * 1_000_000n;
+    assert.equal(bytes.byteLength, 56);
+    assert.equal(view.getInt32(24, true), 0);
+    assert.equal(view.getInt32(28, true), 0);
+    assert.equal(view.getInt32(32, true), 0);
+    assert.equal(view.getInt32(36, true), 0);
+    assert.ok(view.getBigUint64(8, true) >= view.getBigUint64(0, true));
+    assert.ok(view.getBigUint64(16, true) >= wallBefore);
+    assert.ok(view.getBigUint64(16, true) <= wallAfter);
+    assert.ok(bytes.subarray(40).some((byte) => byte !== 0));
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("compiler startup keeps the newest GPU capabilities", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

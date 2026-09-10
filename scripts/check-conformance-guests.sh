@@ -6,6 +6,7 @@ FIXTURES="$ROOT/rust/crates/polkavm-host-runtime/tests/fixtures"
 TOOLCHAIN="${POLKAVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
   "polkavm-app-v2/host-frame-roundtrip polkavm_host_frame_roundtrip host-frame-roundtrip.polkavm"
+  "polkavm-app-v2/core-services polkavm_app_core_services app-core-services.polkavm"
   "polkavm-app-v2/ui-output polkavm_ui_output ui-output.polkavm"
   "polkavm-app-v2/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
   "polkadot-host-computer-0.1/core-context polkavm_computer_core_context computer-core-context.polkavm"

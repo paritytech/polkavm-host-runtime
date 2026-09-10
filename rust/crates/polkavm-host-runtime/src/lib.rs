@@ -49,7 +49,7 @@ use polkavm::{CallError, Config, Engine, Instance, Linker, Module, ProgramBlob};
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub use tri2d::{
     Tri2dFrame, MAX_TRI2D_BYTES, MAX_TRI2D_COMMANDS, MAX_TRI2D_DRAWS, MAX_TRI2D_INDICES,
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
@@ -413,6 +413,35 @@ impl HostClock {
     #[cfg(target_arch = "wasm32")]
     fn set_time_ms(&mut self, time_ms: u64) {
         self.now_ms = self.now_ms.max(time_ms);
+    }
+}
+
+fn wall_clock_ns() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX.into()) as u64
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::wall_clock_ns()
+    }
+}
+
+fn fill_random(bytes: &mut [u8]) -> i32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match getrandom::fill(bytes) {
+            Ok(()) => 0,
+            Err(_) => computer::STATUS_DENIED,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::fill_random(bytes)
     }
 }
 
@@ -1321,6 +1350,68 @@ impl Runtime {
                 },
             )
             .context("define host_time_ms")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_monotonic",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    let nanoseconds = caller
+                        .user_data
+                        .clock
+                        .elapsed_ms()
+                        .saturating_mul(1_000_000)
+                        .to_le_bytes();
+                    caller
+                        .instance
+                        .write_memory(destination, &nanoseconds)
+                        .map_err(|error| anyhow!("write monotonic clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_monotonic")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_wall",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    caller
+                        .instance
+                        .write_memory(destination, &wall_clock_ns().to_le_bytes())
+                        .map_err(|error| anyhow!("write wall clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_wall")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_random",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let length = length as usize;
+                    if length == 0 {
+                        return Ok(computer::STATUS_INVALID);
+                    }
+                    if length > computer::MAX_RANDOM_BYTES {
+                        return Ok(computer::STATUS_LIMIT);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    let mut bytes = [0; computer::MAX_RANDOM_BYTES];
+                    let status = fill_random(&mut bytes[..length]);
+                    if status == 0 {
+                        caller
+                            .instance
+                            .write_memory(destination, &bytes[..length])
+                            .map_err(|error| anyhow!("write random bytes: {error:?}"))?;
+                    }
+                    Ok(status)
+                },
+            )
+            .context("define polkadot_host_0_1_core_random")?;
 
         linker
             .define_typed(
