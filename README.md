@@ -29,6 +29,20 @@ input, output, GPU, audio, and host-frame operations return
 `NativePolkaVmError::Stopped`, while `is_exited()` reports `true`. Consumers
 must regenerate their UniFFI bindings when updating to this API surface.
 
+Large browser guests use bounded groups of Wasm functions instead of one
+function per basic block, avoiding browser function-count limits while
+preserving gas accounting and hostcall resumption. Compilation first uses one
+module to keep calls local. If the browser exhausts native compilation capacity,
+the runtime retries with bounded code modules sharing guest memory, registers,
+and dispatch state before falling back to the interpreter. Cached compiled
+programs include the root and every code module; instantiation creates fresh
+guest state.
+
+Browser and native render passes accept registered texture views as offscreen
+color attachments; zero still selects the surface. Offscreen passes preserve
+the surface and retain generation and resource-handle validation. These changes
+remain within application runtime ABI 1, as required by ADR 0001.
+
 
 ## Build and test
 

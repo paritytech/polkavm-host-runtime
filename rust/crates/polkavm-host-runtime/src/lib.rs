@@ -10,6 +10,7 @@ pub use polkavm_gpu_wire as gpu_wire;
 pub use polkavm_motion_wire as motion_wire;
 pub use polkavm_ui_wire as ui_wire;
 mod manifest;
+mod mediated_input;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
@@ -37,11 +38,20 @@ pub use computer::{
     FS_OPEN_READ, FS_OPEN_TRUNCATE, FS_OPEN_WRITE, MAX_BACKGROUND_PROCESSES,
     MAX_COMPUTER_CONTEXT_BYTES, MAX_COMPUTER_CONTEXT_ENTRIES, MAX_COMPUTER_DIRECTORIES,
     MAX_COMPUTER_FILES, MAX_COMPUTER_FILE_BYTES, MAX_COMPUTER_PATH_BYTES, MAX_COMPUTER_PROCESSES,
-    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES,
-    MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
+    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_RANDOM_BYTES,
+    MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
 };
 pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
 pub use manifest::AppDescriptor;
+pub use mediated_input::{
+    MediatedInputCommand, MediatedInputRequest, MediatedInputStatus, MAX_MEDIATED_INPUT_BYTES,
+    MAX_MEDIATED_INPUT_KIND_BYTES, MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES,
+    MAX_MEDIATED_INPUT_REGISTRATIONS, MEDIATED_INPUT_CANCEL_ACCEPTED,
+    MEDIATED_INPUT_CANCEL_INVALID_HANDLE, MEDIATED_INPUT_CANCEL_NOT_ACTIVE,
+    MEDIATED_INPUT_REGISTER_INVALID, MEDIATED_INPUT_REGISTER_QUOTA_EXCEEDED,
+    MEDIATED_INPUT_REGISTER_UNAVAILABLE, MEDIATED_INPUT_TRIGGER_ACCEPTED,
+    MEDIATED_INPUT_TRIGGER_BUSY, MEDIATED_INPUT_TRIGGER_INVALID_HANDLE,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 pub use polkavm::BackendKind;
@@ -49,7 +59,7 @@ use polkavm::{CallError, Config, Engine, Instance, Linker, Module, ProgramBlob};
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub use tri2d::{
     Tri2dFrame, MAX_TRI2D_BYTES, MAX_TRI2D_COMMANDS, MAX_TRI2D_DRAWS, MAX_TRI2D_INDICES,
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
@@ -416,6 +426,35 @@ impl HostClock {
     }
 }
 
+fn wall_clock_ns() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX.into()) as u64
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::wall_clock_ns()
+    }
+}
+
+fn fill_random(bytes: &mut [u8]) -> i32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match getrandom::fill(bytes) {
+            Ok(()) => 0,
+            Err(_) => computer::STATUS_DENIED,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::fill_random(bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MotionState {
     availability: motion_wire::MotionAvailability,
@@ -519,6 +558,7 @@ struct HostState {
     host_frame_request_bytes: usize,
     host_frame_responses: VecDeque<Vec<u8>>,
     host_frame_response_bytes: usize,
+    mediated_input: mediated_input::MediatedInputState,
     gpu_last_sequence: u64,
     gpu_submits_remaining: u32,
     gpu_upload_bytes_remaining: usize,
@@ -566,6 +606,7 @@ impl HostState {
             host_frame_request_bytes: 0,
             host_frame_responses: VecDeque::new(),
             host_frame_response_bytes: 0,
+            mediated_input: mediated_input::MediatedInputState::default(),
             gpu_last_sequence: 0,
             gpu_submits_remaining: 0,
             gpu_upload_bytes_remaining: 0,
@@ -1263,6 +1304,118 @@ impl Runtime {
 
         linker
             .define_typed(
+                "host_input_register",
+                |caller: polkavm::Caller<'_, HostState>,
+                 kind_pointer: u32,
+                 kind_length: u32,
+                 media_type_pointer: u32,
+                 media_type_length: u32,
+                 max_bytes: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let kind_length = kind_length as usize;
+                    let media_type_length = media_type_length as usize;
+                    if kind_length == 0
+                        || kind_length > MAX_MEDIATED_INPUT_KIND_BYTES
+                        || media_type_length == 0
+                        || media_type_length > MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES
+                    {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    }
+                    caller
+                        .user_data
+                        .charge_hostcall_bytes(kind_length + media_type_length)?;
+                    let Ok(kind) = read_guest_memory(caller.instance, kind_pointer, kind_length)
+                        .and_then(|bytes| String::from_utf8(bytes).map_err(|error| anyhow!(error)))
+                    else {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    };
+                    let Ok(media_type) =
+                        read_guest_memory(caller.instance, media_type_pointer, media_type_length)
+                            .and_then(|bytes| {
+                                String::from_utf8(bytes).map_err(|error| anyhow!(error))
+                            })
+                    else {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    };
+                    Ok(caller.user_data.mediated_input.register(
+                        kind,
+                        media_type,
+                        max_bytes as usize,
+                    ))
+                },
+            )
+            .context("define host_input_register")?;
+
+        linker
+            .define_typed(
+                "host_input_trigger",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    Ok(caller.user_data.mediated_input.trigger(handle))
+                },
+            )
+            .context("define host_input_trigger")?;
+
+        linker
+            .define_typed(
+                "host_input_status",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    Ok(caller.user_data.mediated_input.status(handle) as u32)
+                },
+            )
+            .context("define host_input_status")?;
+
+        linker
+            .define_typed(
+                "host_input_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let Some(required) = caller
+                        .user_data
+                        .mediated_input
+                        .result(handle)
+                        .map(<[u8]>::len)
+                    else {
+                        return Ok(0);
+                    };
+                    if (capacity as usize) < required {
+                        let required = i32::try_from(required)
+                            .map_err(|_| anyhow!("mediated-input result length overflow"))?;
+                        return Ok(-required);
+                    }
+                    caller.user_data.charge_hostcall_bytes(required)?;
+                    let bytes = caller
+                        .user_data
+                        .mediated_input
+                        .result(handle)
+                        .expect("mediated-input result disappeared");
+                    if caller.instance.write_memory(pointer, bytes).is_err() {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    }
+                    caller.user_data.mediated_input.consume_result(handle);
+                    Ok(required as i32)
+                },
+            )
+            .context("define host_input_read")?;
+
+        linker
+            .define_typed(
+                "host_input_cancel",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    Ok(caller.user_data.mediated_input.cancel(handle))
+                },
+            )
+            .context("define host_input_cancel")?;
+
+        linker
+            .define_typed(
                 motion_wire::MOTION_READ_IMPORT,
                 |caller: polkavm::Caller<'_, HostState>,
                  pointer: u32,
@@ -1321,6 +1474,69 @@ impl Runtime {
                 },
             )
             .context("define host_time_ms")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_monotonic",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    let nanoseconds = caller
+                        .user_data
+                        .clock
+                        .elapsed_ms()
+                        .saturating_mul(1_000_000)
+                        .to_le_bytes();
+                    caller
+                        .instance
+                        .write_memory(destination, &nanoseconds)
+                        .map_err(|error| anyhow!("write monotonic clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_monotonic")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_wall",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    caller
+                        .instance
+                        .write_memory(destination, &wall_clock_ns().to_le_bytes())
+                        .map_err(|error| anyhow!("write wall clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_wall")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_random",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let length = length as usize;
+                    caller.user_data.charge_hostcall(0)?;
+                    if length == 0 {
+                        return Ok(computer::STATUS_INVALID);
+                    }
+                    if length > MAX_RANDOM_BYTES {
+                        return Ok(computer::STATUS_LIMIT);
+                    }
+                    caller.user_data.charge_hostcall_bytes(length)?;
+                    let mut bytes = [0; MAX_RANDOM_BYTES];
+                    let status = fill_random(&mut bytes[..length]);
+                    if status == 0 {
+                        caller
+                            .instance
+                            .write_memory(destination, &bytes[..length])
+                            .map_err(|error| anyhow!("write random bytes: {error:?}"))?;
+                    }
+                    Ok(status)
+                },
+            )
+            .context("define polkadot_host_0_1_core_random")?;
 
         linker
             .define_typed(
@@ -1681,6 +1897,23 @@ impl Runtime {
             && self.state.host_frame_request_bytes == 0
             && self.state.host_frame_responses.is_empty()
             && self.state.host_frame_response_bytes == 0
+    }
+
+    pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
+        self.state.mediated_input.set_supported_kinds(kinds)
+    }
+
+    pub fn take_mediated_input_command(&mut self) -> Option<MediatedInputCommand> {
+        self.state.mediated_input.take_command()
+    }
+
+    pub fn send_mediated_input_result(
+        &mut self,
+        handle: u32,
+        status: MediatedInputStatus,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        self.state.mediated_input.complete(handle, status, bytes)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -2271,7 +2504,6 @@ mod tests {
         .unwrap();
         idle_runtime.init().unwrap();
         assert_eq!(idle_runtime.update_after_ms(), None);
-
         let legacy = Runtime::new_with_backend(
             &no_motion_test_program(),
             HashMap::new(),

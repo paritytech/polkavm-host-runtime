@@ -9,12 +9,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use polkavm::program::{Instruction as PvmInstruction, ParsedInstruction, RawReg};
 use polkavm::{MemoryMapBuilder, ProgramBlob, Reg, RETURN_TO_HOST};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
-    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
-    Instruction as W, MemArg, MemorySection, MemoryType, Module, RefType, TableSection, TableType,
-    TypeSection, ValType,
+    EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
+    ImportSection, Instruction as W, MemArg, MemorySection, MemoryType, Module, RefType,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 const PAGE_SIZE: u32 = 65_536;
@@ -24,11 +23,23 @@ const STATUS_TRAP: i32 = -3;
 const STATUS_OUT_OF_GAS: i32 = -4;
 const REGISTER_COUNT: u32 = 13;
 
+// Keep both the dispatch nesting and the worst-case function body bounded. A
+// PolkaVM block can be arbitrarily long; splitting it must not add gas charges.
+const BLOCKS_PER_FUNCTION: usize = 128;
+const INSTRUCTIONS_PER_BLOCK: usize = 16;
+const RESOLVERS_PER_FUNCTION: usize = 128;
+// Bound each native compilation unit without splitting a block-group function.
+const CODE_PART_BYTES: usize = 8 * 1024 * 1024;
+const CODE_PART_SECTION: &str = "epoca.pvm.code-part";
+
 const TYPE_BLOCK: u32 = 0;
 const TYPE_BINARY_I64: u32 = 1;
 const TYPE_BEGIN: u32 = 2;
 const TYPE_SET_GAS: u32 = 3;
 const TYPE_UNARY_I64: u32 = 4;
+const TYPE_RESOLVER: u32 = 5;
+const TYPE_INDIRECT: u32 = 6;
+const TYPE_LOAD: u32 = 7;
 
 const GLOBAL_PC: u32 = REGISTER_COUNT;
 const GLOBAL_GAS: u32 = GLOBAL_PC + 1;
@@ -69,6 +80,19 @@ enum LoadKind {
     U64,
 }
 
+impl LoadKind {
+    // Declaration order is also the offset in the shared helper function range.
+    const ALL: [Self; 7] = [
+        Self::U8,
+        Self::I8,
+        Self::U16,
+        Self::I16,
+        Self::U32,
+        Self::I32,
+        Self::U64,
+    ];
+}
+
 #[derive(Clone, Copy)]
 enum StoreKind {
     U8,
@@ -78,6 +102,15 @@ enum StoreKind {
 }
 
 pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
+    translate_with_part_limit(program, None)
+}
+
+pub fn translate_partitioned(program: &[u8]) -> Result<Vec<u8>> {
+    translate_with_part_limit(program, Some(CODE_PART_BYTES))
+}
+
+fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Result<Vec<u8>> {
+    let partitioned = part_limit.is_some();
     if program.is_empty() || program.len() > MAX_PROGRAM_BYTES {
         bail!("guest program exceeds browser limit");
     }
@@ -101,7 +134,9 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     let layout = build_layout(&blob)?;
     let targets = collect_block_targets(&blob, &instructions)?;
     let (blocks, block_by_pc) = build_blocks(&instructions, &targets)?;
-    let jump_targets: Vec<_> = blob.jump_table().into_iter().collect();
+    let jump_targets = blob.jump_table();
+    let block_group_count = blocks.len().div_ceil(BLOCKS_PER_FUNCTION) as u32;
+    let resolver_group_count = jump_targets.len().div_ceil(RESOLVERS_PER_FUNCTION as u32);
 
     let mut module = Module::new();
     let mut types = TypeSection::new();
@@ -114,24 +149,46 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
         .function([ValType::I32, ValType::I64], [ValType::I32]);
     types.ty().function([ValType::I64], []);
     types.ty().function([ValType::I64], [ValType::I64]);
+    types.ty().function([ValType::I32], [ValType::I32]);
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+    types.ty().function([ValType::I32], [ValType::I64]);
     module.section(&types);
 
-    let helper_count = 3u32;
-    let block_base = helper_count;
-    let resolver_base = block_base + blocks.len() as u32;
-    let dispatcher_index = resolver_base + jump_targets.len() as u32;
+    let load_function_base = 7;
+    let helper_count = load_function_base + LoadKind::ALL.len() as u32;
+    let root_helper_count = if partitioned { 0 } else { helper_count };
+    let root_block_count = if partitioned { 0 } else { block_group_count };
+    let resolver_base = root_helper_count + root_block_count;
+    let dispatcher_index = resolver_base + resolver_group_count;
     let begin_index = dispatcher_index + 1;
     let set_gas_index = begin_index + 1;
 
     let mut functions = FunctionSection::new();
-    functions.function(TYPE_BINARY_I64);
-    functions.function(TYPE_UNARY_I64);
-    functions.function(TYPE_UNARY_I64);
-    for _ in &blocks {
-        functions.function(TYPE_BLOCK);
+    let helper_types = [
+        TYPE_BINARY_I64,
+        TYPE_UNARY_I64,
+        TYPE_UNARY_I64,
+        TYPE_INDIRECT,
+        TYPE_INDIRECT,
+        TYPE_RESOLVER,
+        TYPE_BLOCK,
+    ]
+    .into_iter()
+    .chain(std::iter::repeat_n(TYPE_LOAD, LoadKind::ALL.len()))
+    .collect::<Vec<_>>();
+    let mut part_imports = ImportSection::new();
+    if !partitioned {
+        for &ty in &helper_types {
+            functions.function(ty);
+        }
+        for _ in 0..block_group_count {
+            functions.function(TYPE_BLOCK);
+        }
     }
-    for _ in &jump_targets {
-        functions.function(TYPE_BLOCK);
+    for _ in 0..resolver_group_count {
+        functions.function(TYPE_RESOLVER);
     }
     functions.function(TYPE_BLOCK);
     functions.function(TYPE_BEGIN);
@@ -139,34 +196,34 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     module.section(&functions);
 
     let mut table = TableSection::new();
-    table.table(TableType {
+    let table_type = TableType {
         element_type: RefType::FUNCREF,
-        minimum: (blocks.len() + jump_targets.len()) as u64,
-        maximum: Some((blocks.len() + jump_targets.len()) as u64),
+        minimum: u64::from(block_group_count + resolver_group_count),
+        maximum: Some(u64::from(block_group_count + resolver_group_count)),
         table64: false,
         shared: false,
-    });
+    };
+    table.table(table_type);
+    part_imports.import("pvm", "__table", EntityType::Table(table_type));
     module.section(&table);
 
     let rw_prefix_pages = u64::from(layout.rw_phys / PAGE_SIZE);
     let mut memory = MemorySection::new();
-    memory.memory(MemoryType {
+    let memory_type = MemoryType {
         minimum: rw_prefix_pages + layout.rw_pages,
         maximum: Some(rw_prefix_pages + layout.rw_max_pages),
         memory64: false,
         shared: false,
         page_size_log2: None,
-    });
+    };
+    memory.memory(memory_type);
+    part_imports.import("pvm", "memory", EntityType::Memory(memory_type));
     module.section(&memory);
 
     let mut globals = GlobalSection::new();
     for index in 0..REGISTER_COUNT {
         globals.global(
-            GlobalType {
-                val_type: ValType::I64,
-                mutable: true,
-                shared: false,
-            },
+            shared_global_type(index),
             &ConstExpr::i64_const(if index == Reg::SP.to_u32() {
                 layout.stack_high as i64
             } else {
@@ -176,30 +233,24 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     }
     for _ in 0..5 {
         let index = globals.len();
-        if index == GLOBAL_GAS || index == GLOBAL_HEAP_SIZE {
-            globals.global(
-                GlobalType {
-                    val_type: ValType::I64,
-                    mutable: true,
-                    shared: false,
-                },
-                &ConstExpr::i64_const(0),
-            );
+        let ty = shared_global_type(index);
+        let initial = if ty.val_type == ValType::I64 {
+            ConstExpr::i64_const(0)
         } else {
-            globals.global(
-                GlobalType {
-                    val_type: ValType::I32,
-                    mutable: true,
-                    shared: false,
-                },
-                &ConstExpr::i32_const(0),
-            );
-        }
+            ConstExpr::i32_const(0)
+        };
+        globals.global(ty, &initial);
     }
     module.section(&globals);
 
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
+    exports.export("__table", ExportKind::Table, 0);
+    for index in 0..globals.len() {
+        let name = format!("__global{index}");
+        exports.export(&name, ExportKind::Global, index);
+        part_imports.import("pvm", &name, EntityType::Global(shared_global_type(index)));
+    }
     exports.export("pvm_begin", ExportKind::Func, begin_index);
     exports.export("pvm_resume", ExportKind::Func, dispatcher_index);
     exports.export("pvm_set_gas", ExportKind::Func, set_gas_index);
@@ -213,50 +264,82 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     exports.export("trap_pc", ExportKind::Global, GLOBAL_TRAP_PC);
     module.section(&exports);
 
-    let table_functions: Vec<u32> =
-        (block_base..resolver_base + jump_targets.len() as u32).collect();
+    let table_functions: Vec<u32> = (root_helper_count..dispatcher_index).collect();
     let mut elements = ElementSection::new();
     elements.active(
         Some(0),
-        &ConstExpr::i32_const(0),
+        &ConstExpr::i32_const(if partitioned {
+            block_group_count as i32
+        } else {
+            0
+        }),
         Elements::Functions(Cow::Owned(table_functions)),
     );
     module.section(&elements);
 
-    let mut code = CodeSection::new();
-    code.function(&emit_mulhu());
-    code.function(&emit_bswap32());
-    code.function(&emit_bswap64());
+    let mut helper_code = CodeSection::new();
+    helper_code.function(&emit_mulhu());
+    helper_code.function(&emit_bswap32());
+    helper_code.function(&emit_bswap64());
 
     let context = EmitContext {
         layout,
         block_by_pc: &block_by_pc,
-        jump_table_len: jump_targets.len() as u32,
-        resolver_table_base: blocks.len() as u32,
-        block_function_base: block_base,
+        jump_table_len: jump_targets.len(),
+        resolver_table_base: block_group_count,
+        control_targets: &targets,
         mulhu_function: 0,
         bswap32_function: 1,
         metered_targets: &metered_targets,
         bswap64_function: 2,
         is_64_bit: blob.is_64_bit(),
+        indirect_function: 3,
+        return_function: 4,
+        physical_address_function: 5,
+        gas_function: 6,
+        load_function_base,
+        local_block_start: 0,
+        local_block_end: root_block_count,
     };
-    for block in &blocks {
-        code.function(&emit_block(&context, block)?);
+    helper_code.function(&emit_indirect_helper(&context, true));
+    helper_code.function(&emit_indirect_helper(&context, false));
+    helper_code.function(&emit_physical_address_helper(layout));
+    helper_code.function(&emit_gas_helper());
+    for kind in LoadKind::ALL {
+        helper_code.function(&emit_load_helper(kind, context.physical_address_function));
     }
-    for target in &jump_targets {
+    let mut code = if partitioned {
+        CodeSection::new()
+    } else {
+        let mut code = helper_code.clone();
+        for group in blocks.chunks(BLOCKS_PER_FUNCTION) {
+            code.function(&emit_block_group(&context, group)?);
+        }
+        code
+    };
+    for start in (0..jump_targets.len()).step_by(RESOLVERS_PER_FUNCTION) {
+        let count = (jump_targets.len() - start).min(RESOLVERS_PER_FUNCTION as u32);
         let mut function = Function::new([]);
-        function.instruction(&W::I32Const(
-            block_by_pc
-                .get(&target.0)
-                .copied()
-                .map(|index| index as i32)
-                .unwrap_or(STATUS_TRAP),
-        ));
+        emit_switch(&mut function, count as usize, 0, RESOLVERS_PER_FUNCTION);
+        for index in start..start + count {
+            let target = jump_targets
+                .get_by_index(index)
+                .expect("jump table index is in bounds");
+            function.instruction(&W::End);
+            function.instruction(&W::I32Const(
+                block_by_pc
+                    .get(target.0)
+                    .expect("validated jump target has a block") as i32,
+            ));
+            function.instruction(&W::Return);
+        }
+        function.instruction(&W::End);
+        function.instruction(&W::Unreachable);
         function.instruction(&W::End);
         code.function(&function);
     }
-    code.function(&emit_dispatcher());
-    code.function(&emit_begin());
+    code.function(&emit_dispatcher(blocks.len() as u32));
+    code.function(&emit_begin(dispatcher_index));
     code.function(&emit_set_gas());
     module.section(&code);
 
@@ -282,7 +365,94 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
         name: Cow::Borrowed("epoca.pvm.meta"),
         data: Cow::Owned(metadata),
     });
+
+    if let Some(part_limit) = part_limit {
+        let mut part_code = helper_code.clone();
+        let mut part_table_offset = 0;
+        for (group_index, group) in blocks.chunks(BLOCKS_PER_FUNCTION).enumerate() {
+            let mut part_context = EmitContext {
+                local_block_start: part_table_offset,
+                local_block_end: group_index as u32 + 1,
+                ..context
+            };
+            let mut function = emit_block_group(&part_context, group)?;
+            // Reserve the maximum u32 body-size prefix as well as the actual body.
+            if part_code.len() > helper_count
+                && part_code.byte_len() + function.byte_len() + 5 > part_limit
+            {
+                append_code_part(
+                    &mut module,
+                    &types,
+                    &part_imports,
+                    &part_code,
+                    &helper_types,
+                    part_table_offset,
+                );
+                part_table_offset += part_code.len() - helper_count;
+                part_code = helper_code.clone();
+                part_context.local_block_start = part_table_offset;
+                function = emit_block_group(&part_context, group)?;
+            }
+            part_code.function(&function);
+        }
+        if part_code.len() > helper_count {
+            append_code_part(
+                &mut module,
+                &types,
+                &part_imports,
+                &part_code,
+                &helper_types,
+                part_table_offset,
+            );
+        }
+    }
     Ok(module.finish())
+}
+
+fn shared_global_type(index: u32) -> GlobalType {
+    GlobalType {
+        val_type: if index < REGISTER_COUNT || index == GLOBAL_GAS || index == GLOBAL_HEAP_SIZE {
+            ValType::I64
+        } else {
+            ValType::I32
+        },
+        mutable: true,
+        shared: false,
+    }
+}
+
+fn append_code_part(
+    root: &mut Module,
+    types: &TypeSection,
+    imports: &ImportSection,
+    code: &CodeSection,
+    helper_types: &[u32],
+    table_offset: u32,
+) {
+    let mut part = Module::new();
+    part.section(types);
+    part.section(imports);
+    let mut functions = FunctionSection::new();
+    let helper_count = helper_types.len() as u32;
+    for &ty in helper_types {
+        functions.function(ty);
+    }
+    for _ in helper_count..code.len() {
+        functions.function(TYPE_BLOCK);
+    }
+    part.section(&functions);
+    let mut elements = ElementSection::new();
+    elements.active(
+        Some(0),
+        &ConstExpr::i32_const(table_offset as i32),
+        Elements::Functions(Cow::Owned((helper_count..code.len()).collect())),
+    );
+    part.section(&elements);
+    part.section(code);
+    root.section(&CustomSection {
+        name: Cow::Borrowed(CODE_PART_SECTION),
+        data: Cow::Owned(part.finish()),
+    });
 }
 
 fn align(value: u32, alignment: u32) -> Result<u32> {
@@ -396,79 +566,104 @@ fn direct_target(kind: PvmInstruction) -> Option<u32> {
 fn collect_block_targets(
     blob: &ProgramBlob,
     instructions: &[ParsedInstruction],
-) -> Result<BTreeSet<u32>> {
-    let valid: BTreeSet<_> = instructions
-        .iter()
-        .map(|instruction| instruction.offset.0)
-        .collect();
-    let mut targets = BTreeSet::from([instructions[0].offset.0]);
-    for export in blob.exports() {
-        targets.insert(export.program_counter().0);
-    }
-    for target in blob.jump_table() {
-        targets.insert(target.0);
-    }
+) -> Result<Vec<u32>> {
+    // Flat sorted indexes avoid a tree node and a second instruction allocation
+    // for each of the millions of blocks in a large guest.
+    let mut targets = vec![instructions[0].offset.0];
+    targets.extend(blob.exports().map(|export| export.program_counter().0));
+    targets.extend(blob.jump_table().into_iter().map(|target| target.0));
     for instruction in instructions {
         if let Some(target) = direct_target(instruction.kind) {
-            targets.insert(target);
+            targets.push(target);
         }
-        if is_terminator(instruction.kind) && valid.contains(&instruction.next_offset.0) {
-            targets.insert(instruction.next_offset.0);
+        if is_terminator(instruction.kind)
+            && instruction.next_offset.0 <= instructions.last().unwrap().offset.0
+        {
+            targets.push(instruction.next_offset.0);
         }
     }
-    if let Some(invalid) = targets.iter().find(|target| !valid.contains(target)) {
-        bail!("PolkaVM control-flow target {invalid} is not an instruction");
+    targets.sort_unstable();
+    targets.dedup();
+    for &target in &targets {
+        if instructions
+            .binary_search_by_key(&target, |instruction| instruction.offset.0)
+            .is_err()
+        {
+            bail!("PolkaVM control-flow target {target} is not an instruction");
+        }
     }
     Ok(targets)
 }
 
-type BlockLayout = (Vec<Vec<ParsedInstruction>>, BTreeMap<u32, u32>);
-
-fn build_blocks(
-    instructions: &[ParsedInstruction],
-    targets: &BTreeSet<u32>,
-) -> Result<BlockLayout> {
-    let mut blocks = Vec::new();
-    let mut current = Vec::new();
-    for instruction in instructions {
-        if targets.contains(&instruction.offset.0) && !current.is_empty() {
-            blocks.push(std::mem::take(&mut current));
-        }
-        current.push(*instruction);
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-    let mut block_by_pc = BTreeMap::new();
-    for (index, block) in blocks.iter().enumerate() {
-        block_by_pc.insert(block[0].offset.0, index as u32);
-    }
-    Ok((blocks, block_by_pc))
+struct BlockMap {
+    pcs: Vec<u32>,
 }
 
-fn collect_metered_targets(instructions: &[ParsedInstruction]) -> BTreeSet<u32> {
-    let mut targets = BTreeSet::new();
+impl BlockMap {
+    fn get(&self, pc: u32) -> Option<u32> {
+        self.pcs.binary_search(&pc).ok().map(|index| index as u32)
+    }
+}
+
+type BlockLayout<'a> = (Vec<&'a [ParsedInstruction]>, BlockMap);
+
+fn build_blocks<'a>(
+    instructions: &'a [ParsedInstruction],
+    targets: &[u32],
+) -> Result<BlockLayout<'a>> {
+    let mut blocks = Vec::new();
+    let mut pcs = Vec::new();
+    let mut start = 0;
+    let mut next_target = 1;
+    for index in 1..instructions.len() {
+        let is_target = targets.get(next_target) == Some(&instructions[index].offset.0);
+        if is_target {
+            next_target += 1;
+        }
+        if is_target || index - start == INSTRUCTIONS_PER_BLOCK {
+            pcs.push(instructions[start].offset.0);
+            blocks.push(&instructions[start..index]);
+            start = index;
+        }
+    }
+    pcs.push(instructions[start].offset.0);
+    blocks.push(&instructions[start..]);
+    Ok((blocks, BlockMap { pcs }))
+}
+
+fn collect_metered_targets(instructions: &[ParsedInstruction]) -> Vec<u32> {
+    let mut targets = Vec::new();
     for instruction in instructions {
         if let Some(target) = direct_target(instruction.kind) {
             if target <= instruction.offset.0 {
-                targets.insert(target);
+                targets.push(target);
             }
         }
     }
+    targets.sort_unstable();
+    targets.dedup();
     targets
 }
 
+#[derive(Clone, Copy)]
 struct EmitContext<'a> {
     layout: Layout,
-    block_by_pc: &'a BTreeMap<u32, u32>,
+    block_by_pc: &'a BlockMap,
     jump_table_len: u32,
     resolver_table_base: u32,
-    block_function_base: u32,
+    control_targets: &'a [u32],
     mulhu_function: u32,
     bswap32_function: u32,
-    metered_targets: &'a BTreeSet<u32>,
+    metered_targets: &'a [u32],
     bswap64_function: u32,
     is_64_bit: bool,
+    indirect_function: u32,
+    return_function: u32,
+    physical_address_function: u32,
+    gas_function: u32,
+    load_function_base: u32,
+    local_block_start: u32,
+    local_block_end: u32,
 }
 
 fn reg_index(reg: RawReg) -> u32 {
@@ -583,18 +778,31 @@ fn emit_bswap64() -> Function {
     f
 }
 
-fn emit_dispatcher() -> Function {
+fn emit_dispatcher(block_count: u32) -> Function {
     let mut f = Function::new([]);
     f.instruction(&W::GlobalGet(GLOBAL_PC));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::I32Const(block_count as i32));
+    f.instruction(&W::I32GeU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::I32Const(STATUS_TRAP));
+    f.instruction(&W::Return);
+    f.instruction(&W::End);
+    emit_dispatch_from_pc(&mut f);
     f.instruction(&W::End);
     f
 }
 
-fn emit_begin() -> Function {
+fn emit_dispatch_from_pc(f: &mut Function) {
+    f.instruction(&W::GlobalGet(GLOBAL_PC));
+    f.instruction(&W::I32Const(BLOCKS_PER_FUNCTION.trailing_zeros() as i32));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::ReturnCallIndirect {
+        type_index: TYPE_BLOCK,
+        table_index: 0,
+    });
+}
+
+fn emit_begin(dispatcher_index: u32) -> Function {
     let mut f = Function::new([]);
     f.instruction(&W::I64Const(RETURN_TO_HOST as i64));
     f.instruction(&W::GlobalSet(Reg::RA.to_u32()));
@@ -602,11 +810,7 @@ fn emit_begin() -> Function {
     f.instruction(&W::GlobalSet(GLOBAL_PC));
     f.instruction(&W::LocalGet(1));
     f.instruction(&W::GlobalSet(GLOBAL_GAS));
-    f.instruction(&W::LocalGet(0));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::ReturnCall(dispatcher_index));
     f.instruction(&W::End);
     f
 }
@@ -619,11 +823,7 @@ fn emit_set_gas() -> Function {
     f
 }
 
-fn encode_metadata(
-    blob: &ProgramBlob,
-    block_by_pc: &BTreeMap<u32, u32>,
-    layout: Layout,
-) -> Result<Vec<u8>> {
+fn encode_metadata(blob: &ProgramBlob, block_by_pc: &BlockMap, layout: Layout) -> Result<Vec<u8>> {
     let mut bytes = b"EPM2".to_vec();
     bytes.extend_from_slice(&u32::from(blob.is_64_bit()).to_le_bytes());
     for value in [
@@ -663,43 +863,78 @@ fn encode_metadata(
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.extend_from_slice(name);
         let block = block_by_pc
-            .get(&export.program_counter().0)
-            .copied()
+            .get(export.program_counter().0)
             .ok_or_else(|| anyhow!("export target is not a translated block"))?;
         bytes.extend_from_slice(&block.to_le_bytes());
     }
     Ok(bytes)
 }
 
-fn emit_gas_charge(f: &mut Function) {
+fn emit_gas_helper() -> Function {
+    let mut f = Function::new([(1, ValType::I64)]);
     f.instruction(&W::GlobalGet(GLOBAL_GAS));
     f.instruction(&W::I64Const(1));
     f.instruction(&W::I64Sub);
-    f.instruction(&W::LocalTee(LOCAL_I64_0));
+    f.instruction(&W::LocalTee(0));
     f.instruction(&W::GlobalSet(GLOBAL_GAS));
-    f.instruction(&W::LocalGet(LOCAL_I64_0));
+    f.instruction(&W::LocalGet(0));
     f.instruction(&W::I64Const(0));
     f.instruction(&W::I64LeS);
+    f.instruction(&W::End);
+    f
+}
+
+fn emit_gas_charge(f: &mut Function, gas_function: u32) {
+    f.instruction(&W::Call(gas_function));
     f.instruction(&W::If(BlockType::Empty));
     f.instruction(&W::I32Const(STATUS_OUT_OF_GAS));
     f.instruction(&W::Return);
     f.instruction(&W::End);
 }
 
-fn emit_block(context: &EmitContext<'_>, block: &[ParsedInstruction]) -> Result<Function> {
-    let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
-    if context.metered_targets.contains(&block[0].offset.0) {
-        emit_gas_charge(&mut f);
+// Emit a bounded br_table switch. The extra outer label is the invalid selector
+// path; callers emit one End and one terminating case per entry, then close it.
+fn emit_switch(f: &mut Function, count: usize, local: u32, capacity: usize) {
+    for _ in 0..=count {
+        f.instruction(&W::Block(BlockType::Empty));
     }
+    f.instruction(&W::LocalGet(local));
+    f.instruction(&W::I32Const((capacity - 1) as i32));
+    f.instruction(&W::I32And);
+    let labels: Vec<u32> = (0..count as u32).collect();
+    f.instruction(&W::BrTable(Cow::Owned(labels), count as u32));
+}
 
-    for instruction in block {
-        if emit_instruction(context, &mut f, instruction)? {
-            f.instruction(&W::End);
-            return Ok(f);
+fn emit_block_group(
+    context: &EmitContext<'_>,
+    blocks: &[&[ParsedInstruction]],
+) -> Result<Function> {
+    let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
+    f.instruction(&W::GlobalGet(GLOBAL_PC));
+    f.instruction(&W::LocalSet(LOCAL_ADDR));
+    emit_switch(&mut f, blocks.len(), LOCAL_ADDR, BLOCKS_PER_FUNCTION);
+    for block in blocks {
+        f.instruction(&W::End);
+        if context
+            .metered_targets
+            .binary_search(&block[0].offset.0)
+            .is_ok()
+        {
+            emit_gas_charge(&mut f, context.gas_function);
+        }
+        let mut terminated = false;
+        for instruction in *block {
+            if emit_instruction(context, &mut f, instruction)? {
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            emit_block_target(context, &mut f, block.last().unwrap().next_offset.0)?;
         }
     }
-    let next = block.last().unwrap().next_offset.0;
-    emit_block_target(context, &mut f, next)?;
+    f.instruction(&W::End);
+    f.instruction(&W::Unreachable);
     f.instruction(&W::End);
     Ok(f)
 }
@@ -707,10 +942,23 @@ fn emit_block(context: &EmitContext<'_>, block: &[ParsedInstruction]) -> Result<
 fn emit_block_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Result<()> {
     let target = context
         .block_by_pc
-        .get(&pc)
-        .copied()
+        .get(pc)
         .ok_or_else(|| anyhow!("translated fallthrough target {pc} is missing"))?;
-    f.instruction(&W::ReturnCall(context.block_function_base + target));
+    f.instruction(&W::I32Const(target as i32));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
+    let group = target / BLOCKS_PER_FUNCTION as u32;
+    if (context.local_block_start..context.local_block_end).contains(&group) {
+        let helper_count = context.load_function_base + LoadKind::ALL.len() as u32;
+        f.instruction(&W::ReturnCall(
+            helper_count + group - context.local_block_start,
+        ));
+    } else {
+        f.instruction(&W::I32Const(group as i32));
+        f.instruction(&W::ReturnCallIndirect {
+            type_index: TYPE_BLOCK,
+            table_index: 0,
+        });
+    }
     Ok(())
 }
 
@@ -742,15 +990,17 @@ fn emit_i32_result(f: &mut Function, reg: RawReg, operation: W<'_>) {
 fn emit_address(f: &mut Function, base: Option<RawReg>, offset: i32) {
     if let Some(base) = base {
         emit_reg(f, base);
-        f.instruction(&W::I64Const(offset as i64));
-        f.instruction(&W::I64Add);
         f.instruction(&W::I32WrapI64);
+        if offset != 0 {
+            f.instruction(&W::I32Const(offset));
+            f.instruction(&W::I32Add);
+        }
     } else {
         f.instruction(&W::I32Const(offset));
     }
 }
 
-fn static_target(layout: Layout, address: u32, bytes: u32, write: bool) -> Option<(u32, u32)> {
+fn static_target(layout: Layout, address: u32, bytes: u32, write: bool) -> Option<u32> {
     let end = u64::from(address).checked_add(u64::from(bytes))?;
     let (virtual_base, physical_base) = if !write
         && address >= layout.ro_address
@@ -766,22 +1016,51 @@ fn static_target(layout: Layout, address: u32, bytes: u32, write: bool) -> Optio
     } else {
         return None;
     };
-    Some((
-        0,
-        physical_base.checked_add(address.checked_sub(virtual_base)?)?,
-    ))
+    physical_base.checked_add(address.checked_sub(virtual_base)?)
 }
 
 fn emit_physical_address(f: &mut Function, virtual_base: u32, physical_base: u32) {
-    f.instruction(&W::I32Const(virtual_base as i32));
-    f.instruction(&W::I32Sub);
-    if physical_base != 0 {
-        f.instruction(&W::I32Const(physical_base as i32));
+    let offset = physical_base.wrapping_sub(virtual_base) as i32;
+    if offset != 0 {
+        f.instruction(&W::I32Const(offset));
         f.instruction(&W::I32Add);
     }
 }
 
-fn emit_load_at(f: &mut Function, kind: LoadKind, memory: u32) {
+fn emit_physical_address_helper(layout: Layout) -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&W::LocalGet(0));
+    f.instruction(&W::I32Const(layout.stack_low as i32));
+    f.instruction(&W::I32GeU);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    f.instruction(&W::LocalGet(0));
+    emit_physical_address(&mut f, layout.stack_low, layout.stack_phys);
+    f.instruction(&W::Else);
+    f.instruction(&W::LocalGet(0));
+    f.instruction(&W::I32Const(layout.rw_address as i32));
+    f.instruction(&W::I32GeU);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    f.instruction(&W::LocalGet(0));
+    emit_physical_address(&mut f, layout.rw_address, layout.rw_phys);
+    f.instruction(&W::Else);
+    f.instruction(&W::LocalGet(0));
+    emit_physical_address(&mut f, layout.ro_address, layout.ro_phys);
+    f.instruction(&W::End);
+    f.instruction(&W::End);
+    f.instruction(&W::End);
+    f
+}
+
+fn emit_load_helper(kind: LoadKind, physical_address_function: u32) -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&W::LocalGet(0));
+    f.instruction(&W::Call(physical_address_function));
+    emit_load_at(&mut f, kind);
+    f.instruction(&W::End);
+    f
+}
+
+fn emit_load_at(f: &mut Function, kind: LoadKind) {
     let bytes = match kind {
         LoadKind::U8 | LoadKind::I8 => 1,
         LoadKind::U16 | LoadKind::I16 => 2,
@@ -789,13 +1068,13 @@ fn emit_load_at(f: &mut Function, kind: LoadKind, memory: u32) {
         LoadKind::U64 => 8,
     };
     f.instruction(&match kind {
-        LoadKind::U8 => W::I64Load8U(memarg(bytes, memory)),
-        LoadKind::I8 => W::I64Load8S(memarg(bytes, memory)),
-        LoadKind::U16 => W::I64Load16U(memarg(bytes, memory)),
-        LoadKind::I16 => W::I64Load16S(memarg(bytes, memory)),
-        LoadKind::U32 => W::I64Load32U(memarg(bytes, memory)),
-        LoadKind::I32 => W::I64Load32S(memarg(bytes, memory)),
-        LoadKind::U64 => W::I64Load(memarg(bytes, memory)),
+        LoadKind::U8 => W::I64Load8U(memarg(bytes, 0)),
+        LoadKind::I8 => W::I64Load8S(memarg(bytes, 0)),
+        LoadKind::U16 => W::I64Load16U(memarg(bytes, 0)),
+        LoadKind::I16 => W::I64Load16S(memarg(bytes, 0)),
+        LoadKind::U32 => W::I64Load32U(memarg(bytes, 0)),
+        LoadKind::I32 => W::I64Load32S(memarg(bytes, 0)),
+        LoadKind::U64 => W::I64Load(memarg(bytes, 0)),
     });
 }
 
@@ -815,10 +1094,9 @@ fn emit_load(
         LoadKind::U64 => 8,
     };
     if base.is_none() {
-        if let Some((memory, physical)) = static_target(context.layout, offset as u32, bytes, false)
-        {
+        if let Some(physical) = static_target(context.layout, offset as u32, bytes, false) {
             f.instruction(&W::I32Const(physical as i32));
-            emit_load_at(f, kind, memory);
+            emit_load_at(f, kind);
         } else {
             emit_trap(f, pc);
         }
@@ -826,54 +1104,30 @@ fn emit_load(
         return;
     }
     if base == Some(Reg::SP.raw()) {
+        let offset = offset
+            .wrapping_sub(context.layout.stack_low as i32)
+            .wrapping_add(context.layout.stack_phys as i32);
         emit_address(f, base, offset);
-        emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
-        emit_load_at(f, kind, 0);
+        emit_load_at(f, kind);
         emit_set_reg(f, dst);
         return;
     }
     emit_address(f, base, offset);
-    f.instruction(&W::LocalTee(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.stack_low as i32));
-    f.instruction(&W::I32GeU);
-    f.instruction(&W::If(BlockType::Result(ValType::I64)));
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
-    emit_load_at(f, kind, 0);
-    f.instruction(&W::Else);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.rw_address as i32));
-    f.instruction(&W::I32GeU);
-    f.instruction(&W::If(BlockType::Result(ValType::I64)));
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    emit_physical_address(f, context.layout.rw_address, context.layout.rw_phys);
-    emit_load_at(f, kind, 0);
-    f.instruction(&W::Else);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    emit_physical_address(f, context.layout.ro_address, context.layout.ro_phys);
-    emit_load_at(f, kind, 0);
-    f.instruction(&W::End);
-    f.instruction(&W::End);
+    f.instruction(&W::Call(context.load_function_base + kind as u32));
     emit_set_reg(f, dst);
 }
 
-fn emit_store_value(
-    f: &mut Function,
-    kind: StoreKind,
-    source: Option<RawReg>,
-    immediate: i32,
-    memory: u32,
-) {
+fn emit_store_value(f: &mut Function, kind: StoreKind, source: Option<RawReg>, immediate: i32) {
     if let Some(source) = source {
         emit_reg(f, source);
     } else {
         f.instruction(&W::I64Const(immediate as i64));
     }
     f.instruction(&match kind {
-        StoreKind::U8 => W::I64Store8(memarg(1, memory)),
-        StoreKind::U16 => W::I64Store16(memarg(2, memory)),
-        StoreKind::U32 => W::I64Store32(memarg(4, memory)),
-        StoreKind::U64 => W::I64Store(memarg(8, memory)),
+        StoreKind::U8 => W::I64Store8(memarg(1, 0)),
+        StoreKind::U16 => W::I64Store16(memarg(2, 0)),
+        StoreKind::U32 => W::I64Store32(memarg(4, 0)),
+        StoreKind::U64 => W::I64Store(memarg(8, 0)),
     });
 }
 
@@ -897,41 +1151,32 @@ fn emit_store(
         StoreKind::U64 => 8,
     };
     if base.is_none() {
-        if let Some((memory, physical)) = static_target(context.layout, offset as u32, bytes, true)
-        {
+        if let Some(physical) = static_target(context.layout, offset as u32, bytes, true) {
             f.instruction(&W::I32Const(physical as i32));
-            emit_store_value(f, kind, source, immediate, memory);
+            emit_store_value(f, kind, source, immediate);
         } else {
             emit_trap(f, pc);
         }
         return;
     }
     if base == Some(Reg::SP.raw()) {
+        let offset = offset
+            .wrapping_sub(context.layout.stack_low as i32)
+            .wrapping_add(context.layout.stack_phys as i32);
         emit_address(f, base, offset);
-        emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
-        emit_store_value(f, kind, source, immediate, 0);
+        emit_store_value(f, kind, source, immediate);
         return;
     }
     emit_address(f, base, offset);
     f.instruction(&W::LocalTee(LOCAL_ADDR));
-    f.instruction(&W::I32Const(context.layout.stack_low as i32));
-    f.instruction(&W::I32GeU);
-    f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    emit_physical_address(f, context.layout.stack_low, context.layout.stack_phys);
-    emit_store_value(f, kind, source, immediate, 0);
-    f.instruction(&W::Else);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(context.layout.rw_address as i32));
-    f.instruction(&W::I32GeU);
+    f.instruction(&W::I32LtU);
     f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    emit_physical_address(f, context.layout.rw_address, context.layout.rw_phys);
-    emit_store_value(f, kind, source, immediate, 0);
-    f.instruction(&W::Else);
     emit_trap(f, pc);
     f.instruction(&W::End);
-    f.instruction(&W::End);
+    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::Call(context.physical_address_function));
+    emit_store_value(f, kind, source, immediate);
 }
 
 fn emit_binary_i64(f: &mut Function, dst: RawReg, lhs: RawReg, rhs: RawReg, operation: W<'_>) {
@@ -1061,7 +1306,30 @@ fn emit_indirect(context: &EmitContext<'_>, f: &mut Function, pc: u32, base: Raw
     emit_indirect_from_local(context, f, pc, base != Reg::RA.raw() || offset != 0);
 }
 
+// Keep the caller's target capture before fused register writes, then tail-call
+// shared validation/resolution. A regular call would retain a Wasm stack frame
+// across every guest return or indirect jump.
 fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32, meter: bool) {
+    let current_pc = context.control_targets[context
+        .control_targets
+        .partition_point(|target| *target <= pc)
+        - 1];
+    let current_block = context.block_by_pc.get(current_pc).unwrap();
+    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::I32Const(pc as i32));
+    f.instruction(&W::I32Const(current_block as i32));
+    f.instruction(&W::ReturnCall(if meter {
+        context.indirect_function
+    } else {
+        context.return_function
+    }));
+}
+
+fn emit_indirect_helper(context: &EmitContext<'_>, meter: bool) -> Function {
+    // Parameters: target address, source instruction PC, original source block.
+    // Specialize the backedge comparison for returns rather than passing a flag
+    // and branching at every callsite.
+    let mut f = Function::new([]);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(RETURN_TO_HOST as i32));
     f.instruction(&W::I32Eq);
@@ -1076,7 +1344,10 @@ fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32
     f.instruction(&W::I32Eqz);
     f.instruction(&W::I32Or);
     f.instruction(&W::If(BlockType::Empty));
-    emit_trap(f, pc);
+    f.instruction(&W::LocalGet(1));
+    f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
+    f.instruction(&W::I32Const(STATUS_TRAP));
+    f.instruction(&W::Return);
     f.instruction(&W::End);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(2));
@@ -1087,48 +1358,37 @@ fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32
     f.instruction(&W::I32Const(context.jump_table_len as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Empty));
-    emit_trap(f, pc);
+    f.instruction(&W::LocalGet(1));
+    f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
+    f.instruction(&W::I32Const(STATUS_TRAP));
+    f.instruction(&W::Return);
     f.instruction(&W::End);
+    // The resolver takes the full jump-table index and switches on its low
+    // bits. Only one table entry/function is needed per resolver group.
     f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::I32Const(RESOLVERS_PER_FUNCTION.trailing_zeros() as i32));
+    f.instruction(&W::I32ShrU);
     f.instruction(&W::I32Const(context.resolver_table_base as i32));
     f.instruction(&W::I32Add);
     f.instruction(&W::CallIndirect {
-        type_index: TYPE_BLOCK,
+        type_index: TYPE_RESOLVER,
         table_index: 0,
     });
-    f.instruction(&W::LocalSet(LOCAL_ADDR));
-    if meter {
-        let current_block = context
-            .block_by_pc
-            .range(..=pc)
-            .next_back()
-            .map(|(_, index)| *index)
-            .unwrap_or(0);
-        f.instruction(&W::LocalGet(LOCAL_ADDR));
-        f.instruction(&W::I32Const(current_block as i32));
-        f.instruction(&W::I32LeU);
-        f.instruction(&W::If(BlockType::Empty));
-        emit_gas_charge(f);
-        f.instruction(&W::End);
-    } else {
-        let current_block = context
-            .block_by_pc
-            .range(..=pc)
-            .next_back()
-            .map(|(_, index)| *index)
-            .unwrap_or(0);
-        f.instruction(&W::LocalGet(LOCAL_ADDR));
-        f.instruction(&W::I32Const(current_block as i32));
-        f.instruction(&W::I32Eq);
-        f.instruction(&W::If(BlockType::Empty));
-        emit_gas_charge(f);
-        f.instruction(&W::End);
-    }
+    f.instruction(&W::LocalTee(LOCAL_ADDR));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
+    // Resume at the resolved destination, not at the source block: a fused
+    // load-and-jump may already have overwritten the register holding its target.
+    // Compare against the original control-flow block, not an artificial split.
     f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::ReturnCallIndirect {
-        type_index: TYPE_BLOCK,
-        table_index: 0,
-    });
+    f.instruction(&W::LocalGet(2));
+    f.instruction(if meter { &W::I32LeU } else { &W::I32Eq });
+    f.instruction(&W::If(BlockType::Empty));
+    emit_gas_charge(&mut f, context.gas_function);
+    f.instruction(&W::End);
+    emit_dispatch_from_pc(&mut f);
+    f.instruction(&W::End);
+    f
 }
 
 fn written_register(kind: PvmInstruction) -> Option<RawReg> {
@@ -1298,8 +1558,7 @@ fn emit_instruction(
             f.instruction(&W::GlobalSet(GLOBAL_ECALL));
             let next = context
                 .block_by_pc
-                .get(&instruction.next_offset.0)
-                .copied()
+                .get(instruction.next_offset.0)
                 .ok_or_else(|| anyhow!("ecall continuation is not a block"))?;
             f.instruction(&W::I32Const(next as i32));
             f.instruction(&W::GlobalSet(GLOBAL_PC));
@@ -2068,13 +2327,18 @@ fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: Raw
 
 #[cfg(test)]
 mod tests {
-    use super::{translate, STATUS_FINISHED};
+    use super::{
+        translate, translate_partitioned, translate_with_part_limit, BLOCKS_PER_FUNCTION,
+        CODE_PART_SECTION, INSTRUCTIONS_PER_BLOCK, STATUS_ECALL, STATUS_FINISHED,
+        STATUS_OUT_OF_GAS, STATUS_TRAP,
+    };
     use polkavm::program::{assemble, InstructionSetKind};
     use polkavm::{
         BackendKind, Config, Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg,
         RETURN_TO_HOST,
     };
-    use wasmi::{Engine as WasmEngine, Linker, Module as WasmModule, Store, Val};
+    use polkavm_common::{program::asm, writer::ProgramBlobBuilder};
+    use wasmi::{Engine as WasmEngine, Instance, Linker, Module as WasmModule, Store, Val};
 
     fn interpreter_registers(program: &[u8]) -> [u64; 13] {
         let blob = ProgramBlob::parse(program.into()).expect("parse differential fixture");
@@ -2101,17 +2365,54 @@ mod tests {
         Reg::ALL.map(|reg| instance.reg(reg))
     }
 
-    fn translated_registers(program: &[u8]) -> [u64; 13] {
-        let wasm = translate(program).expect("translate differential fixture");
+    fn translated_instance(program: &[u8]) -> (Store<()>, Instance) {
+        // Exercise all existing group-boundary regressions across module boundaries.
+        let wasm =
+            translate_with_part_limit(program, Some(1)).expect("translate differential fixture");
+        instance_from_wasm(&wasm)
+    }
+
+    fn code_parts(wasm: &[u8]) -> impl Iterator<Item = &[u8]> {
+        wasmparser::Parser::new(0)
+            .parse_all(wasm)
+            .filter_map(|payload| match payload.expect("parse translated fixture") {
+                wasmparser::Payload::CustomSection(section)
+                    if section.name() == CODE_PART_SECTION =>
+                {
+                    Some(section.data())
+                }
+                _ => None,
+            })
+    }
+
+    fn instance_from_wasm(wasm: &[u8]) -> (Store<()>, Instance) {
         let engine = WasmEngine::default();
-        let module = WasmModule::new(&engine, &wasm[..]).expect("compile translated fixture");
+        let module = WasmModule::new(&engine, wasm).expect("compile translated fixture");
         let mut store = Store::new(&engine, ());
-        let linker = Linker::new(&engine);
+        let mut linker = Linker::new(&engine);
         let instance = linker
             .instantiate(&mut store, &module)
             .expect("instantiate translated fixture")
             .start(&mut store)
             .expect("start translated fixture");
+        linker
+            .instance(&mut store, "pvm", instance)
+            .expect("link translated shared state");
+        for bytes in code_parts(wasm) {
+            let part = WasmModule::new(&engine, bytes).expect("compile translated code part");
+            // Wasmi retains instances in the Store, and the shared table retains
+            // their functions. No entrypoint runs until every segment is installed.
+            linker
+                .instantiate(&mut store, &part)
+                .expect("instantiate translated code part")
+                .start(&mut store)
+                .expect("start translated code part");
+        }
+        (store, instance)
+    }
+
+    fn translated_registers(program: &[u8]) -> [u64; 13] {
+        let (mut store, instance) = translated_instance(program);
         let begin = instance
             .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
             .expect("translated begin export");
@@ -2121,11 +2422,15 @@ mod tests {
                 .expect("run translated fixture"),
             STATUS_FINISHED
         );
+        register_values(&store, instance)
+    }
+
+    fn register_values(store: &Store<()>, instance: Instance) -> [u64; 13] {
         std::array::from_fn(|index| {
             let value = instance
-                .get_global(&store, &format!("r{index}"))
+                .get_global(store, &format!("r{index}"))
                 .expect("translated register")
-                .get(&store);
+                .get(store);
             let Val::I64(value) = value else {
                 panic!("translated register is not i64");
             };
@@ -2152,6 +2457,12 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(&wasm)
             .expect("validate translated framebuffer fixture");
+        for part in code_parts(&wasm) {
+            wasmparser::Validator::new()
+                .validate_all(part)
+                .expect("validate translated framebuffer code part");
+        }
+        instance_from_wasm(&wasm);
         let memory_count = wasmparser::Parser::new(0)
             .parse_all(&wasm)
             .filter_map(
@@ -2227,6 +2538,14 @@ mod tests {
                 a2 = u16 [131072]
                 a3 = i32 [131072]
                 a4 = u64 [131072]
+                a5 = 131072
+                u64 [a5 + 8] = a0
+                t0 = u64 [a5 + 8]
+                a5 = sp - 16
+                u64 [sp + -16] = t0
+                t1 = u64 [a5]
+                u64 [a5] = a1
+                t2 = u64 [sp + -16]
                 jump @matched if a1 == 120
                 a5 = -1
                 ret
@@ -2235,6 +2554,105 @@ mod tests {
                 ret
             "#,
         );
+    }
+
+    #[test]
+    fn narrow_memory_widths_and_signs_match_interpreter() {
+        let source = r#"
+            %rw_data_size = 65536
+            %stack_size = 4096
+            pub @main:
+            a5 = 131073
+            u32 [a5] = -1
+            a0 = i8 [a5]
+            a1 = u8 [a5]
+            a2 = i16 [a5]
+            a3 = u16 [a5]
+            a4 = i32 [a5]
+            t0 = u32 [a5]
+            u8 [a5] = a3
+            u8 [a5 + 1] = 128
+            t1 = u16 [a5]
+            u16 [a5] = a4
+            u16 [a5 + 2] = 32768
+            t2 = u32 [a5]
+            u32 [a5] = a5
+            a5 = u32 [a5]
+            ret
+        "#;
+        assert_differential_isa(InstructionSetKind::Latest64, source);
+        assert_differential_isa(
+            InstructionSetKind::Latest32,
+            &source.replace("= u32 [", "= i32 ["),
+        );
+    }
+
+    #[test]
+    fn wide_memory_preserves_high_bits_and_aliases() {
+        assert_differential(
+            r#"
+                %rw_data_size = 65536
+                %stack_size = 4096
+                pub @main:
+                a5 = 131073
+                u64 [a5] = -2147483648
+                a0 = u64 [a5]
+                u64 [sp + -9] = a0
+                a1 = u64 [sp + -9]
+                u64 [a5] = a5
+                a5 = u64 [a5]
+                a2 = u64 [131073]
+                ret
+            "#,
+        );
+    }
+
+    #[test]
+    fn memory_guards_report_source_pc_without_writing_destination() {
+        // Static width checking, static write protection, and dynamic write
+        // protection must still return before the shared memory access runs.
+        for operation in ["a0 = u64 [196604]", "u8 [65536] = a0", "u32 [a1] = a0"] {
+            let source = format!(
+                r#"
+                    %rw_data_size = 65536
+                    %stack_size = 4096
+                    pub @main:
+                    a0 = 7
+                    {operation}
+                    a0 = 99
+                    ret
+                "#
+            );
+            let program = assemble(Some(InstructionSetKind::Latest64), &source).unwrap();
+            let blob = ProgramBlob::parse((&program[..]).into()).unwrap();
+            let trap_pc = blob.instructions().nth(1).unwrap().offset.0;
+            let (mut store, instance) = translated_instance(&program);
+            instance
+                .get_global(&store, Reg::A1.name_non_abi())
+                .unwrap()
+                .set(&mut store, Val::I64(65536))
+                .unwrap();
+            let begin = instance
+                .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                .unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_TRAP);
+            assert_eq!(
+                instance
+                    .get_global(&store, "trap_pc")
+                    .unwrap()
+                    .get(&store)
+                    .i32(),
+                Some(trap_pc as i32),
+            );
+            assert_eq!(
+                instance
+                    .get_global(&store, Reg::A0.name_non_abi())
+                    .unwrap()
+                    .get(&store)
+                    .i64(),
+                Some(7),
+            );
+        }
     }
 
     #[test]
@@ -2255,5 +2673,354 @@ mod tests {
                 ret
             "#,
         );
+    }
+
+    #[test]
+    fn grouped_direct_and_indirect_jumps_match_interpreter() {
+        let count = 2 * BLOCKS_PER_FUNCTION as u32 + 1;
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_export_by_basic_block(count - 1, b"tail");
+        let mut instructions = Vec::new();
+        for index in 0..count {
+            instructions.push(asm::add_imm_64(Reg::A0, Reg::A0, 1));
+            if index + 1 == count {
+                instructions.push(asm::ret());
+            } else if index % 2 == 0 {
+                instructions.push(asm::load_imm(Reg::A1, (2 * (index + 2)) as i32));
+                instructions.push(asm::jump_indirect(Reg::A1, 0));
+            } else {
+                instructions.push(asm::jump(index + 1));
+            }
+        }
+        builder.set_code(&instructions, &(0..count).collect::<Vec<_>>());
+        let program = builder.into_vec().unwrap();
+        assert_eq!(
+            translated_registers(&program),
+            interpreter_registers(&program)
+        );
+
+        let wasm = translate(&program).unwrap();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            match payload.unwrap() {
+                wasmparser::Payload::CustomSection(section)
+                    if section.name() == "epoca.pvm.meta" =>
+                {
+                    // The final EPM2 export is tail. Its token must retain both
+                    // the group and the slot, not merely name a Wasm function.
+                    let data = section.data();
+                    let entry = i32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+                    let (mut store, instance) = translated_instance(&program);
+                    let begin = instance
+                        .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                        .unwrap();
+                    assert_eq!(begin.call(&mut store, (entry, 1)).unwrap(), STATUS_FINISHED);
+                    assert_eq!(
+                        instance
+                            .get_global(&store, Reg::A0.name_non_abi())
+                            .unwrap()
+                            .get(&store)
+                            .i64(),
+                        Some(1),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn cross_part_loop_shares_memory_and_registers() {
+        // Exercise forward and backward control flow both within a module and
+        // across parts, including loads through local helpers and shared stores.
+        let mut source = String::from(
+            "%stack_size = 4096\npub @main:\ni32 a5 = sp - 16\n\
+             u32 [a5] = 0\na1 = 0\njump @block0\n",
+        );
+        for index in 0..BLOCKS_PER_FUNCTION {
+            source.push_str(&format!(
+                "@block{index}:\na0 = i32 [a5]\ni32 a0 = a0 + 1\n\
+                 u32 [a5] = a0\njump @block{}\n",
+                index + 1,
+            ));
+        }
+        source.push_str(&format!(
+            "@block{BLOCKS_PER_FUNCTION}:\ni32 a1 = a1 + 1\n\
+             jump @block0 if a1 <u 3\na2 = i32 [a5]\nret\n",
+        ));
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            let program = assemble(Some(isa), &source).unwrap();
+            let wasm = translate_with_part_limit(&program, Some(1)).unwrap();
+            assert_eq!(code_parts(&wasm).count(), 2, "fixture must cross parts");
+            for wasm in [
+                translate(&program).unwrap(),
+                translate_partitioned(&program).unwrap(),
+                wasm,
+            ] {
+                let (mut store, instance) = instance_from_wasm(&wasm);
+                let begin = instance
+                    .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                    .unwrap();
+                assert_eq!(
+                    begin.call(&mut store, (0, i64::MAX)).unwrap(),
+                    STATUS_FINISHED,
+                );
+                let registers = register_values(&store, instance);
+                assert_eq!(registers, interpreter_registers(&program));
+                assert_eq!(
+                    registers[Reg::A2.to_u32() as usize],
+                    3 * BLOCKS_PER_FUNCTION as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_straight_line_block_crosses_groups_without_charging_gas() {
+        let count = BLOCKS_PER_FUNCTION * INSTRUCTIONS_PER_BLOCK + 1;
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        let mut instructions = vec![asm::add_imm_64(Reg::A0, Reg::A0, 1); count];
+        instructions.push(asm::ret());
+        builder.set_code(&instructions, &[]);
+        let program = builder.into_vec().unwrap();
+        assert_eq!(
+            translated_registers(&program),
+            interpreter_registers(&program)
+        );
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(count as i64),
+        );
+    }
+
+    #[test]
+    fn gas_resume_does_not_restart_the_entrypoint() {
+        let program = assemble(
+            Some(InstructionSetKind::Latest64),
+            r#"
+            %stack_size = 4096
+            pub @main:
+            a0 = 0
+            jump @loop
+            @loop:
+            a0 = a0 + 1
+            jump @loop if a0 <u 3
+            ret
+        "#,
+        )
+        .unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        let gas = instance
+            .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+        gas.call(&mut store, 3).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(2),
+        );
+        gas.call(&mut store, 2).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_FINISHED);
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn indirect_gas_resume_preserves_fused_jump_side_effects() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        let mut instructions = vec![
+            asm::jump(2),
+            asm::add_imm_64(Reg::A0, Reg::A0, 1),
+            asm::ret(),
+        ];
+        instructions.extend(std::iter::repeat_n(
+            asm::add_imm_64(Reg::A2, Reg::A2, 1),
+            INSTRUCTIONS_PER_BLOCK + 1,
+        ));
+        instructions.push(asm::load_imm(Reg::A1, 2));
+        instructions.push(asm::load_imm_and_jump_indirect(Reg::A1, Reg::A1, 999, 0));
+        builder.set_code(&instructions, &[1]);
+        let program = builder.into_vec().unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        let gas = instance
+            .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+        gas.call(&mut store, 2).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_FINISHED);
+        for (reg, value) in [
+            (Reg::A0, 1),
+            (Reg::A1, 999),
+            (Reg::A2, INSTRUCTIONS_PER_BLOCK as i64 + 1),
+        ] {
+            assert_eq!(
+                instance
+                    .get_global(&store, reg.name_non_abi())
+                    .unwrap()
+                    .get(&store)
+                    .i64(),
+                Some(value),
+            );
+        }
+    }
+
+    #[test]
+    fn hostcall_resume_across_groups_reports_exact_trap_pc() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_import(b"host_test");
+        let count = BLOCKS_PER_FUNCTION * INSTRUCTIONS_PER_BLOCK;
+        let mut instructions = vec![asm::add_imm_64(Reg::A0, Reg::A0, 1); count];
+        instructions.push(asm::ecalli(0));
+        instructions.push(asm::trap());
+        builder.set_code(&instructions, &[]);
+        let program = builder.into_vec().unwrap();
+        let blob = ProgramBlob::parse((&program[..]).into()).unwrap();
+        let trap_pc = blob
+            .instructions()
+            .find(|instruction| instruction.kind == asm::trap())
+            .unwrap()
+            .offset
+            .0;
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_ECALL);
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_TRAP);
+        assert_eq!(
+            instance
+                .get_global(&store, "trap_pc")
+                .unwrap()
+                .get(&store)
+                .i32(),
+            Some(trap_pc as i32),
+        );
+        assert_eq!(
+            instance
+                .get_global(&store, Reg::A0.name_non_abi())
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(count as i64),
+        );
+    }
+
+    #[test]
+    fn indirect_traps_report_the_source_instruction_pc() {
+        for base in [Reg::A1, Reg::RA] {
+            let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+            builder.set_stack_size(4096);
+            builder.add_export_by_basic_block(0, b"main");
+            builder.set_code(
+                &[
+                    asm::load_imm(Reg::A0, 7),
+                    asm::move_reg(base, Reg::A2),
+                    asm::jump_indirect(base, 0),
+                    asm::ret(),
+                ],
+                &[1],
+            );
+            let program = builder.into_vec().unwrap();
+            let blob = ProgramBlob::parse((&program[..]).into()).unwrap();
+            let trap_pc = blob.instructions().nth(2).unwrap().offset.0;
+            let (mut store, instance) = translated_instance(&program);
+            let begin = instance
+                .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                .unwrap();
+            let target = instance.get_global(&store, Reg::A2.name_non_abi()).unwrap();
+            // Exercise both invalid-address paths in the jump and return helpers.
+            for address in [3, 4] {
+                target.set(&mut store, Val::I64(address)).unwrap();
+                assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_TRAP);
+                assert_eq!(
+                    instance
+                        .get_global(&store, "trap_pc")
+                        .unwrap()
+                        .get(&store)
+                        .i32(),
+                    Some(trap_pc as i32),
+                );
+                assert_eq!(
+                    instance
+                        .get_global(&store, Reg::A0.name_non_abi())
+                        .unwrap()
+                        .get(&store)
+                        .i64(),
+                    Some(7),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_group_padding_is_not_a_valid_jump_target() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.set_code(&[asm::jump_indirect(Reg::A1, 0), asm::ret()], &vec![1; 129]);
+        let program = builder.into_vec().unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let target = instance.get_global(&store, Reg::A1.name_non_abi()).unwrap();
+        for address in [0, 1, 260] {
+            target.set(&mut store, Val::I64(address)).unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_TRAP);
+            assert_eq!(
+                instance
+                    .get_global(&store, "trap_pc")
+                    .unwrap()
+                    .get(&store)
+                    .i32(),
+                Some(0)
+            );
+        }
+        for address in [2, 258, RETURN_TO_HOST as i64] {
+            target.set(&mut store, Val::I64(address)).unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+        }
     }
 }

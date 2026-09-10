@@ -373,6 +373,74 @@ the chunk and zero padding. A complete text event is at most 4 KiB. The Host
 MUST queue all chunks of one event atomically; the guest MUST reject malformed
 flag sequences or invalid UTF-8.
 
+### Mediated input
+
+Large or permissioned inputs use a request lifecycle instead of the eight-byte
+event queue. The guest registers a Host-owned input kind and the exact media
+type it accepts, then explicitly triggers that registration:
+
+```text
+host_input_register(
+  kind_pointer: u32,
+  kind_length: u32,
+  media_type_pointer: u32,
+  media_type_length: u32,
+  max_bytes: u32
+) -> i32
+host_input_trigger(handle: u32) -> u32
+host_input_status(handle: u32) -> u32
+host_input_read(handle: u32, pointer: u32, capacity: u32) -> i32
+host_input_cancel(handle: u32) -> u32
+```
+
+`kind` and `media_type` are lowercase ASCII tokens using letters, digits,
+`-`, `.`, `_`, or `+`; each starts and ends with a letter or digit. Kinds are
+at most 32 bytes and media types at most 64 bytes. `max_bytes` is in
+`1..=1048576`. One execution may hold at most eight registrations. Repeating
+an identical registration returns the existing positive handle. Registration
+otherwise returns:
+
+```text
+-1  malformed token, size, or guest range
+-2  kind unavailable for this execution
+-3  registration quota exhausted
+```
+
+`host_input_trigger` returns 0 when accepted, 1 for an unknown handle, and 2
+while any registration is already active. Acceptance means only that the Host
+will present its own consent and capture UI. The guest does not receive raw
+device frames and cannot bypass Host permission policy.
+
+`host_input_status` returns:
+
+```text
+0  invalid handle
+1  registered and idle
+2  active
+3  decoded result ready
+4  cancelled
+5  permission denied
+6  capture or decode failed
+```
+
+When status is 3, `host_input_read` writes the complete decoded value. A
+successful read returns its positive byte length and resets the registration
+to status 1. Capacity smaller than the result returns the negated required
+length without consuming it. Other states and unknown handles return zero.
+The Host MUST reject empty results and results larger than the registration's
+bound before they become visible to the guest.
+
+`host_input_cancel` returns 0 and tells the Host to stop capture for an active
+request, 1 for an unknown handle, or 2 when that handle is not active. Runtime
+teardown cancels every active request and releases every device stream.
+
+ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
+The Host owns camera access, QR recognition, UR fountain reconstruction, and
+type filtering; only the reconstructed UR CBOR bytes cross into guest memory.
+An App requiring this kind lists `"camera-ur"` in
+`deviceInput.requiredFeatures`. A conforming Host MUST reject launch when it
+cannot provide every required input feature.
+
 ### Pointer capture
 
 ```text
@@ -596,6 +664,23 @@ fallback does not require motion and MUST handle `-1` and `-2`.
 host_time_ms() -> u64
 host_sleep_ms(duration_ms: u32) -> ()
 ```
+
+Applications may also use the versioned `host.core` clock and entropy operations:
+
+```text
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
+```
+
+The clock operations write a little-endian `u64` nanosecond value and return
+zero. The monotonic clock is scoped to the execution; the wall clock is Unix
+time. `core_random` fills exactly the requested bytes, at most 4 KiB, from the
+Host CSPRNG. It returns `-3` for an empty request, `-5` when secure entropy is
+unavailable, and `-6` above the per-call limit. A failed entropy request does
+not write the guest destination. Invalid writable guest ranges fail the
+execution. These imports do not opt the application into the separate
+application-computer lifecycle.
 
 `host_time_ms` returns a monotonic millisecond clock scoped to the execution.
 It is not wall-clock time.

@@ -37,6 +37,7 @@ enum Resource {
 }
 
 struct PendingPass {
+    color_view: u32,
     depth_view: u32,
     flags: u32,
     clear_color: wgpu::Color,
@@ -367,10 +368,17 @@ impl NativeGpuRenderer {
                     };
                     let clear_depth = reader.f32()?;
                     reader.finish()?;
-                    if color_view != 0 || generation != self.generation {
-                        bail!("stale or non-surface render attachment");
+                    if generation != self.generation {
+                        bail!("stale render attachment");
+                    }
+                    if color_view != 0 {
+                        self.texture_view(color_view)?;
+                    }
+                    if depth_view != 0 {
+                        self.texture_view(depth_view)?;
                     }
                     pending_pass = Some(PendingPass {
+                        color_view,
                         depth_view,
                         flags,
                         clear_color,
@@ -459,11 +467,12 @@ impl NativeGpuRenderer {
                     let pass = pending_pass
                         .take()
                         .ok_or_else(|| anyhow!("render pass is not active"))?;
+                    let renders_to_surface = pass.color_view == 0;
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
                     self.encode_render_pass(command_encoder, pass)?;
-                    presented = true;
+                    presented |= renders_to_surface;
                 }
                 GpuOpcode::CopyBufferToBuffer => {
                     let source = reader.u32()?;
@@ -996,14 +1005,20 @@ impl NativeGpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         pending: PendingPass,
     ) -> Result<()> {
-        let surface_view = self.surface.create_view(&Default::default());
+        let surface_view;
+        let color_view = if pending.color_view == 0 {
+            surface_view = self.surface.create_view(&Default::default());
+            &surface_view
+        } else {
+            self.texture_view(pending.color_view)?
+        };
         let depth_view = if pending.depth_view == 0 {
             None
         } else {
             Some(self.texture_view(pending.depth_view)?)
         };
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
-            view: &surface_view,
+            view: color_view,
             resolve_target: None,
             ops: wgpu::Operations {
                 load: if pending.flags & 1 != 0 {

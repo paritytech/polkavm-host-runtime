@@ -4,9 +4,10 @@
 
 use crate::{
     keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, Frame,
-    GpuBatch, InputEvent, InputEventType, PresentationProfile, Tri2dFrame, UiOutputFrame,
-    UiSemanticsFrame, INPUT_EVENT_BYTES, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS,
-    MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES, UPDATE_AFTER_IDLE,
+    GpuBatch, InputEvent, InputEventType, MediatedInputCommand, MediatedInputStatus,
+    PresentationProfile, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
+    INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS, MAX_ASSET_BYTES, MAX_ASSET_FILES,
+    MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES, UPDATE_AFTER_IDLE,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -15,6 +16,26 @@ use std::collections::HashMap;
 
 const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_STAGING_BYTES: usize = MAX_ASSET_FILE_BYTES + MAX_ASSET_NAME_BYTES;
+
+#[link(wasm_import_module = "polkavm_browser")]
+unsafe extern "C" {
+    #[link_name = "clock_wall_ms"]
+    fn browser_clock_wall_ms() -> f64;
+    #[link_name = "random_fill"]
+    fn browser_random_fill(pointer: *mut u8, length: usize) -> i32;
+}
+
+pub(crate) fn wall_clock_ns() -> u64 {
+    let milliseconds = unsafe { browser_clock_wall_ms() };
+    if !milliseconds.is_finite() || milliseconds < 0.0 {
+        return 0;
+    }
+    (milliseconds as u64).saturating_mul(1_000_000)
+}
+
+pub(crate) fn fill_random(bytes: &mut [u8]) -> i32 {
+    unsafe { browser_random_fill(bytes.as_mut_ptr(), bytes.len()) }
+}
 
 struct Launch {
     program: Vec<u8>,
@@ -41,6 +62,7 @@ struct BrowserHost {
     gpu_batch: Option<GpuBatch>,
     audio: Option<AudioChunk>,
     host_frame_request: Option<Vec<u8>>,
+    mediated_input_command: Option<MediatedInputCommand>,
     log: Option<String>,
     save: Option<Vec<u8>>,
     translation: Vec<u8>,
@@ -59,6 +81,7 @@ impl BrowserHost {
             gpu_batch: None,
             audio: None,
             host_frame_request: None,
+            mediated_input_command: None,
             log: None,
             save: None,
             translation: Vec::new(),
@@ -80,6 +103,7 @@ impl BrowserHost {
         self.ui_output = None;
         self.gpu_batch = None;
         self.host_frame_request = None;
+        self.mediated_input_command = None;
         self.audio = None;
         self.log = None;
         self.save = None;
@@ -134,6 +158,14 @@ pub extern "C" fn polkavm_browser_staging_reserve(length: u32) -> u32 {
 pub extern "C" fn polkavm_browser_translate_staged() -> u32 {
     status(|host| {
         host.translation = crate::wasm_codegen::translate(&host.staging)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_translate_partitioned_staged() -> u32 {
+    status(|host| {
+        host.translation = crate::wasm_codegen::translate_partitioned(&host.staging)?;
         Ok(())
     })
 }
@@ -357,6 +389,29 @@ pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
                 }
             }
         }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_set_mediated_input_kinds() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| anyhow!("mediated-input kinds are not UTF-8"))?;
+        let kinds = text.split('\0').map(str::to_owned).collect::<Vec<_>>();
+        host.running()?.set_mediated_input_kinds(&kinds)
+    })
+}
+#[no_mangle]
+pub extern "C" fn polkavm_browser_send_mediated_input_result(handle: u32, result: u32) -> u32 {
+    status(|host| {
+        let mut bytes = std::mem::take(&mut host.staging);
+        let result = MediatedInputStatus::try_from(result)?;
+        if result != MediatedInputStatus::Ready {
+            bytes.clear();
+        }
+        host.running()?
+            .send_mediated_input_result(handle, result, bytes)
     })
 }
 
@@ -657,6 +712,71 @@ pub extern "C" fn polkavm_browser_host_frame_request_length() -> u32 {
             .host_frame_request
             .as_ref()
             .map_or(0, Vec::len) as u32
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_take_mediated_input_command() -> u32 {
+    HOST.with(|host| {
+        let mut host = host.borrow_mut();
+        host.mediated_input_command = match &mut host.phase {
+            Phase::Running(runtime) => runtime.take_mediated_input_command(),
+            _ => None,
+        };
+        match host.mediated_input_command {
+            Some(MediatedInputCommand::Request(_)) => 1,
+            Some(MediatedInputCommand::Cancel { .. }) => 2,
+            None => 0,
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_handle() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.handle,
+        Some(MediatedInputCommand::Cancel { handle }) => *handle,
+        None => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_max_bytes() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.max_bytes,
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_kind_pointer() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.kind.as_ptr() as usize as u32,
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_kind_length() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.kind.len() as u32,
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_media_type_pointer() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.media_type.as_ptr() as usize as u32,
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_mediated_input_media_type_length() -> u32 {
+    HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
+        Some(MediatedInputCommand::Request(request)) => request.media_type.len() as u32,
+        _ => 0,
     })
 }
 #[no_mangle]
