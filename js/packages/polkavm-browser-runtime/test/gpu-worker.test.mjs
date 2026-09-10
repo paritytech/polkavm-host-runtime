@@ -18,6 +18,9 @@ const context = vm.createContext({
   Uint8Array,
   onmessage: null,
   postMessage() {},
+  setTimeout(callback) {
+    queueMicrotask(callback);
+  },
   GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01 },
 });
 vm.runInContext(
@@ -291,7 +294,6 @@ function lostEngine(overrides = {}) {
     testDeviceLossPending: false,
     stopped: true,
     disposed: false,
-    restoreAttempts: 0,
     device: { destroy() {} },
     context: { configure() {} },
     ...overrides,
@@ -348,10 +350,49 @@ test("a rebuilt device is published to the guest with fresh capabilities", async
   assert.equal(eventType(capture.messages[1].bytes), 8);
 });
 
-test("a device that cannot be rebuilt reports an error instead of a restore", async () => {
+test("a temporarily unavailable adapter is retried before reporting failure", async () => {
   const engine = lostEngine();
+  const replacement = {
+    device: {
+      addEventListener() {},
+      lost: new Promise(() => {}),
+      destroy() {},
+    },
+    context: { configure() {} },
+    format: "bgra8unorm",
+    limits: Array.from({ length: 21 }, () => 2048),
+  };
+  let attempts = 0;
   const acquire = GpuEngine.acquireDevice;
   GpuEngine.acquireDevice = async () => {
+    attempts++;
+    if (attempts < 3) {
+      throw new Error("WebGPU adapter is unavailable");
+    }
+    return replacement;
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+
+  assert.equal(attempts, 3);
+  assert.equal(engine.stopped, false, "the recovered surface accepts batches");
+  assert.deepEqual(
+    capture.messages.map(message => message.type),
+    ["capabilities", "event"]
+  );
+});
+
+test("a permanently unavailable adapter reports one error after bounded retries", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
     throw new Error("WebGPU adapter is unavailable");
   };
   const capture = captureMessages();
@@ -362,27 +403,11 @@ test("a device that cannot be rebuilt reports an error instead of a restore", as
     capture.restore();
   }
 
+  assert.equal(attempts, 3, "the retry ceiling is honoured");
   assert.equal(engine.stopped, true, "the surface stays down");
   assert.equal(engine.deviceGeneration, 1);
   assert.deepEqual(
-    capture.messages.map((message) => message.type),
-    ["error"],
+    capture.messages.map(message => message.type),
+    ["error"]
   );
-});
-
-test("a permanently broken adapter stops being rebuilt", async () => {
-  const engine = lostEngine({ restoreAttempts: 3 });
-  let attempts = 0;
-  const acquire = GpuEngine.acquireDevice;
-  GpuEngine.acquireDevice = async () => {
-    attempts++;
-    throw new Error("unreachable");
-  };
-  try {
-    await engine.restore();
-  } finally {
-    GpuEngine.acquireDevice = acquire;
-  }
-
-  assert.equal(attempts, 0, "the attempt ceiling is honoured");
 });
