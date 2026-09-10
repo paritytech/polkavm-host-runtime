@@ -68,6 +68,7 @@ pub struct Vm {
     epoca_input_events: VecDeque<[u8; crate::INPUT_EVENT_BYTES]>,
     motion: crate::MotionState,
     pointer_capture: crate::PointerCaptureState,
+    update_after_ms: Option<u32>,
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
     #[cfg(target_arch = "wasm32")]
@@ -93,6 +94,7 @@ pub struct Vm {
     import_time_ms: Option<u32>,
     import_log: Option<u32>,
     import_yield: Option<u32>,
+    import_update_after: Option<u32>,
     import_host_frame_send: Option<u32>,
     import_motion_read: Option<u32>,
     import_pointer_capture: Option<u32>,
@@ -440,6 +442,7 @@ impl Vm {
         let mut import_time_ms = None;
         let mut import_log = None;
         let mut import_yield = None;
+        let mut import_update_after = None;
         let mut import_host_frame_send = None;
         let mut import_host_frame_poll = None;
         let mut import_motion_read = None;
@@ -468,6 +471,9 @@ impl Vm {
                 b"pvm_time_ms" => import_time_ms = Some(import_index),
                 b"host_log" => import_log = Some(import_index),
                 b"pvm_yield" => import_yield = Some(import_index),
+                name if name == crate::UPDATE_AFTER_IMPORT.as_bytes() => {
+                    import_update_after = Some(import_index)
+                }
                 b"host_frame_send" => import_host_frame_send = Some(import_index),
                 b"host_frame_poll" => import_host_frame_poll = Some(import_index),
                 b"host_motion_read" => import_motion_read = Some(import_index),
@@ -501,6 +507,7 @@ impl Vm {
             epoca_input_events: VecDeque::with_capacity(MAX_QUEUED_INPUT_EVENTS),
             motion: crate::MotionState::new(),
             pointer_capture: crate::PointerCaptureState::default(),
+            update_after_ms: None,
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
             #[cfg(target_arch = "wasm32")]
@@ -525,6 +532,7 @@ impl Vm {
             import_time_ms,
             import_log,
             import_yield,
+            import_update_after,
             import_host_frame_send,
             import_host_frame_poll,
             import_motion_read,
@@ -574,6 +582,19 @@ impl Vm {
 
     pub fn uses_pointer_capture(&self) -> bool {
         self.import_pointer_capture.is_some()
+    }
+
+    pub fn begin_update(&mut self) {
+        self.update_after_ms = None;
+    }
+
+    pub fn uses_update_scheduling(&self) -> bool {
+        self.import_update_after.is_some()
+    }
+
+    pub fn update_after_ms(&self) -> Option<u32> {
+        self.update_after_ms
+            .filter(|delay_ms| *delay_ms != crate::UPDATE_AFTER_IDLE)
     }
 
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
@@ -1069,6 +1090,14 @@ impl Vm {
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_time_ms => {
                     self.instance.set_reg(Reg::A0, self.time_ms());
+                    continue;
+                }
+                InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_update_after => {
+                    let delay_ms = self.instance.reg(Reg::A0) as u32;
+                    self.update_after_ms = Some(
+                        self.update_after_ms
+                            .map_or(delay_ms, |current| current.min(delay_ms)),
+                    );
                     continue;
                 }
                 InterruptKind::Ecalli(hostcall) if Some(hostcall) == self.import_log => {

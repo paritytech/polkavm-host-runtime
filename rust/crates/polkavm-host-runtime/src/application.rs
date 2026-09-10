@@ -188,11 +188,11 @@ impl ApplicationRuntime {
             Self::CoreVm(runtime) => runtime.vm.uses_pointer_capture(),
         }
     }
-    /// True when the cooperative guest opts into Host-scheduled updates.
+    /// True when the guest opts into Host-scheduled updates.
     pub fn uses_update_scheduling(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.uses_update_scheduling(),
-            Self::CoreVm(_) => false,
+            Self::CoreVm(runtime) => runtime.vm.uses_update_scheduling(),
         }
     }
 
@@ -200,7 +200,7 @@ impl ApplicationRuntime {
     pub fn update_after_ms(&self) -> Option<u32> {
         match self {
             Self::Cooperative(runtime) => runtime.update_after_ms(),
-            Self::CoreVm(_) => None,
+            Self::CoreVm(runtime) => runtime.vm.update_after_ms(),
         }
     }
 
@@ -421,6 +421,7 @@ impl CoreVmRuntime {
         if self.exited {
             return Ok(());
         }
+        self.vm.begin_update();
         self.vm.set_gas(self.max_gas_per_update);
         for _ in 0..MAX_INTERRUPTS_PER_UPDATE {
             match self.vm.run().map_err(|error| anyhow!(error))? {
@@ -586,7 +587,60 @@ fn corevm_pointer_delta(value: u16) -> Option<i8> {
 
 #[cfg(test)]
 mod tests {
-    use super::corevm_pointer_delta;
+    use super::{corevm_pointer_delta, ApplicationRuntime};
+    use crate::{BackendKind, PresentationProfile, UPDATE_AFTER_IMPORT};
+    use polkavm::Reg;
+    use polkavm_common::program::{asm, InstructionSetKind};
+    use polkavm_common::writer::ProgramBlobBuilder;
+    use std::collections::HashMap;
+
+    fn update_schedule_corevm_program() -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4 * 1024);
+        builder.add_import(UPDATE_AFTER_IMPORT.as_bytes());
+        builder.add_import(b"pvm_yield");
+        builder.add_export_by_basic_block(0, b"_pvm_start");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, 50),
+                asm::ecalli(0),
+                asm::load_imm(Reg::A0, 10),
+                asm::ecalli(0),
+                asm::ecalli(1),
+                asm::load_imm(Reg::A0, 250),
+                asm::ecalli(0),
+                asm::ecalli(1),
+                asm::ret(),
+            ],
+            &[],
+        );
+        builder.into_vec().unwrap()
+    }
+
+    #[test]
+    fn corevm_update_schedule_uses_each_updates_earliest_deadline() {
+        let program = update_schedule_corevm_program();
+        assert_eq!(
+            program.as_slice(),
+            include_bytes!("../tests/fixtures/update-schedule-corevm.polkavm")
+        );
+        let mut runtime = ApplicationRuntime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+
+        assert!(runtime.uses_update_scheduling());
+        runtime.init().unwrap();
+        runtime.update().unwrap();
+        assert_eq!(runtime.update_after_ms(), Some(10));
+        runtime.update().unwrap();
+        assert_eq!(runtime.update_after_ms(), Some(250));
+    }
 
     #[test]
     fn corevm_pointer_delta_preserves_representable_signed_values() {

@@ -68,7 +68,7 @@ pub use ui::{
 };
 
 pub const ABI_VERSION: u32 = 1;
-/// Optional cooperative import used by guests to choose their next update.
+/// Optional application import used by guests to choose their next update.
 pub const UPDATE_AFTER_IMPORT: &str = "host_update_after";
 /// Wait for Host input or another external event before updating again.
 pub const UPDATE_AFTER_IDLE: u32 = u32::MAX;
@@ -1656,7 +1656,9 @@ impl Runtime {
 
     /// Requested delay after the latest call, or `None` to wait for Host input.
     pub fn update_after_ms(&self) -> Option<u32> {
-        self.state.update_after_ms
+        self.state
+            .update_after_ms
+            .filter(|delay_ms| *delay_ms != UPDATE_AFTER_IDLE)
     }
 
     pub fn send_input(&mut self, event: InputEvent) {
@@ -2050,22 +2052,19 @@ mod tests {
         builder.into_vec().unwrap()
     }
 
-    fn update_schedule_test_program() -> Vec<u8> {
+    fn update_schedule_test_program(delays: &[i32]) -> Vec<u8> {
         let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
         builder.set_stack_size(4 * 1024);
         builder.add_import(UPDATE_AFTER_IMPORT.as_bytes());
         builder.add_export_by_basic_block(0, b"init");
         builder.add_export_by_basic_block(0, b"update");
-        builder.set_code(
-            &[
-                asm::load_imm(Reg::A0, 250),
-                asm::ecalli(0),
-                asm::load_imm(Reg::A0, 50),
-                asm::ecalli(0),
-                asm::ret(),
-            ],
-            &[],
-        );
+        let mut code = Vec::with_capacity(delays.len() * 2 + 1);
+        for &delay in delays {
+            code.push(asm::load_imm(Reg::A0, delay));
+            code.push(asm::ecalli(0));
+        }
+        code.push(asm::ret());
+        builder.set_code(&code, &[]);
         builder.into_vec().unwrap()
     }
 
@@ -2337,7 +2336,7 @@ mod tests {
 
     #[test]
     fn guest_update_schedule_uses_the_earliest_requested_deadline() {
-        let program = update_schedule_test_program();
+        let program = update_schedule_test_program(&[250, 50]);
         let mut runtime = Runtime::new_with_backend(
             &program,
             HashMap::new(),
@@ -2354,6 +2353,18 @@ mod tests {
         runtime.update().unwrap();
         assert_eq!(runtime.update_after_ms(), Some(50));
 
+        let idle_program = update_schedule_test_program(&[-1]);
+        let mut idle_runtime = Runtime::new_with_backend(
+            &idle_program,
+            HashMap::new(),
+            PresentationProfile::Tri2d,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        idle_runtime.init().unwrap();
+        assert_eq!(idle_runtime.update_after_ms(), None);
         let legacy = Runtime::new_with_backend(
             &no_motion_test_program(),
             HashMap::new(),
