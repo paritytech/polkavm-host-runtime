@@ -26,31 +26,31 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "ab5bc997399f2e5d97cad7a0ebbc83d27016ff53dd9f2a55a55a5aa3fcc99ad3",
+        sha256: "dd15a3c9fa24520b44a6210a791cac8e4e3c8d60e670aee2c7268ed481400950",
     },
     BrowserAsset {
         path: "polkavm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-worker.js"),
-        sha256: "d69df2e2e919a2feeff4137444b0aad60d0d6d0a798ed4da09dbbd90bfcd97e1",
+        sha256: "45883e1de203548eab9251a292dd3f47245335d07a8e52656b2b0e9b76817017",
     },
     BrowserAsset {
         path: "polkavm-gpu-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-gpu-worker.js"),
-        sha256: "57f084ba804d48f2af5dea415aedade936119fe97c1d25f8525e0a4e382a9854",
+        sha256: "447e1a9f8ffe4db4db83c37b70bfbeb2409b5ca9e437cb68d0d1822c053c07b4",
     },
     BrowserAsset {
         path: "polkavm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-wasm-translated.js"),
-        sha256: "d2d4967ec0653f83b88d6722bac150ebfc42d22c4d72c2b6035e6d52d8da7827",
+        sha256: "b233be3e8afad3cf9f3070818aee3534de2ad1f3fff3dfe033ebdb0ec6e8eee4",
     },
     BrowserAsset {
         path: "polkavm-runtime-core.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-runtime-core.js"),
-        sha256: "2963a3fc19abaca2b311b05764c663928e599d5fa613f95d3dc7ff4dc33882ce",
+        sha256: "b7671bbed542f23145833e7d8d9b630d6864dcd3bd882fed3b79313d24337ab2",
     },
     BrowserAsset {
         path: "polkavm-wasm-worker-entry.js",
@@ -68,7 +68,7 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "376faaa02a9817588be04c24cd9eb33c7048a7ea0e9a7169b5d8d3ce83166f63",
+        sha256: "1b8f164966f5a534852edec16a54a8f6e5a66f720589ee634825723550dffc56",
     },
 ];
 

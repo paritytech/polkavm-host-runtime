@@ -336,6 +336,10 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
       invalidStart({ motionAvailability: 3 }),
       /invalid PolkaVM browser motion availability/,
     ],
+    [
+      invalidStart({ mediatedInputKinds: ["Camera UR"] }),
+      /invalid PolkaVM browser mediated-input kinds/,
+    ],
   ]) {
     const { messages, receiver } = endpoint();
     receiver.onmessage({ data: message });
@@ -389,6 +393,61 @@ test("demand-driven guests idle until an external event wakes them", async () =>
     await waitForMessage(messages, "frame");
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(messages.filter((message) => message.type === "frame").length, 1);
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+    await waitForMessage(messages, "terminated");
+  }
+});
+
+test("demand-driven delays start after the completed update", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  const updateStartedAt = [];
+  globalThis.TranslatedPolkaVmRuntime = class extends originalRuntime {
+    update(timeMs) {
+      const startedAt = performance.now();
+      updateStartedAt.push(startedAt);
+      super.update(timeMs);
+      if (updateStartedAt.length === 1) {
+        while (performance.now() - startedAt < 25) {}
+      }
+    }
+    usesUpdateScheduling() {
+      return true;
+    }
+    updateAfterMilliseconds() {
+      return updateStartedAt.length === 1 ? 40 : null;
+    }
+  };
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "demand-driven-delay-origin",
+      },
+    });
+    while (updateStartedAt.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(
+      updateStartedAt[1] - updateStartedAt[0] >= 55,
+      "the requested delay must not overlap the preceding update",
+    );
   } finally {
     receiver.onmessage({ data: { type: "stop" } });
     globalThis.TranslatedPolkaVmRuntime = originalRuntime;
@@ -728,6 +787,77 @@ test("host-frame response backpressure is retryable in both backends", async () 
       messages.some((message) => message.type === "terminated"),
       false,
     );
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
+test("both browser backends deliver bounded mediated input", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/mediated-input.polkavm",
+    ),
+  );
+  const payload = new TextEncoder().encode("decoded-ur-cbor");
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "tri2d",
+        audioEnabled: false,
+        cacheKey: `mediated-input-${forceInterpreter}`,
+        mediatedInputKinds: ["camera-ur"],
+        forceInterpreter,
+      },
+    });
+
+    const request = await waitForMessage(messages, "mediated-input-request");
+    assert.equal(request.kind, "camera-ur");
+    assert.equal(request.mediaType, "x-test-payload");
+    assert.equal(request.maxBytes, 32);
+    assert.ok(request.handle > 0);
+
+    const initialSave = await waitForMessage(messages, "save");
+    const initialView = new DataView(
+      initialSave.bytes.buffer,
+      initialSave.bytes.byteOffset,
+      initialSave.bytes.byteLength,
+    );
+    assert.deepEqual(
+      [0, 4, 8].map((offset) => initialView.getInt32(offset, true)),
+      [request.handle, 0, 2],
+    );
+    messages.splice(messages.indexOf(initialSave), 1);
+
+    receiver.onmessage({
+      data: {
+        type: "mediated-input-result",
+        handle: request.handle,
+        status: 3,
+        bytes: bytesBuffer(payload),
+      },
+    });
+    const completedSave = await waitForMessage(messages, "save");
+    const completed = new Uint8Array(completedSave.bytes);
+    assert.equal(
+      new DataView(
+        completed.buffer,
+        completed.byteOffset,
+        completed.byteLength,
+      ).getInt32(0, true),
+      payload.byteLength,
+    );
+    assert.deepEqual(completed.subarray(4), payload);
 
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
@@ -1085,6 +1215,48 @@ test("cached native code renders when further compilation is unavailable", async
     cached.receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(cached.messages, "terminated");
   }
+});
+
+test("compiler backend honors CoreVM update deadlines", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/update-schedule-corevm.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "corevm-update-scheduling",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.program,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.initialize();
+  assert.equal(translated.usesUpdateScheduling(), true);
+  translated.update(0);
+  assert.equal(translated.updateAfterMilliseconds(), 10);
+  translated.update(10);
+  assert.equal(translated.updateAfterMilliseconds(), 250);
 });
 
 test("compiler backend discards stale CoreVM mouse movement", async () => {

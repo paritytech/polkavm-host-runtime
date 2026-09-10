@@ -1,6 +1,6 @@
 [package]
 name = "polkavm-host-runtime"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Host-neutral App manifest v2 PolkaVM runtime and browser execution wrapper"
 license = "MPL-2.0"
@@ -18,9 +18,9 @@ native-gpu = ["dep:pollster", "dep:wgpu"]
 anyhow = "1"
 log = "0.4"
 polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", features = ["generic-sandbox"] }
-polkavm-gpu-wire = { version = "0.2.0", path = "../polkavm-gpu-wire", features = ["tri2d-validation"] }
-polkavm-motion-wire = { version = "0.2.0", path = "../polkavm-motion-wire" }
-polkavm-ui-wire = { version = "0.2.0", path = "../polkavm-ui-wire" }
+polkavm-gpu-wire = { version = "0.3.0", path = "../polkavm-gpu-wire", features = ["tri2d-validation"] }
+polkavm-motion-wire = { version = "0.3.0", path = "../polkavm-motion-wire" }
+polkavm-ui-wire = { version = "0.3.0", path = "../polkavm-ui-wire" }
 rand_chacha = "0.9"
 rand_core = "0.9"
 serde = { version = "1", features = ["derive"] }

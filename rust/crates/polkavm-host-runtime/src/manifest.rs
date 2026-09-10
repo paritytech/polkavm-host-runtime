@@ -150,7 +150,11 @@ impl AppDescriptor {
                 bail!("device input capability must use ABI version 1");
             }
             for feature in &input.required_features {
-                if feature != "pointer" && feature != "keyboard" && feature != "motion" {
+                if feature != "pointer"
+                    && feature != "keyboard"
+                    && feature != "motion"
+                    && feature != "camera-ur"
+                {
                     bail!("unsupported device input feature {feature}");
                 }
             }
@@ -199,6 +203,7 @@ mod tests {
     const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
     const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
     const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
+    const CAMERA_UR: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["keyboard","camera-ur"]}}}"#;
 
     #[test]
     fn omitted_required_features_default_to_empty() {
@@ -212,6 +217,12 @@ mod tests {
     fn accepts_required_motion_input() {
         let descriptor = AppDescriptor::parse_exact(MOTION, MOTION).unwrap();
         assert_eq!(descriptor.input_features, ["pointer", "motion"]);
+    }
+
+    #[test]
+    fn accepts_required_camera_ur_input() {
+        let descriptor = AppDescriptor::parse_exact(CAMERA_UR, CAMERA_UR).unwrap();
+        assert_eq!(descriptor.input_features, ["keyboard", "camera-ur"]);
     }
 
     #[test]
