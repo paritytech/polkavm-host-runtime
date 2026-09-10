@@ -66,6 +66,10 @@ pub use ui::{
 };
 
 pub const ABI_VERSION: u32 = 1;
+/// Optional application import used by guests to choose their next update.
+pub const UPDATE_AFTER_IMPORT: &str = "host_update_after";
+/// Wait for Host input or another external event before updating again.
+pub const UPDATE_AFTER_IDLE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
@@ -238,6 +242,10 @@ pub enum InputEventType {
     PointerMove = 5,
     PointerDelta = 6,
     SurfaceMetrics = 7,
+    TouchStart = 18,
+    TouchMove = 19,
+    TouchEnd = 20,
+    TouchCancel = 21,
 }
 
 /// Import through which a guest arms or releases Host pointer capture.
@@ -502,6 +510,8 @@ struct HostState {
     pointer_capture: PointerCaptureState,
     uses_pointer_capture: bool,
     uses_motion: bool,
+    uses_update_scheduling: bool,
+    update_after_ms: Option<u32>,
     gpu_capabilities: Option<Vec<u8>>,
     gpu_batches: VecDeque<GpuBatch>,
     gpu_events: VecDeque<Vec<u8>>,
@@ -547,6 +557,8 @@ impl HostState {
             pointer_capture: PointerCaptureState::default(),
             uses_pointer_capture,
             uses_motion,
+            uses_update_scheduling: false,
+            update_after_ms: None,
             gpu_capabilities: None,
             gpu_batches: VecDeque::new(),
             gpu_events: VecDeque::new(),
@@ -564,6 +576,7 @@ impl HostState {
         self.hostcall_bytes_remaining = MAX_HOSTCALL_BYTES_PER_TICK;
         self.hostcalls_remaining = max_hostcalls;
         self.sleep_ms_remaining = max_sleep_ms;
+        self.update_after_ms = None;
         self.tri2d_submitted = false;
         self.ui_semantics_submitted = false;
         self.ui_output_submitted = false;
@@ -616,6 +629,12 @@ impl HostState {
                 .is_some_and(|queued| queued[0] == InputEventType::PointerMove as u8)
         {
             self.input.pop_back();
+        } else if record[0] == InputEventType::TouchMove as u8 {
+            if let Some(position) = self.input.iter().rposition(|queued| {
+                queued[0] == InputEventType::TouchMove as u8 && queued[1] == record[1]
+            }) {
+                self.input.remove(position);
+            }
         }
         if self.input.len() == MAX_QUEUED_INPUT_EVENTS {
             let Some(position) = self.discardable_input_position() else {
@@ -667,11 +686,18 @@ impl HostState {
     }
 
     /// Position of the oldest record the guest can lose without losing state:
-    /// pointer samples are superseded by the next one, wheel deltas accumulate.
+    /// pointer and touch samples are superseded by the next one, while wheel
+    /// deltas accumulate.
     fn discardable_input_position(&self) -> Option<usize> {
         self.input
             .iter()
-            .position(|queued| queued[0] == InputEventType::PointerMove as u8)
+            .position(|queued| {
+                matches!(
+                    queued[0],
+                    value if value == InputEventType::PointerMove as u8
+                        || value == InputEventType::TouchMove as u8
+                )
+            })
             .or_else(|| {
                 self.input.iter().position(|queued| {
                     matches!(
@@ -765,13 +791,15 @@ impl HostState {
     }
 }
 
-/// True for records the guest can lose without losing state: a pointer sample
-/// is superseded by the next one and wheel deltas are accumulated by the Host.
+/// True for records the guest can lose without losing state: pointer and touch
+/// samples are superseded by the next one, and wheel deltas are accumulated by
+/// the Host.
 fn is_discardable_input(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
     matches!(
         record[0],
         value if value == InputEventType::PointerMove as u8
             || value == InputEventType::PointerDelta as u8
+            || value == InputEventType::TouchMove as u8
             || value == ui::INPUT_WHEEL
     )
 }
@@ -870,6 +898,10 @@ impl Runtime {
             .iter()
             .flatten()
             .any(|import| import.as_bytes() == POINTER_CAPTURE_IMPORT.as_bytes());
+        let uses_update_scheduling = imports
+            .iter()
+            .flatten()
+            .any(|import| import.as_bytes() == UPDATE_AFTER_IMPORT.as_bytes());
         let mut engine_config = Config::new();
         // macOS requires PolkaVM's experimental generic sandbox for native
         // recompilation. Keep sandboxing enabled while opting into that boundary.
@@ -1266,6 +1298,22 @@ impl Runtime {
 
         linker
             .define_typed(
+                UPDATE_AFTER_IMPORT,
+                |caller: polkavm::Caller<'_, HostState>, delay_ms: u32| -> Result<()> {
+                    caller.user_data.charge_hostcall(0)?;
+                    caller.user_data.update_after_ms = Some(
+                        caller
+                            .user_data
+                            .update_after_ms
+                            .map_or(delay_ms, |current| current.min(delay_ms)),
+                    );
+                    Ok(())
+                },
+            )
+            .context("define host_update_after")?;
+
+        linker
+            .define_typed(
                 "host_time_ms",
                 |caller: polkavm::Caller<'_, HostState>| -> Result<u64> {
                     caller.user_data.charge_hostcall(0)?;
@@ -1412,15 +1460,17 @@ impl Runtime {
             .instantiate()
             .context("instantiate PolkaVM module")?;
 
+        let mut state = HostState::new(
+            assets,
+            presentation,
+            audio_enabled,
+            uses_motion,
+            uses_pointer_capture,
+        );
+        state.uses_update_scheduling = uses_update_scheduling;
         Ok(Self {
             instance,
-            state: HostState::new(
-                assets,
-                presentation,
-                audio_enabled,
-                uses_motion,
-                uses_pointer_capture,
-            ),
+            state,
             max_gas_per_update,
             last_gas_used: 0,
             backend,
@@ -1508,6 +1558,18 @@ impl Runtime {
 
     pub fn uses_motion(&self) -> bool {
         self.state.uses_motion
+    }
+
+    /// True when the guest opts into Host-scheduled updates.
+    pub fn uses_update_scheduling(&self) -> bool {
+        self.state.uses_update_scheduling
+    }
+
+    /// Requested delay after the latest call, or `None` to wait for Host input.
+    pub fn update_after_ms(&self) -> Option<u32> {
+        self.state
+            .update_after_ms
+            .filter(|delay_ms| *delay_ms != UPDATE_AFTER_IDLE)
     }
 
     pub fn send_input(&mut self, event: InputEvent) {
@@ -1896,6 +1958,22 @@ mod tests {
         builder.into_vec().unwrap()
     }
 
+    fn update_schedule_test_program(delays: &[i32]) -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4 * 1024);
+        builder.add_import(UPDATE_AFTER_IMPORT.as_bytes());
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        let mut code = Vec::with_capacity(delays.len() * 2 + 1);
+        for &delay in delays {
+            code.push(asm::load_imm(Reg::A0, delay));
+            code.push(asm::ecalli(0));
+        }
+        code.push(asm::ret());
+        builder.set_code(&code, &[]);
+        builder.into_vec().unwrap()
+    }
+
     /// Guest that arms capture during `init` and stores the returned status.
     fn pointer_capture_test_program(request: u32) -> Vec<u8> {
         let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
@@ -2160,6 +2238,50 @@ mod tests {
             runtime.instance.reg(Reg::A0) as u32 as i32,
             motion_wire::MOTION_ERROR_PERMISSION_DENIED
         );
+    }
+
+    #[test]
+    fn guest_update_schedule_uses_the_earliest_requested_deadline() {
+        let program = update_schedule_test_program(&[250, 50]);
+        let mut runtime = Runtime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Tri2d,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+
+        assert!(runtime.uses_update_scheduling());
+        runtime.init().unwrap();
+        assert_eq!(runtime.update_after_ms(), Some(50));
+        runtime.update().unwrap();
+        assert_eq!(runtime.update_after_ms(), Some(50));
+
+        let idle_program = update_schedule_test_program(&[-1]);
+        let mut idle_runtime = Runtime::new_with_backend(
+            &idle_program,
+            HashMap::new(),
+            PresentationProfile::Tri2d,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        idle_runtime.init().unwrap();
+        assert_eq!(idle_runtime.update_after_ms(), None);
+
+        let legacy = Runtime::new_with_backend(
+            &no_motion_test_program(),
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        assert!(!legacy.uses_update_scheduling());
     }
 
     #[test]

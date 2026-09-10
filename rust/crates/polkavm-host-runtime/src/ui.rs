@@ -21,6 +21,10 @@ pub const INPUT_SAFE_AREA_INSETS: u8 = 16;
 pub const INPUT_KEYBOARD_INSETS: u8 = 17;
 pub const INPUT_INSETS_HORIZONTAL: u8 = 0;
 pub const INPUT_INSETS_VERTICAL: u8 = 1;
+pub const INPUT_TOUCH_START: u8 = 18;
+pub const INPUT_TOUCH_MOVE: u8 = 19;
+pub const INPUT_TOUCH_END: u8 = 20;
+pub const INPUT_TOUCH_CANCEL: u8 = 21;
 
 const CHUNK_LENGTH_MASK: u8 = 0x07;
 const CHUNK_FIRST: u8 = 0x40;
@@ -187,6 +191,11 @@ pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<
         INPUT_SAFE_AREA_INSETS | INPUT_KEYBOARD_INSETS => {
             if record[1] > INPUT_INSETS_VERTICAL || record[6..] != [0, 0] {
                 bail!("viewport insets record is malformed");
+            }
+        }
+        INPUT_TOUCH_START | INPUT_TOUCH_MOVE | INPUT_TOUCH_END | INPUT_TOUCH_CANCEL => {
+            if record[6..] != [0, 0] {
+                bail!("touch record has nonzero reserved bytes");
             }
         }
         _ => bail!("unsupported input record type {}", record[0]),

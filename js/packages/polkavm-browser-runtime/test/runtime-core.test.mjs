@@ -171,6 +171,133 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
   }
 });
 
+test("demand-driven guests idle until an external event wakes them", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  let updates = 0;
+  globalThis.TranslatedPolkaVmRuntime = class {
+    initialize() {}
+    usesMotion() {
+      return false;
+    }
+    usesPointerCapture() {
+      return false;
+    }
+    usesUpdateScheduling() {
+      return true;
+    }
+    updateAfterMilliseconds() {
+      return null;
+    }
+    update() {
+      updates++;
+    }
+    sendInput() {}
+    setPointerCaptureSupported() {}
+    takePointerCaptureRequest() {
+      return null;
+    }
+    stop() {}
+  };
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: new Uint8Array([1]),
+        compiledModule: new WebAssembly.Module(
+          new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
+        ),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "demand-driven-idle",
+      },
+    });
+    const ready = await waitForMessage(messages, "ready");
+    assert.equal(ready.usesUpdateScheduling, true);
+    while (updates < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(updates, 1);
+
+    receiver.onmessage({ data: { type: "input", bytes: new Uint8Array(8) } });
+    while (updates < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(updates, 2);
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+  }
+});
+
+test("demand-driven delays start after the completed update", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  const updateStartedAt = [];
+  globalThis.TranslatedPolkaVmRuntime = class {
+    initialize() {}
+    usesMotion() {
+      return false;
+    }
+    usesPointerCapture() {
+      return false;
+    }
+    usesUpdateScheduling() {
+      return true;
+    }
+    updateAfterMilliseconds() {
+      return updateStartedAt.length === 1 ? 40 : null;
+    }
+    update() {
+      const startedAt = performance.now();
+      updateStartedAt.push(startedAt);
+      if (updateStartedAt.length === 1) {
+        while (performance.now() - startedAt < 25) {}
+      }
+    }
+    setPointerCaptureSupported() {}
+    takePointerCaptureRequest() {
+      return null;
+    }
+    stop() {}
+  };
+  const { receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: new Uint8Array([1]),
+        compiledModule: new WebAssembly.Module(
+          new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
+        ),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "demand-driven-delay-origin",
+      },
+    });
+    while (updateStartedAt.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(
+      updateStartedAt[1] - updateStartedAt[0] >= 55,
+      "the requested delay must not overlap the preceding update",
+    );
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+  }
+});
+
 test("compiler backend enforces the declared graphics profile", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -439,7 +566,10 @@ test("host-frame response backpressure is retryable in both backends", async () 
       { type: "host-frame-response-rejected", reason: "queue-full" },
       "responses without seq keep the legacy rejection shape",
     );
-    assert.equal(messages.some((message) => message.type === "error"), false);
+    assert.equal(
+      messages.some((message) => message.type === "error"),
+      false,
+    );
     assert.equal(
       messages.some((message) => message.type === "terminated"),
       false,
@@ -669,6 +799,48 @@ test("JIT fallback preserves a motion sample queued during startup", async () =>
     console.warn = warn;
     globalThis.TranslatedPolkaVmRuntime = Runtime;
   }
+});
+
+test("compiler backend honors CoreVM update deadlines", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/update-schedule-corevm.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "corevm-update-scheduling",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.initialize();
+  assert.equal(translated.usesUpdateScheduling(), true);
+  translated.update(0);
+  assert.equal(translated.updateAfterMilliseconds(), 10);
+  translated.update(10);
+  assert.equal(translated.updateAfterMilliseconds(), 250);
 });
 
 test("compiler backend discards stale CoreVM mouse movement", async () => {

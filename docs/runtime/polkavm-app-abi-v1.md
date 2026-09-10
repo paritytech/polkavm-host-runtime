@@ -81,6 +81,30 @@ silently reinterpret a submission as another graphics profile.
 
 ## Host imports
 
+### Cooperative update scheduling
+
+```text
+host_update_after(delay_ms: u32) -> ()
+```
+
+Importing `host_update_after` opts a cooperative application guest into
+demand-driven updates. The Host performs the first `update` after `init`
+automatically. Before each later update, the Host clears the previous request.
+Calls made during that Host update select the smallest requested delay.
+
+The CoreVM compatibility path recognizes the same import and applies equivalent
+behavior to the initial `_pvm_start` slice and each later resume. This is Host
+compatibility behavior, not part of the portable CoreVM contract.
+
+`delay_ms == 0` requests another update as soon as the Host can schedule it.
+`delay_ms == u32::MAX` requests no timer; the Host waits until input, a
+Host-frame response, a GPU event, or another external event is queued for the
+guest. Every such event MUST wake an opted-in guest promptly.
+
+A guest that does not import this call retains Host-defined continuous
+scheduling for compatibility. Scheduling does not weaken per-update gas or
+Host-call budgets.
+
 ### Framebuffer presentation
 
 ```text
@@ -297,6 +321,10 @@ ABI v1 event types are:
 15  pointer capture (`code` is 0 or 1)
 16  safe-area inset pair (`code` is 0 or 1)
 17  virtual-keyboard occlusion inset pair (`code` is 0 or 1)
+18  touch start
+19  touch move
+20  touch end
+21  touch cancel
 ```
 
 Pointer button, position, and delta records are baseline optional input. An App
@@ -305,6 +333,12 @@ pointer source simply emits no pointer records, and that absence is not a
 launch failure. Pointer capture is Host policy and is never selected by the
 manifest. The guest arms capture through the pointer-capture hostcall below,
 and the Host decides when an activation is eligible.
+
+Touch records use `code` as a Host-assigned contact ID and `x`/`y` as the
+physical-pixel position. An ID MUST remain stable from start through end or
+cancel and MUST NOT be reused while active. Hosts MAY omit touch input when
+unavailable. Touch contacts are independent of the compatibility pointer
+stream; a Host MUST NOT synthesize pointer records for non-primary contacts.
 
 Safe-area and virtual-keyboard occlusion values are unsigned physical pixels
 measured inward from the current render-surface edges. Each complete update is
@@ -479,18 +513,21 @@ Version 1 commands are:
 opcode  flags  payload
 1       0      clipboard text as UTF-8
 2       bit 0  non-empty URL as UTF-8; bit 0 requests a new surface
+3       0      width u32, height u32, then row-major unpremultiplied sRGBA bytes
 ```
+
 
 Commands are processed in stream order. URL bytes are untrusted input: the Host
 MUST apply its navigation scheme, origin, permission, and user-gesture policy,
 and a new surface MUST NOT retain a privileged opener. Clipboard access remains
-subject to platform policy. Version 1 deliberately has no image-clipboard
-command; unknown opcodes are rejected rather than ignored.
+subject to platform policy. Image dimensions are non-zero, at most 2048 on
+either axis, at most 1,048,576 total pixels, and followed by exactly
+`width * height * 4` bytes. Unknown opcodes are rejected rather than ignored.
 
-A stream is at most 256 KiB and contains at most 64 commands. Clipboard text is
-at most 64 KiB and a URL is at most 8 KiB. All reserved bytes and unsupported
-flags MUST be zero. The encoded total must end exactly after the declared
-command sequence.
+A stream is at most 4.25 MiB and contains at most 64 commands. Clipboard text is
+at most 64 KiB, one clipboard image is at most 4 MiB, and a URL is at most
+8 KiB. All reserved bytes and unsupported flags MUST be zero. The encoded total
+must end exactly after the declared command sequence.
 
 Return values:
 
@@ -711,7 +748,8 @@ results covering:
 - save submission;
 - bounded logging;
 - host-frame request/response round trips and queue bounds;
-- graphics-profile enforcement.
+- graphics-profile enforcement;
+- demand-driven update deadlines, idle suspension, and external-event wakes.
 
 Native and browser implementations MUST run the same fixture inputs. Full
 sample applications are integration evidence rather than normative fixtures.

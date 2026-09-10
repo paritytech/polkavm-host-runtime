@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assets-export"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "polkavm-host-runtime-assets",
 ]
@@ -896,11 +896,11 @@ dependencies = [
 
 [[package]]
 name = "polkavm-gpu-wire"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "polkavm-host-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-host-runtime-assets"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sha2",
 ]
@@ -935,11 +935,11 @@ source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce
 
 [[package]]
 name = "polkavm-motion-wire"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "polkavm-ui-wire"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "pollster"
