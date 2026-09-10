@@ -479,8 +479,38 @@
   }
 
   class TranslatedPolkaVmRuntime {
+    static async compile(bytes) {
+      const module = await WebAssembly.compile(bytes);
+      const parts = [];
+      for (const bytes of WebAssembly.Module.customSections(
+        module,
+        "epoca.pvm.code-part",
+      )) {
+        // Keep native compilation bounded to one code part at a time.
+        parts.push(await WebAssembly.compile(bytes));
+      }
+      return { module, parts };
+    }
+
+    static isCompiledProgram(value) {
+      if (
+        value === null ||
+        typeof value !== "object" ||
+        !(value.module instanceof WebAssembly.Module) ||
+        !Array.isArray(value.parts)
+      ) {
+        return false;
+      }
+      for (const part of value.parts) {
+        if (!(part instanceof WebAssembly.Module)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     constructor(
-      module,
+      program,
       assets,
       emit,
       maxGas,
@@ -489,13 +519,20 @@
       gpuCapabilities = null,
       motionAvailability = MOTION_STATUS_UNAVAILABLE,
     ) {
-      this.metadata = readMetadata(module);
-      this.instance = new WebAssembly.Instance(module, {});
+      if (!TranslatedPolkaVmRuntime.isCompiledProgram(program)) {
+        throw new TypeError("invalid translated PolkaVM compiled program");
+      }
+      this.metadata = readMetadata(program.module);
+      this.instance = new WebAssembly.Instance(program.module, {});
       this.pvm = this.instance.exports;
       this.memory = this.pvm.memory;
       if (!(this.memory instanceof WebAssembly.Memory)) {
         throw new Error("translated PolkaVM module is missing guest memory");
       }
+      const imports = { pvm: this.pvm };
+      this.partInstances = program.parts.map(
+        (part) => new WebAssembly.Instance(part, imports),
+      );
       this.assets = new Map(
         assets.map((asset) => [
           normalizedPath(asset.path),

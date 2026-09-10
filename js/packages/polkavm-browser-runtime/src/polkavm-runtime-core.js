@@ -447,9 +447,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     let compilationMs = 0;
     let translatedWasmBytes = 0;
     let cacheHit = false;
+    let compilerStage = "compiler-staging-program";
+    let compilerFallbackReason;
+    let compilerFallbackStage;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
-    const instantiated = await WebAssembly.instantiate(message.runtime, {});
-    pvm = instantiated.instance.exports;
+    pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
     if (pvm.polkavm_browser_abi_version() !== 2) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
@@ -460,14 +462,18 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         throw FORCE_INTERPRETER;
       }
       stage(program);
-      let module = message.compiledModule;
+      let compiledProgram = message.compiledProgram;
       let bytes =
         message.compiledBytes instanceof ArrayBuffer
           ? new Uint8Array(message.compiledBytes)
           : null;
-      cacheHit = module instanceof WebAssembly.Module || bytes !== null;
-      if (!(module instanceof WebAssembly.Module)) {
+      const hasCompiledProgram =
+        globalThis.TranslatedPolkaVmRuntime.isCompiledProgram(compiledProgram);
+      cacheHit = hasCompiledProgram || bytes !== null;
+      if (!hasCompiledProgram) {
+        let generatedTranslation = bytes === null;
         if (bytes === null) {
+          compilerStage = "compiler-translating";
           const translationStarted = performance.now();
           check(
             pvm.polkavm_browser_translate_staged(),
@@ -477,26 +483,72 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           const pointer = pvm.polkavm_browser_translation_pointer();
           const length = pvm.polkavm_browser_translation_length();
           bytes = new Uint8Array(pvm.memory.buffer, pointer, length).slice();
+        }
+        translatedWasmBytes = bytes.byteLength;
+        // Translation can grow its linear memory far beyond the guest heap.
+        // The compiled backend does not use that instance; release it before
+        // the browser allocates native code for the root and its code parts.
+        pvm = null;
+        compilerStage = "compiler-compiling";
+        const compilationStarted = performance.now();
+        try {
+          compiledProgram =
+            await globalThis.TranslatedPolkaVmRuntime.compile(bytes);
+          compilationMs = performance.now() - compilationStarted;
+        } catch (error) {
+          compilationMs = performance.now() - compilationStarted;
+          // Invalid Wasm cannot be repaired by changing compilation-unit sizes.
+          if (error instanceof WebAssembly.CompileError) {
+            throw error;
+          }
+          console.warn(
+            `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          compilerStage = "compiler-translating-parts";
+          pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
+          stage(program);
+          const translationStarted = performance.now();
+          check(
+            pvm.polkavm_browser_translate_partitioned_staged(),
+            "translate bounded PolkaVM browser code parts",
+          );
+          translationMs += performance.now() - translationStarted;
+          bytes = new Uint8Array(
+            pvm.memory.buffer,
+            pvm.polkavm_browser_translation_pointer(),
+            pvm.polkavm_browser_translation_length(),
+          ).slice();
+          generatedTranslation = true;
+          translatedWasmBytes = bytes.byteLength;
+          pvm = null;
+          compilerStage = "compiler-compiling-parts";
+          const partsStarted = performance.now();
+          try {
+            compiledProgram =
+              await globalThis.TranslatedPolkaVmRuntime.compile(bytes);
+          } finally {
+            compilationMs += performance.now() - partsStarted;
+          }
+        }
+        if (generatedTranslation) {
           const persistent = bytes.slice();
           postMessage(
-            {
-              type: "translated",
-              cacheKey: message.cacheKey,
-              bytes: persistent,
-            },
+            { type: "translated", cacheKey: message.cacheKey, bytes: persistent },
             [persistent.buffer],
           );
         }
-        translatedWasmBytes = bytes.byteLength;
-        const compilationStarted = performance.now();
-        module = await WebAssembly.compile(bytes);
-        compilationMs = performance.now() - compilationStarted;
         try {
-          postMessage({ type: "compiled", cacheKey: message.cacheKey, module });
+          postMessage({
+            type: "compiled",
+            cacheKey: message.cacheKey,
+            program: compiledProgram,
+          });
         } catch {}
       }
+      pvm = null;
+      compilerStage = "compiler-instantiating";
       translated = new globalThis.TranslatedPolkaVmRuntime(
-        module,
+        compiledProgram,
         message.assets,
         (output, transfers = []) => {
           if (running) {
@@ -511,6 +563,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         pendingGpuCapabilities,
         motionAvailability,
       );
+      compilerStage = "compiler-initializing";
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
       }
@@ -523,7 +576,15 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       translated = null;
       pendingOutputs.length = 0;
       if (error !== FORCE_INTERPRETER) {
-        console.warn(`PolkaVM translation failed; using interpreter: ${error}`);
+        compilerFallbackReason =
+          error instanceof Error ? error.message : String(error);
+        compilerFallbackStage = compilerStage;
+        console.warn(
+          `PolkaVM ${compilerFallbackStage} failed; using interpreter: ${compilerFallbackReason}`,
+        );
+      }
+      if (pvm === null) {
+        pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
       }
       let presentation = 0;
       if (message.graphicsProfile === "tri2d") {
@@ -621,6 +682,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({
       type: "ready",
       backend,
+      compilerFallbackReason,
+      compilerFallbackStage,
       usesMotion,
       usesPointerCapture,
       cacheHit,
@@ -718,7 +781,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (availability !== 1) {
       pendingMotionSample = null;
     }
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -733,7 +796,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
 
   function setPointerCaptureSupported(supported) {
     pointerCaptureSupported = supported === true;
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -749,7 +812,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function setPointerCaptureActive(active) {
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -766,7 +829,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (bytes.byteLength !== MOTION_SAMPLE_BYTES) {
       throw new Error("invalid PolkaVM browser motion sample");
     }
-    if (!running || !pvm) {
+    if (!running) {
       pendingMotionSample = bytes.slice();
       motionAvailability = 1;
       return;
@@ -786,7 +849,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (bytes.byteLength < 56 || bytes.byteLength > 4096) {
       throw new Error("invalid PolkaVM browser GPU capabilities");
     }
-    if (!running || !pvm) {
+    if (!running) {
       pendingGpuCapabilities = bytes.slice();
       return;
     }
@@ -802,7 +865,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function sendGpuEvent(bytes) {
-    if (!running || !pvm || !bytes.byteLength) {
+    if (!running || !bytes.byteLength) {
       return;
     }
     if (translated) {
@@ -817,7 +880,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function sendHostFrameResponse(bytes) {
-    if (!running || !pvm || !bytes.byteLength) {
+    if (!running || !bytes.byteLength) {
       return true;
     }
     if (translated) {

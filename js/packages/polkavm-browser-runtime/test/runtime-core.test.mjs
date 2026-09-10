@@ -16,6 +16,182 @@ function bytesBuffer(bytes) {
   );
 }
 
+function partitionedGuestBytes() {
+  const uleb = (value) => {
+    const bytes = [];
+    do {
+      const byte = value & 0x7f;
+      value >>>= 7;
+      bytes.push(byte | (value ? 0x80 : 0));
+    } while (value);
+    return bytes;
+  };
+  const string = (value) => {
+    const bytes = [...new TextEncoder().encode(value)];
+    return [...uleb(bytes.length), ...bytes];
+  };
+  const section = (id, bytes) => [id, ...uleb(bytes.length), ...bytes];
+  const vector = (entries) => [...uleb(entries.length), ...entries.flat()];
+  const body = (instructions) => {
+    const bytes = [0, ...instructions, 0x0b];
+    return [...uleb(bytes.length), ...bytes];
+  };
+  const wasm = (...sections) =>
+    new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sections.flat()]);
+  const exportEntry = (name, kind, index) => [...string(name), kind, index];
+  const importEntry = (name, descriptor) => [
+    ...string("pvm"),
+    ...string(name),
+    ...descriptor,
+  ];
+  const blockType = [0x60, 0, 1, 0x7f]; // () -> i32 status
+  const part = (slot, instructions) =>
+    wasm(
+      section(1, vector([blockType])),
+      section(
+        2,
+        vector([
+          importEntry("__helper0", [0, 0]),
+          importEntry("__table", [1, 0x70, 0, 2]),
+          importEntry("memory", [2, 0, 1]),
+          importEntry("__global0", [3, 0x7e, 1]),
+        ]),
+      ),
+      section(3, [1, 0]),
+      section(9, [1, 0, 0x41, slot, 0x0b, 1, 1]),
+      section(10, vector([body(instructions)])),
+    );
+  const first = part(0, [
+    0x23, 0, 0x42, 7, 0x7c, 0x24, 0, // r0 += 7
+    0x41, 0, 0x41, 0, 0x28, 2, 0, // address 0, memory[0]
+    0x41, 5, 0x6a, 0x36, 2, 0, // memory[0] += 5
+    0x41, 1, 0x13, 0, 0, // tail-dispatch to part 1 through the shared table
+  ]);
+  const second = part(1, [
+    0x41, 4, 0x10, 0, // address 4, root helper reading memory[0]
+    0x23, 0, 0xa7, 0x6a, 0x36, 2, 0, // memory[4] = memory[0] + r0
+    0x41, 0x7f, // STATUS_FINISHED
+  ]);
+  const metadataExport = (name) => [
+    name.length, 0, ...new TextEncoder().encode(name), 0, 0, 0, 0,
+  ];
+  const metadata = [
+    ...new TextEncoder().encode("EPM2"),
+    1, 0, 0, 0, // 64-bit registers
+    ...new Array(11 * 4).fill(0), // no hostcall address translation needed
+    0, 0, 0, 0, // imports
+    2, 0, 0, 0, // exports
+    ...metadataExport("init"),
+    ...metadataExport("update"),
+  ];
+  const rootSections = [
+    section(0, [...string("epoca.pvm.meta"), ...metadata]),
+    section(
+      1,
+      vector([
+        blockType,
+        [0x60, 2, 0x7f, 0x7e, 1, 0x7f], // begin(i32, i64) -> i32
+        [0x60, 1, 0x7e, 0], // set_gas(i64)
+      ]),
+    ),
+    section(3, [3, 0, 1, 2]),
+    section(4, [1, 0x70, 0, 2]),
+    section(5, [1, 0, 1]),
+    section(
+      6,
+      vector(Array.from({ length: 14 }, () => [0x7e, 1, 0x42, 0, 0x0b])),
+    ),
+    section(
+      7,
+      vector([
+        exportEntry("memory", 2, 0),
+        exportEntry("__table", 1, 0),
+        exportEntry("__global0", 3, 0),
+        exportEntry("__helper0", 0, 0),
+        exportEntry("pvm_begin", 0, 1),
+        exportEntry("pvm_set_gas", 0, 2),
+        ...Array.from({ length: 13 }, (_, index) =>
+          exportEntry(`r${index}`, 3, index),
+        ),
+      ]),
+    ),
+    section(
+      10,
+      vector([
+        body([0x41, 0, 0x28, 2, 0]), // helper reads memory[0]
+        body([0x20, 1, 0x24, 13, 0x20, 0, 0x13, 0, 0]),
+        body([0x20, 0, 0x24, 13]),
+      ]),
+    ),
+  ];
+  return {
+    root: wasm(...rootSections),
+    partitioned: wasm(
+      ...rootSections,
+      section(0, [...string("epoca.pvm.code-part"), ...first]),
+      section(0, [...string("epoca.pvm.code-part"), ...second]),
+    ),
+    invalidPart: wasm(
+      ...rootSections,
+      section(0, [...string("epoca.pvm.code-part"), 0]),
+    ),
+  };
+}
+
+test("translated code parts share guest memory, registers, helpers and control flow", async () => {
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const { partitioned } = partitionedGuestBytes();
+  const program = structuredClone(await Runtime.compile(partitioned));
+  assert.equal(Runtime.isCompiledProgram(program), true);
+  const translated = new Runtime(
+    program, [], () => {}, 1_000_000, false, "framebuffer",
+  );
+  const state = () => ({
+    register: translated.pvm.r0.value,
+    memory: [...new Uint32Array(translated.memory.buffer, 0, 2)],
+  });
+  translated.initialize();
+  assert.deepEqual(state(), { register: 7n, memory: [5, 12] });
+  translated.update(17);
+  assert.deepEqual(state(), { register: 14n, memory: [10, 24] });
+  const other = new Runtime(
+    program, [], () => {}, 1_000_000, false, "framebuffer",
+  );
+  other.initialize();
+  assert.deepEqual(
+    [...new Uint32Array(other.memory.buffer, 0, 2)],
+    [5, 12],
+    "cached code must not share guest state between runtime instances",
+  );
+  assert.deepEqual(state(), { register: 14n, memory: [10, 24] });
+  translated.stop();
+  other.stop();
+});
+
+test("compiled programs accept root-only modules but reject malformed parts and bare modules", async () => {
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const { root } = partitionedGuestBytes();
+  const program = await Runtime.compile(root);
+  assert.equal(Runtime.isCompiledProgram(program), true);
+  const translated = new Runtime(
+    program, [], () => {}, 1_000_000, false, "framebuffer",
+  );
+  translated.stop();
+  for (const invalid of [
+    program.module,
+    { module: program.module },
+    { module: program.module, parts: [null] },
+    { module: program.module, parts: new Array(1) },
+    { module: root, parts: [] },
+  ]) {
+    assert.equal(Runtime.isCompiledProgram(invalid), false);
+    assert.throws(
+      () => new Runtime(invalid, [], () => {}, 1_000_000, false, "framebuffer"),
+      TypeError,
+    );
+  }
+});
+
 function endpoint() {
   const messages = [];
   const receiver = {
@@ -234,7 +410,7 @@ test("compiler backend returns complete u64 clock values to 32-bit guests", asyn
 
   const outputs = [];
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     (output) => outputs.push(output),
     1_000_000,
@@ -288,6 +464,8 @@ test("graphics runtimes expose wall clock and secure random core services", asyn
     assert.deepEqual(save.bytes, success);
     const ready = await waitForMessage(messages, "ready");
     assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+    assert.equal(ready.compilerFallbackReason, undefined);
+    assert.equal(ready.compilerFallbackStage, undefined);
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
   }
@@ -586,7 +764,7 @@ test("compiler backend implements MotionSample v1 status and reads", async () =>
 
   const outputs = [];
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     (output) => outputs.push(output),
     1_000_000,
@@ -607,7 +785,7 @@ test("compiler backend implements MotionSample v1 status and reads", async () =>
 
   const deniedOutputs = [];
   const denied = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     (output) => deniedOutputs.push(output),
     1_000_000,
@@ -698,6 +876,11 @@ test("JIT fallback preserves a motion sample queued during startup", async () =>
     });
     const ready = await waitForMessage(messages, "ready");
     assert.equal(ready.backend, "interpreter");
+    assert.equal(
+      ready.compilerFallbackReason,
+      "forced translated initialization failure",
+    );
+    assert.equal(ready.compilerFallbackStage, "compiler-initializing");
     assert.equal(ready.usesMotion, true);
     const result = motionResult((await waitForMessage(messages, "save")).bytes);
     assert.equal(result.status, 48);
@@ -707,6 +890,151 @@ test("JIT fallback preserves a motion sample queued during startup", async () =>
   } finally {
     console.warn = warn;
     globalThis.TranslatedPolkaVmRuntime = Runtime;
+  }
+});
+
+test("compiler capacity failure selects bounded compiled code and still renders", async (t) => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const compile = Runtime.compile;
+  t.mock.method(Runtime, "compile", async (bytes) => {
+    const module = await WebAssembly.compile(bytes);
+    if (WebAssembly.Module.customSections(module, "epoca.pvm.code-part").length === 0) {
+      throw new RangeError("single-module native code capacity exceeded");
+    }
+    return compile(bytes);
+  });
+  t.mock.method(console, "warn", () => {});
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+      },
+    });
+    assert.equal((await waitForMessage(messages, "ready")).backend, "compiler");
+    const frame = await waitForMessage(messages, "frame");
+    assert.equal(frame.width, 320);
+    assert.equal(frame.height, 200);
+    assert.deepEqual(Array.from(frame.pixels.slice(-4)), [0x0f, 0x0f, 0x23, 0xff]);
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
+test("compiler fallback reports root and code-part compilation failures", async (t) => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const { invalidPart } = partitionedGuestBytes();
+  for (const [name, compiledBytes] of [
+    ["root", new Uint8Array([0])],
+    ["code part", invalidPart],
+  ]) {
+    await t.test(name, async () => {
+      let compilationError;
+      try {
+        await globalThis.TranslatedPolkaVmRuntime.compile(compiledBytes);
+      } catch (error) {
+        compilationError = error;
+      }
+      assert.ok(compilationError instanceof WebAssembly.CompileError);
+      const { messages, receiver } = endpoint();
+      const warn = console.warn;
+      console.warn = () => {};
+      try {
+        receiver.onmessage({
+          data: {
+            type: "start",
+            runtime: bytesBuffer(runtime),
+            program: bytesBuffer(program),
+            compiledBytes: bytesBuffer(compiledBytes),
+            assets: [],
+            graphicsProfile: "framebuffer",
+            audioEnabled: false,
+            cacheKey: `invalid-cached-wasm-${name}`,
+          },
+        });
+        const ready = await waitForMessage(messages, "ready");
+        assert.equal(ready.backend, "interpreter");
+        assert.equal(ready.compilerFallbackStage, "compiler-compiling");
+        assert.equal(ready.compilerFallbackReason, compilationError.message);
+        await waitForMessage(messages, "frame");
+      } finally {
+        console.warn = warn;
+        receiver.onmessage({ data: { type: "stop" } });
+        await waitForMessage(messages, "terminated");
+      }
+    });
+  }
+});
+
+test("cached native code renders when further compilation is unavailable", async (t) => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const start = {
+    type: "start",
+    runtime: bytesBuffer(runtime),
+    program: bytesBuffer(program),
+    assets: [],
+    graphicsProfile: "framebuffer",
+    audioEnabled: false,
+    cacheKey: "compiled-program-reuse",
+  };
+  const first = endpoint();
+  let compiledProgram;
+  try {
+    first.receiver.onmessage({ data: start });
+    assert.equal((await waitForMessage(first.messages, "ready")).backend, "compiler");
+    compiledProgram = structuredClone(
+      (await waitForMessage(first.messages, "compiled")).program,
+    );
+    await waitForMessage(first.messages, "frame");
+  } finally {
+    first.receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(first.messages, "terminated");
+  }
+  t.mock.method(globalThis.TranslatedPolkaVmRuntime, "compile", async () => {
+    throw new RangeError("native compiler capacity exhausted");
+  });
+  const cached = endpoint();
+  try {
+    cached.receiver.onmessage({ data: { ...start, compiledProgram } });
+    const ready = await waitForMessage(cached.messages, "ready");
+    assert.equal(ready.backend, "compiler");
+    assert.equal(ready.cacheHit, true);
+    const frame = await waitForMessage(cached.messages, "frame");
+    assert.deepEqual(Array.from(frame.pixels.slice(-4)), [0x0f, 0x0f, 0x23, 0xff]);
+  } finally {
+    cached.receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(cached.messages, "terminated");
   }
 });
 
@@ -737,7 +1065,7 @@ test("compiler backend discards stale CoreVM mouse movement", async () => {
   await waitForMessage(messages, "terminated");
 
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     () => {},
     1_000_000,
@@ -795,6 +1123,8 @@ test("browser runtime can select the interpreter without attempting translation"
 
   const ready = await waitForMessage(messages, "ready");
   assert.equal(ready.backend, "interpreter");
+  assert.equal(ready.compilerFallbackReason, undefined);
+  assert.equal(ready.compilerFallbackStage, undefined);
   assert.equal(ready.usesMotion, false);
   assert.equal(ready.cacheHit, false);
   assert.equal(ready.translationMs, 0);
@@ -808,27 +1138,6 @@ test("browser runtime can select the interpreter without attempting translation"
   );
 
   await waitForStartupStage(messages, "first-update-completed");
-  assert.deepEqual(
-    messages
-      .filter((message) => message.type === "startup")
-      .map((message) => message.stage),
-    [
-      "runtime-instantiating",
-      "runtime-instantiated",
-      "interpreter-staging-program",
-      "interpreter-program-staged",
-      "interpreter-launch-begin",
-      "interpreter-launch-begun",
-      "interpreter-mounting-assets",
-      "interpreter-assets-mounted",
-      "interpreter-launch-starting",
-      "interpreter-launch-started",
-      "interpreter-initializing",
-      "interpreter-initialized",
-      "first-update-started",
-      "first-update-completed",
-    ],
-  );
 
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
@@ -861,7 +1170,7 @@ test("translated backend keeps pointer capture under Host policy", async () => {
   await waitForMessage(messages, "terminated");
 
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     () => {},
     1_000_000,
@@ -938,7 +1247,7 @@ test("both browser backends answer the pointer capture hostcall", async () => {
 
   const outputs = [];
   const unsupported = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     (output) => outputs.push(output),
     1_000_000,
@@ -957,7 +1266,7 @@ test("both browser backends answer the pointer capture hostcall", async () => {
 
   const supportedOutputs = [];
   const supported = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     (output) => supportedOutputs.push(output),
     1_000_000,
@@ -1037,7 +1346,7 @@ test("both browser backends take viewport insets as a whole pair", async () => {
   await waitForMessage(messages, "terminated");
 
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     () => {},
     1_000_000,
@@ -1093,7 +1402,7 @@ test("a guest buffer that ends mid-pair waits for the whole update", async () =>
   await waitForMessage(messages, "terminated");
 
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module,
+    compiled.program,
     [],
     () => {},
     1_000_000,

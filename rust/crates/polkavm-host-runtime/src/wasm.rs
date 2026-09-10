@@ -140,6 +140,14 @@ pub extern "C" fn polkavm_browser_translate_staged() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn polkavm_browser_translate_partitioned_staged() -> u32 {
+    status(|host| {
+        host.translation = crate::wasm_codegen::translate_partitioned(&host.staging)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn polkavm_browser_translation_pointer() -> u32 {
     HOST.with(|host| host.borrow().translation.as_ptr() as usize as u32)
 }

@@ -1230,15 +1230,18 @@
   /** One translated computer guest process (mirror of ComputerRuntime). */
   class ComputerProcess {
     constructor(
-      module,
+      program,
       context,
       maxGas,
       emitLog = null,
       networkProvider = null,
       filesystem = new ComputerFilesystem(),
     ) {
-      this.metadata = readMetadata(module);
-      this.instance = new WebAssembly.Instance(module, {});
+      this.metadata = readMetadata(program.module);
+      this.instance = new WebAssembly.Instance(program.module, {});
+      this.partInstances = program.parts.map(
+        (part) => new WebAssembly.Instance(part, { pvm: this.instance.exports }),
+      );
       this.pvm = this.instance.exports;
       this.memory = this.pvm.memory;
       this.maxGas = BigInt(maxGas);
@@ -2724,7 +2727,7 @@
     }
   }
 
-  /** Translates a `.polkavm` program to a wasm module through the staged
+  /** Translates a `.polkavm` program to a compiled program through the staged
    * translator in polkavm-browser-runtime.wasm. */
   class ComputerTranslator {
     constructor(runtimeExports) {
@@ -2751,11 +2754,7 @@
       );
     }
 
-    async translate(programBytes) {
-      const source =
-        programBytes instanceof Uint8Array
-          ? programBytes
-          : new Uint8Array(programBytes);
+    #translateBytes(source, partitioned) {
       const pointer = this.pvm.polkavm_browser_staging_reserve(source.byteLength);
       if (!pointer) {
         throw new Error(`reserve staging memory: ${this.#errorText()}`);
@@ -2763,17 +2762,44 @@
       new Uint8Array(this.pvm.memory.buffer, pointer, source.byteLength).set(
         source,
       );
-      if (this.pvm.polkavm_browser_translate_staged() !== 0) {
+      const status = partitioned
+        ? this.pvm.polkavm_browser_translate_partitioned_staged()
+        : this.pvm.polkavm_browser_translate_staged();
+      if (status !== 0) {
         throw new Error(`translate computer guest: ${this.#errorText()}`);
       }
       const output = this.pvm.polkavm_browser_translation_pointer();
       const length = this.pvm.polkavm_browser_translation_length();
-      const bytes = new Uint8Array(
+      return new Uint8Array(
         this.pvm.memory.buffer,
         output,
         length,
       ).slice();
-      return WebAssembly.compile(bytes);
+    }
+
+    async translate(programBytes) {
+      const source =
+        programBytes instanceof Uint8Array
+          ? programBytes
+          : new Uint8Array(programBytes);
+      const bytes = this.#translateBytes(source, false);
+      let module;
+      try {
+        module = await WebAssembly.compile(bytes);
+      } catch (error) {
+        if (error instanceof WebAssembly.CompileError) {
+          throw error;
+        }
+        module = await WebAssembly.compile(this.#translateBytes(source, true));
+      }
+      const parts = [];
+      for (const part of WebAssembly.Module.customSections(
+        module,
+        "epoca.pvm.code-part",
+      )) {
+        parts.push(await WebAssembly.compile(part));
+      }
+      return { module, parts };
     }
   }
 
