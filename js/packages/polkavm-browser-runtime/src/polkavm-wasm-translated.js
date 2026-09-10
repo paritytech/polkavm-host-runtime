@@ -1610,6 +1610,7 @@
         case "host_frame_poll":
         case "host_motion_read":
         case POINTER_CAPTURE_IMPORT:
+        case UPDATE_AFTER_IMPORT:
           return this.#handleCooperativeCall(name);
         case "pvm_set_palette": {
           const palette = this.#read(this.#u32(this.#reg(7)), 256 * 3);

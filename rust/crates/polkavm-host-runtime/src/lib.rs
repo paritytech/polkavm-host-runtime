@@ -66,7 +66,7 @@ pub use ui::{
 };
 
 pub const ABI_VERSION: u32 = 1;
-/// Optional cooperative import used by guests to choose their next update.
+/// Optional application import used by guests to choose their next update.
 pub const UPDATE_AFTER_IMPORT: &str = "host_update_after";
 /// Wait for Host input or another external event before updating again.
 pub const UPDATE_AFTER_IDLE: u32 = u32::MAX;

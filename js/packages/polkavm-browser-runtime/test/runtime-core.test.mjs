@@ -739,6 +739,48 @@ test("JIT fallback preserves a motion sample queued during startup", async () =>
   }
 });
 
+test("compiler backend honors CoreVM update deadlines", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/update-schedule-corevm.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "corevm-update-scheduling",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.module,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.initialize();
+  assert.equal(translated.usesUpdateScheduling(), true);
+  translated.update(0);
+  assert.equal(translated.updateAfterMilliseconds(), 10);
+  translated.update(10);
+  assert.equal(translated.updateAfterMilliseconds(), 250);
+});
+
 test("compiler backend discards stale CoreVM mouse movement", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
