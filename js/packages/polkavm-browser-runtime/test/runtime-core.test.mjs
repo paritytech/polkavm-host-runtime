@@ -940,6 +940,44 @@ test("both browser backends deliver bounded mediated input", async () => {
   }
 });
 
+test("both browser backends cancel active mediated input on teardown", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/mediated-input.polkavm",
+    ),
+  );
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "tri2d",
+        audioEnabled: false,
+        cacheKey: `mediated-input-stop-${forceInterpreter}`,
+        mediatedInputKinds: ["camera-ur"],
+        forceInterpreter,
+      },
+    });
+
+    const request = await waitForMessage(messages, "mediated-input-request");
+    receiver.onmessage({ data: { type: "stop" } });
+    const cancellation = await waitForMessage(
+      messages,
+      "mediated-input-cancel",
+    );
+    assert.equal(cancellation.handle, request.handle);
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("native-Wasm and translated backends validate and emit UI output v1", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
