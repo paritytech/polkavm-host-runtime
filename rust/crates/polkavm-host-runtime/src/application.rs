@@ -5,8 +5,8 @@
 use crate::corevm::{Interruption, Vm};
 use crate::{
     AudioChunk, ComputerContext, Frame, GpuBatch, HostFrameResponseError, InputEvent,
-    InputEventType, PresentationProfile, Runtime, TextInputKind, Tri2dFrame, UiOutputFrame,
-    UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
+    InputEventType, MediatedInputCommand, MediatedInputStatus, PresentationProfile, Runtime,
+    TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -317,6 +317,32 @@ impl ApplicationRuntime {
             self.stop();
         }
         result
+    }
+
+    pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_mediated_input_kinds(kinds),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support mediated input")),
+        }
+    }
+
+    pub fn take_mediated_input_command(&mut self) -> Option<MediatedInputCommand> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_mediated_input_command(),
+            Self::CoreVm(_) => None,
+        }
+    }
+
+    pub fn send_mediated_input_result(
+        &mut self,
+        handle: u32,
+        status: MediatedInputStatus,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_mediated_input_result(handle, status, bytes),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support mediated input")),
+        }
     }
 
     #[cfg(target_arch = "wasm32")]

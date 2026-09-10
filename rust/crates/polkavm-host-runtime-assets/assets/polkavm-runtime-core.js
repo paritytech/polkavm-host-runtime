@@ -27,6 +27,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MAX_ASSET_FILE_BYTES = 128 * 1024 * 1024;
   const MAX_ASSET_BYTES = 256 * 1024 * 1024;
   const MOTION_SAMPLE_BYTES = 48;
+  const MAX_MEDIATED_INPUT_KIND_BYTES = 32;
+  const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
   // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
   // update carry a single axis, so a Host sends them through the dedicated
   // `view-insets` message that queues the pair together; the runtime rejects a
@@ -200,6 +202,44 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
   }
 
+  function drainMediatedInputCommands() {
+    while (true) {
+      const operation = pvm.polkavm_browser_take_mediated_input_command?.() ?? 0;
+      if (operation === 0) {
+        return;
+      }
+      const handle = pvm.polkavm_browser_mediated_input_handle();
+      if (operation === 2) {
+        postMessage({ type: "mediated-input-cancel", handle });
+        continue;
+      }
+      if (operation !== 1) {
+        throw new Error("interpreter emitted an invalid mediated-input command");
+      }
+      const kind = decoder.decode(
+        new Uint8Array(
+          pvm.memory.buffer,
+          pvm.polkavm_browser_mediated_input_kind_pointer(),
+          pvm.polkavm_browser_mediated_input_kind_length(),
+        ),
+      );
+      const mediaType = decoder.decode(
+        new Uint8Array(
+          pvm.memory.buffer,
+          pvm.polkavm_browser_mediated_input_media_type_pointer(),
+          pvm.polkavm_browser_mediated_input_media_type_length(),
+        ),
+      );
+      postMessage({
+        type: "mediated-input-request",
+        handle,
+        kind,
+        mediaType,
+        maxBytes: pvm.polkavm_browser_mediated_input_max_bytes(),
+      });
+    }
+  }
+
   function drainAudio() {
     while (pvm.polkavm_browser_take_audio()) {
       const sampleRate = pvm.polkavm_browser_audio_sample_rate();
@@ -322,6 +362,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         drainUiOutput();
         drainGpuBatches();
         drainHostFrameRequests();
+        drainMediatedInputCommands();
         drainAudio();
         drainSave();
         drainLogs();
@@ -468,6 +509,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     ) {
       throw new Error("invalid PolkaVM browser motion availability");
     }
+    const mediatedInputKinds = message.mediatedInputKinds ?? [];
+    if (
+      !Array.isArray(mediatedInputKinds) ||
+      mediatedInputKinds.length > MAX_MEDIATED_INPUT_REGISTRATIONS ||
+      mediatedInputKinds.some(
+        (kind) =>
+          typeof kind !== "string" ||
+          encoder.encode(kind).byteLength > MAX_MEDIATED_INPUT_KIND_BYTES ||
+          !/^[a-z0-9][a-z0-9+._-]*[a-z0-9]$|^[a-z0-9]$/.test(kind),
+      ) ||
+      new Set(mediatedInputKinds).size !== mediatedInputKinds.length
+    ) {
+      throw new Error("invalid PolkaVM browser mediated-input kinds");
+    }
     return program;
   }
 
@@ -553,6 +608,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         message.graphicsProfile,
         pendingGpuCapabilities,
         motionAvailability,
+        message.mediatedInputKinds ?? [],
       );
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
@@ -609,6 +665,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         ),
         "set PolkaVM browser pointer capture support",
       );
+      if ((message.mediatedInputKinds?.length ?? 0) > 0) {
+        stage(encoder.encode(message.mediatedInputKinds.join("\0")));
+        check(
+          pvm.polkavm_browser_set_mediated_input_kinds(),
+          "set PolkaVM browser mediated-input kinds",
+        );
+      }
       if (pendingMotionSample !== null) {
         stage(pendingMotionSample);
         check(
@@ -637,6 +700,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         drainLogs();
         throw initError;
       }
+      drainMediatedInputCommands();
       postMessage({ type: "startup", stage: "interpreter-initialized" });
       drainTri2d();
       drainUiOutput();
@@ -871,6 +935,28 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     return true;
   }
 
+  function sendMediatedInputResult(handle, status, bytes) {
+    if (
+      !running ||
+      !pvm ||
+      !Number.isInteger(handle) ||
+      handle <= 0 ||
+      !Number.isInteger(status) ||
+      status < 3 ||
+      status > 6
+    ) {
+      throw new Error("invalid PolkaVM browser mediated-input result");
+    }
+    if (translated) {
+      translated.sendMediatedInputResult(handle, status, bytes);
+      return;
+    }
+    stage(status === 3 ? bytes : new Uint8Array([0]));
+    check(
+      pvm.polkavm_browser_send_mediated_input_result(handle, status),
+      "send PolkaVM browser mediated-input result",
+    );
+  }
   endpoint.onmessage = (event) => {
     const message = event.data;
     if (message?.type === "start") {
@@ -988,6 +1074,18 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             reason: "queue-full",
           });
         }
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "mediated-input-result") {
+      try {
+        sendMediatedInputResult(
+          message.handle,
+          message.status,
+          new Uint8Array(message.bytes),
+        );
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

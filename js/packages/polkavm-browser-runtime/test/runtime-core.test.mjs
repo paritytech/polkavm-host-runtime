@@ -160,6 +160,10 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
       invalidStart({ motionAvailability: 3 }),
       /invalid PolkaVM browser motion availability/,
     ],
+    [
+      invalidStart({ mediatedInputKinds: ["Camera UR"] }),
+      /invalid PolkaVM browser mediated-input kinds/,
+    ],
   ]) {
     const { messages, receiver } = endpoint();
     receiver.onmessage({ data: message });
@@ -592,6 +596,77 @@ test("host-frame response backpressure is retryable in both backends", async () 
       messages.some((message) => message.type === "terminated"),
       false,
     );
+
+    receiver.onmessage({ data: { type: "stop" } });
+    await waitForMessage(messages, "terminated");
+  }
+});
+
+test("both browser backends deliver bounded mediated input", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/mediated-input.polkavm",
+    ),
+  );
+  const payload = new TextEncoder().encode("decoded-ur-cbor");
+
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "tri2d",
+        audioEnabled: false,
+        cacheKey: `mediated-input-${forceInterpreter}`,
+        mediatedInputKinds: ["camera-ur"],
+        forceInterpreter,
+      },
+    });
+
+    const request = await waitForMessage(messages, "mediated-input-request");
+    assert.equal(request.kind, "camera-ur");
+    assert.equal(request.mediaType, "x-test-payload");
+    assert.equal(request.maxBytes, 32);
+    assert.ok(request.handle > 0);
+
+    const initialSave = await waitForMessage(messages, "save");
+    const initialView = new DataView(
+      initialSave.bytes.buffer,
+      initialSave.bytes.byteOffset,
+      initialSave.bytes.byteLength,
+    );
+    assert.deepEqual(
+      [0, 4, 8].map((offset) => initialView.getInt32(offset, true)),
+      [request.handle, 0, 2],
+    );
+    messages.splice(messages.indexOf(initialSave), 1);
+
+    receiver.onmessage({
+      data: {
+        type: "mediated-input-result",
+        handle: request.handle,
+        status: 3,
+        bytes: bytesBuffer(payload),
+      },
+    });
+    const completedSave = await waitForMessage(messages, "save");
+    const completed = new Uint8Array(completedSave.bytes);
+    assert.equal(
+      new DataView(
+        completed.buffer,
+        completed.byteOffset,
+        completed.byteLength,
+      ).getInt32(0, true),
+      payload.byteLength,
+    );
+    assert.deepEqual(completed.subarray(4), payload);
 
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
