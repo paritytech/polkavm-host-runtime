@@ -26,6 +26,7 @@
   const INPUT_INSETS_HORIZONTAL = 0;
   const INPUT_INSETS_VERTICAL = 1;
   const POINTER_CAPTURE_IMPORT = "host_pointer_capture";
+  const UPDATE_AFTER_IMPORT = "host_update_after";
   const POINTER_CAPTURE_RELEASE = 0;
   const POINTER_CAPTURE_ARM = 1;
   const POINTER_CAPTURE_RELEASED = 0;
@@ -48,9 +49,12 @@
   const MAX_UI_SEMANTIC_STRING_BYTES = 1024;
   const UI_OUTPUT_HEADER_BYTES = 48;
   const UI_OUTPUT_COMMAND_HEADER_BYTES = 8;
-  const MAX_UI_OUTPUT_BYTES = 256 * 1024;
+  const MAX_UI_COPY_IMAGE_BYTES = 4 * 1024 * 1024;
+  const MAX_UI_OUTPUT_BYTES = MAX_UI_COPY_IMAGE_BYTES + 256 * 1024;
   const MAX_UI_OUTPUT_COMMANDS = 64;
   const MAX_UI_COPY_TEXT_BYTES = 64 * 1024;
+  const MAX_UI_COPY_IMAGE_PIXELS = 1024 * 1024;
+  const MAX_UI_COPY_IMAGE_DIMENSION = 2048;
   const MAX_UI_OPEN_URL_BYTES = 8 * 1024;
   const UI_CURSOR_ICONS = Object.freeze([
     "default",
@@ -246,14 +250,15 @@
         if (payloadEnd > bytes.byteLength) {
           return null;
         }
-        const payload = strictDecoder.decode(
-          bytes.subarray(payloadStart, payloadEnd),
-        );
+        const payloadBytes = bytes.subarray(payloadStart, payloadEnd);
         if (opcode === 1) {
           if (commandFlags !== 0 || payloadLength > MAX_UI_COPY_TEXT_BYTES) {
             return null;
           }
-          commands.push({ type: "copy-text", text: payload });
+          commands.push({
+            type: "copy-text",
+            text: strictDecoder.decode(payloadBytes),
+          });
         } else if (opcode === 2) {
           if (
             (commandFlags & ~1) !== 0 ||
@@ -264,8 +269,36 @@
           }
           commands.push({
             type: "open-url",
-            url: payload,
+            url: strictDecoder.decode(payloadBytes),
             newSurface: (commandFlags & 1) !== 0,
+          });
+        } else if (opcode === 3) {
+          if (commandFlags !== 0 || payloadLength < 8) {
+            return null;
+          }
+          const payloadView = new DataView(
+            bytes.buffer,
+            bytes.byteOffset + payloadStart,
+            payloadLength,
+          );
+          const width = payloadView.getUint32(0, true);
+          const height = payloadView.getUint32(4, true);
+          const pixelBytes = payloadLength - 8;
+          if (
+            width === 0 ||
+            height === 0 ||
+            width > MAX_UI_COPY_IMAGE_DIMENSION ||
+            height > MAX_UI_COPY_IMAGE_DIMENSION ||
+            width * height > MAX_UI_COPY_IMAGE_PIXELS ||
+            width * height * 4 !== pixelBytes
+          ) {
+            return null;
+          }
+          commands.push({
+            type: "copy-image",
+            width,
+            height,
+            rgba: payloadBytes.subarray(8),
           });
         } else {
           return null;
@@ -479,8 +512,38 @@
   }
 
   class TranslatedPolkaVmRuntime {
+    static async compile(bytes) {
+      const module = await WebAssembly.compile(bytes);
+      const parts = [];
+      for (const bytes of WebAssembly.Module.customSections(
+        module,
+        "epoca.pvm.code-part",
+      )) {
+        // Keep native compilation bounded to one code part at a time.
+        parts.push(await WebAssembly.compile(bytes));
+      }
+      return { module, parts };
+    }
+
+    static isCompiledProgram(value) {
+      if (
+        value === null ||
+        typeof value !== "object" ||
+        !(value.module instanceof WebAssembly.Module) ||
+        !Array.isArray(value.parts)
+      ) {
+        return false;
+      }
+      for (const part of value.parts) {
+        if (!(part instanceof WebAssembly.Module)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     constructor(
-      module,
+      program,
       assets,
       emit,
       maxGas,
@@ -489,13 +552,20 @@
       gpuCapabilities = null,
       motionAvailability = MOTION_STATUS_UNAVAILABLE,
     ) {
-      this.metadata = readMetadata(module);
-      this.instance = new WebAssembly.Instance(module, {});
+      if (!TranslatedPolkaVmRuntime.isCompiledProgram(program)) {
+        throw new TypeError("invalid translated PolkaVM compiled program");
+      }
+      this.metadata = readMetadata(program.module);
+      this.instance = new WebAssembly.Instance(program.module, {});
       this.pvm = this.instance.exports;
       this.memory = this.pvm.memory;
       if (!(this.memory instanceof WebAssembly.Memory)) {
         throw new Error("translated PolkaVM module is missing guest memory");
       }
+      const imports = { pvm: this.pvm };
+      this.partInstances = program.parts.map(
+        (part) => new WebAssembly.Instance(part, imports),
+      );
       this.assets = new Map(
         assets.map((asset) => [
           normalizedPath(asset.path),
@@ -548,6 +618,7 @@
         request: null,
       };
       this.timeMs = null;
+      this.updateAfterMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
       this.hostcallBytes = 0;
@@ -593,6 +664,14 @@
 
     usesPointerCapture() {
       return this.imports.includes(POINTER_CAPTURE_IMPORT);
+    }
+
+    usesUpdateScheduling() {
+      return this.imports.includes(UPDATE_AFTER_IMPORT);
+    }
+
+    updateAfterMilliseconds() {
+      return this.updateAfterMs;
     }
 
     setPointerCaptureSupported(supported) {
@@ -649,6 +728,7 @@
         return;
       }
       this.timeMs = timeMs;
+      this.updateAfterMs = null;
       this.gpuSubmits = 0;
       this.hostFrameRequests = 0;
       this.uiSemanticsSubmitted = false;
@@ -676,10 +756,40 @@
         return;
       }
       if (!this.coreVm) {
-        if (this.input.length === MAX_INPUT_EVENTS) {
-          this.input.shift();
+        const copy = bytes.slice();
+        const type = copy[0];
+        if (type === 7) {
+          const existing = this.input.findLastIndex(
+            (event) => event[0] === type,
+          );
+          if (existing !== -1) {
+            this.input.splice(existing, 1);
+          }
+        } else if (type === 5 && this.input.at(-1)?.[0] === 5) {
+          this.input[this.input.length - 1] = copy;
+          return;
+        } else if (type === 19) {
+          const existing = this.input.findLastIndex(
+            (event) => event[0] === type && event[1] === copy[1],
+          );
+          if (existing !== -1) {
+            this.input.splice(existing, 1);
+          }
         }
-        this.input.push(bytes.slice());
+        if (this.input.length === MAX_INPUT_EVENTS) {
+          const discardable = this.input.findIndex(
+            (event) =>
+              event[0] === 5 ||
+              event[0] === 6 ||
+              event[0] === 14 ||
+              event[0] === 19,
+          );
+          if (discardable === -1) {
+            throw new Error("translated PolkaVM input queue is full");
+          }
+          this.input.splice(discardable, 1);
+        }
+        this.input.push(copy);
         return;
       }
       const view = new DataView(
@@ -1280,6 +1390,14 @@
           this.#chargeBytes(length);
           crypto.getRandomValues(this.#range(this.#u32(a0), length, true));
           this.#setReg(7, 0n);
+          return false;
+        }
+        case UPDATE_AFTER_IMPORT: {
+          const delayMs = this.#u32(a0);
+          this.updateAfterMs =
+            this.updateAfterMs === null
+              ? delayMs
+              : Math.min(this.updateAfterMs, delayMs);
           return false;
         }
         case "host_time_ms": {
@@ -1914,7 +2032,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
   };
 
-  const FRAME_INTERVAL_MS = 1000 / 60;
+  const LEGACY_FRAME_INTERVAL_MS = 1000 / 60;
   const MAX_GAS_PER_UPDATE = 10_000_000_000;
   const MAX_TRANSLATED_LOOPS_PER_UPDATE = 50_000_000;
   const MAX_PROGRAM_BYTES = 64 * 1024 * 1024;
@@ -1930,6 +2048,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const INPUT_SAFE_AREA_INSETS = 16;
   const INPUT_KEYBOARD_INSETS = 17;
   const MAX_INSET_PIXELS = 65535;
+  const UPDATE_AFTER_IDLE = 0xffffffff;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -1939,6 +2058,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let backend = "interpreter";
   let running = false;
   let disposed = false;
+  let demandDriven = false;
+  let tickPending = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
   let pointerCaptureSupported = false;
@@ -1948,7 +2069,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let updateCount = 0;
   const updateSamples = [];
   const tickChannel = new MessageChannel();
-  tickChannel.port1.onmessage = tick;
+  tickChannel.port1.onmessage = () => {
+    tickPending = false;
+    tick();
+  };
 
   function stopRuntime() {
     if (disposed) {
@@ -2147,6 +2271,48 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({ type: "pointer-capture", capture: request });
   }
 
+  function scheduleTick(delayMs) {
+    if (!running) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = undefined;
+    if (delayMs <= 0) {
+      if (!tickPending) {
+        tickPending = true;
+        tickChannel.port2.postMessage(null);
+      }
+      return;
+    }
+    if (tickPending) {
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (!running || tickPending) {
+        return;
+      }
+      tickPending = true;
+      tickChannel.port2.postMessage(null);
+    }, delayMs);
+  }
+
+  function wake() {
+    if (demandDriven) {
+      scheduleTick(0);
+    }
+  }
+
+  function requestedUpdateDelay() {
+    if (!demandDriven) {
+      return LEGACY_FRAME_INTERVAL_MS;
+    }
+    const delay = translated
+      ? translated.updateAfterMilliseconds()
+      : pvm.polkavm_browser_update_after_ms();
+    return delay === UPDATE_AFTER_IDLE ? null : delay;
+  }
+
   function tick() {
     if (!running) {
       return;
@@ -2207,11 +2373,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         updateMaxMs: sorted[sorted.length - 1],
       });
     }
-    const delay = FRAME_INTERVAL_MS - elapsed;
-    if (delay > 0) {
-      timer = setTimeout(tick, delay);
-    } else {
-      tickChannel.port2.postMessage(null);
+    const requestedDelay = requestedUpdateDelay();
+    if (requestedDelay !== null) {
+      scheduleTick(Math.max(0, requestedDelay - elapsed));
     }
   }
 
@@ -2343,9 +2507,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     let compilationMs = 0;
     let translatedWasmBytes = 0;
     let cacheHit = false;
+    let compilerStage = "compiler-staging-program";
+    let compilerFallbackReason;
+    let compilerFallbackStage;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
-    const instantiated = await WebAssembly.instantiate(message.runtime, {});
-    pvm = instantiated.instance.exports;
+    pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
     if (pvm.polkavm_browser_abi_version() !== 2) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
@@ -2356,14 +2522,18 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         throw FORCE_INTERPRETER;
       }
       stage(program);
-      let module = message.compiledModule;
+      let compiledProgram = message.compiledProgram;
       let bytes =
         message.compiledBytes instanceof ArrayBuffer
           ? new Uint8Array(message.compiledBytes)
           : null;
-      cacheHit = module instanceof WebAssembly.Module || bytes !== null;
-      if (!(module instanceof WebAssembly.Module)) {
+      const hasCompiledProgram =
+        globalThis.TranslatedPolkaVmRuntime.isCompiledProgram(compiledProgram);
+      cacheHit = hasCompiledProgram || bytes !== null;
+      if (!hasCompiledProgram) {
+        let generatedTranslation = bytes === null;
         if (bytes === null) {
+          compilerStage = "compiler-translating";
           const translationStarted = performance.now();
           check(
             pvm.polkavm_browser_translate_staged(),
@@ -2373,26 +2543,72 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           const pointer = pvm.polkavm_browser_translation_pointer();
           const length = pvm.polkavm_browser_translation_length();
           bytes = new Uint8Array(pvm.memory.buffer, pointer, length).slice();
+        }
+        translatedWasmBytes = bytes.byteLength;
+        // Translation can grow its linear memory far beyond the guest heap.
+        // The compiled backend does not use that instance; release it before
+        // the browser allocates native code for the root and its code parts.
+        pvm = null;
+        compilerStage = "compiler-compiling";
+        const compilationStarted = performance.now();
+        try {
+          compiledProgram =
+            await globalThis.TranslatedPolkaVmRuntime.compile(bytes);
+          compilationMs = performance.now() - compilationStarted;
+        } catch (error) {
+          compilationMs = performance.now() - compilationStarted;
+          // Invalid Wasm cannot be repaired by changing compilation-unit sizes.
+          if (error instanceof WebAssembly.CompileError) {
+            throw error;
+          }
+          console.warn(
+            `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          compilerStage = "compiler-translating-parts";
+          pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
+          stage(program);
+          const translationStarted = performance.now();
+          check(
+            pvm.polkavm_browser_translate_partitioned_staged(),
+            "translate bounded PolkaVM browser code parts",
+          );
+          translationMs += performance.now() - translationStarted;
+          bytes = new Uint8Array(
+            pvm.memory.buffer,
+            pvm.polkavm_browser_translation_pointer(),
+            pvm.polkavm_browser_translation_length(),
+          ).slice();
+          generatedTranslation = true;
+          translatedWasmBytes = bytes.byteLength;
+          pvm = null;
+          compilerStage = "compiler-compiling-parts";
+          const partsStarted = performance.now();
+          try {
+            compiledProgram =
+              await globalThis.TranslatedPolkaVmRuntime.compile(bytes);
+          } finally {
+            compilationMs += performance.now() - partsStarted;
+          }
+        }
+        if (generatedTranslation) {
           const persistent = bytes.slice();
           postMessage(
-            {
-              type: "translated",
-              cacheKey: message.cacheKey,
-              bytes: persistent,
-            },
+            { type: "translated", cacheKey: message.cacheKey, bytes: persistent },
             [persistent.buffer],
           );
         }
-        translatedWasmBytes = bytes.byteLength;
-        const compilationStarted = performance.now();
-        module = await WebAssembly.compile(bytes);
-        compilationMs = performance.now() - compilationStarted;
         try {
-          postMessage({ type: "compiled", cacheKey: message.cacheKey, module });
+          postMessage({
+            type: "compiled",
+            cacheKey: message.cacheKey,
+            program: compiledProgram,
+          });
         } catch {}
       }
+      pvm = null;
+      compilerStage = "compiler-instantiating";
       translated = new globalThis.TranslatedPolkaVmRuntime(
-        module,
+        compiledProgram,
         message.assets,
         (output, transfers = []) => {
           if (running) {
@@ -2407,6 +2623,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         pendingGpuCapabilities,
         motionAvailability,
       );
+      compilerStage = "compiler-initializing";
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
       }
@@ -2419,7 +2636,15 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       translated = null;
       pendingOutputs.length = 0;
       if (error !== FORCE_INTERPRETER) {
-        console.warn(`PolkaVM translation failed; using interpreter: ${error}`);
+        compilerFallbackReason =
+          error instanceof Error ? error.message : String(error);
+        compilerFallbackStage = compilerStage;
+        console.warn(
+          `PolkaVM ${compilerFallbackStage} failed; using interpreter: ${compilerFallbackReason}`,
+        );
+      }
+      if (pvm === null) {
+        pvm = (await WebAssembly.instantiate(message.runtime, {})).instance.exports;
       }
       let presentation = 0;
       if (message.graphicsProfile === "tri2d") {
@@ -2512,13 +2737,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     const usesPointerCapture = translated
       ? translated.usesPointerCapture()
       : pvm.polkavm_browser_uses_pointer_capture() === 1;
+    demandDriven = translated
+      ? translated.usesUpdateScheduling()
+      : typeof pvm.polkavm_browser_uses_update_scheduling === "function" &&
+        pvm.polkavm_browser_uses_update_scheduling() === 1;
     startedAt = performance.now();
     running = true;
     postMessage({
       type: "ready",
       backend,
+      compilerFallbackReason,
+      compilerFallbackStage,
       usesMotion,
       usesPointerCapture,
+      usesUpdateScheduling: demandDriven,
       cacheHit,
       translationMs,
       compilationMs,
@@ -2528,7 +2760,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     for (const { output, transfers } of pendingOutputs) {
       postMessage(output, transfers);
     }
-    tick();
+    scheduleTick(0);
   }
 
   function sendInput(bytes) {
@@ -2614,7 +2846,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (availability !== 1) {
       pendingMotionSample = null;
     }
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -2629,7 +2861,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
 
   function setPointerCaptureSupported(supported) {
     pointerCaptureSupported = supported === true;
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -2645,7 +2877,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function setPointerCaptureActive(active) {
-    if (!running || !pvm) {
+    if (!running) {
       return;
     }
     if (translated) {
@@ -2662,7 +2894,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (bytes.byteLength !== MOTION_SAMPLE_BYTES) {
       throw new Error("invalid PolkaVM browser motion sample");
     }
-    if (!running || !pvm) {
+    if (!running) {
       pendingMotionSample = bytes.slice();
       motionAvailability = 1;
       return;
@@ -2682,7 +2914,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (bytes.byteLength < 56 || bytes.byteLength > 4096) {
       throw new Error("invalid PolkaVM browser GPU capabilities");
     }
-    if (!running || !pvm) {
+    if (!running) {
       pendingGpuCapabilities = bytes.slice();
       return;
     }
@@ -2698,7 +2930,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function sendGpuEvent(bytes) {
-    if (!running || !pvm || !bytes.byteLength) {
+    if (!running || !bytes.byteLength) {
       return;
     }
     if (translated) {
@@ -2713,7 +2945,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function sendHostFrameResponse(bytes) {
-    if (!running || !pvm || !bytes.byteLength) {
+    if (!running || !bytes.byteLength) {
       return true;
     }
     if (translated) {
@@ -2739,6 +2971,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2753,6 +2986,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           message.right,
           message.bottom,
         );
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2761,6 +2995,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion-status") {
       try {
         setMotionAvailability(message.availability);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2772,6 +3007,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture support");
         }
         setPointerCaptureSupported(message.supported);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2783,6 +3019,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture state");
         }
         setPointerCaptureActive(message.active);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2791,6 +3028,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion") {
       try {
         sendMotionSample(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2799,6 +3037,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-capabilities") {
       try {
         sendGpuCapabilities(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2807,6 +3046,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-event") {
       try {
         sendGpuEvent(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -2821,6 +3061,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           );
         }
         if (sendHostFrameResponse(new Uint8Array(message.bytes))) {
+          wake();
           if (seq !== undefined) {
             postMessage({ type: "host-frame-response-accepted", seq });
           }

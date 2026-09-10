@@ -23,11 +23,17 @@ pub const UI_OUTPUT_HEADER_BYTES: usize = 48;
 /// Encoded byte length of every UI output command header.
 pub const UI_OUTPUT_COMMAND_HEADER_BYTES: usize = 8;
 /// Maximum complete UI output stream accepted by the Host.
-pub const MAX_UI_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_UI_OUTPUT_BYTES: usize = MAX_UI_COPY_IMAGE_BYTES + 256 * 1024;
 /// Maximum commands accepted in one UI output stream.
 pub const MAX_UI_OUTPUT_COMMANDS: usize = 64;
 /// Maximum UTF-8 clipboard text accepted in one command.
 pub const MAX_UI_COPY_TEXT_BYTES: usize = 64 * 1024;
+/// Maximum RGBA pixels accepted in one clipboard image.
+pub const MAX_UI_COPY_IMAGE_PIXELS: usize = 1024 * 1024;
+/// Maximum RGBA bytes accepted in one clipboard image.
+pub const MAX_UI_COPY_IMAGE_BYTES: usize = MAX_UI_COPY_IMAGE_PIXELS * 4;
+/// Maximum width or height accepted for one clipboard image.
+pub const MAX_UI_COPY_IMAGE_DIMENSION: usize = 2048;
 /// Maximum UTF-8 URL accepted in one command.
 pub const MAX_UI_OPEN_URL_BYTES: usize = 8 * 1024;
 
@@ -48,6 +54,8 @@ const UI_OUTPUT_FLAGS_V1: u8 = UI_OUTPUT_FLAG_MUTABLE_TEXT | UI_OUTPUT_FLAG_IME;
 pub const UI_OUTPUT_COMMAND_COPY_TEXT: u8 = 1;
 /// Open a UTF-8 URL through the Host's navigation policy.
 pub const UI_OUTPUT_COMMAND_OPEN_URL: u8 = 2;
+/// Copy unpremultiplied sRGBA pixels to the platform clipboard.
+pub const UI_OUTPUT_COMMAND_COPY_IMAGE: u8 = 3;
 /// Open the URL in a new platform surface rather than replacing the current one.
 pub const UI_OUTPUT_OPEN_URL_NEW_SURFACE: u8 = 1 << 0;
 
@@ -234,6 +242,15 @@ pub enum UiOutputCommand<'a> {
         /// Whether a new platform surface was requested.
         new_surface: bool,
     },
+    /// Replace the platform clipboard image with unpremultiplied sRGBA pixels.
+    CopyImage {
+        /// Image width in pixels.
+        width: u32,
+        /// Image height in pixels.
+        height: u32,
+        /// Row-major unpremultiplied sRGBA pixels.
+        rgba: &'a [u8],
+    },
 }
 
 /// A validated borrowed UI output stream.
@@ -285,15 +302,21 @@ impl<'a> Iterator for UiOutputCommands<'a> {
         let length = read_u32(self.bytes, self.offset + 4) as usize;
         let start = self.offset + UI_OUTPUT_COMMAND_HEADER_BYTES;
         let end = start + length;
-        let payload =
-            core::str::from_utf8(&self.bytes[start..end]).expect("validated UI command text");
+        let payload = &self.bytes[start..end];
         self.offset = end;
         self.remaining -= 1;
         Some(match opcode {
-            UI_OUTPUT_COMMAND_COPY_TEXT => UiOutputCommand::CopyText(payload),
+            UI_OUTPUT_COMMAND_COPY_TEXT => UiOutputCommand::CopyText(
+                core::str::from_utf8(payload).expect("validated UI command text"),
+            ),
             UI_OUTPUT_COMMAND_OPEN_URL => UiOutputCommand::OpenUrl {
-                url: payload,
+                url: core::str::from_utf8(payload).expect("validated UI command URL"),
                 new_surface: flags & UI_OUTPUT_OPEN_URL_NEW_SURFACE != 0,
+            },
+            UI_OUTPUT_COMMAND_COPY_IMAGE => UiOutputCommand::CopyImage {
+                width: read_u32(payload, 0),
+                height: read_u32(payload, 4),
+                rgba: &payload[8..],
             },
             _ => unreachable!("validated UI command opcode"),
         })
@@ -367,6 +390,21 @@ impl<'a> UiOutputEncoder<'a> {
         self.push_command(UI_OUTPUT_COMMAND_COPY_TEXT, 0, text.as_bytes())
     }
 
+    /// Append one clipboard-image command with row-major unpremultiplied sRGBA pixels.
+    pub fn copy_image(
+        &mut self,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) -> Result<(), UiOutputEncodeError> {
+        validate_copy_image(width, height, rgba.len())
+            .map_err(|_| UiOutputEncodeError::CopyImage)?;
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&(width as u32).to_le_bytes());
+        header[4..].copy_from_slice(&(height as u32).to_le_bytes());
+        self.push_command_parts(UI_OUTPUT_COMMAND_COPY_IMAGE, 0, &header, rgba)
+    }
+
     /// Append one URL navigation command.
     pub fn open_url(&mut self, url: &str, new_surface: bool) -> Result<(), UiOutputEncodeError> {
         if url.is_empty() || url.len() > MAX_UI_OPEN_URL_BYTES {
@@ -392,11 +430,25 @@ impl<'a> UiOutputEncoder<'a> {
         flags: u8,
         payload: &[u8],
     ) -> Result<(), UiOutputEncodeError> {
+        self.push_command_parts(opcode, flags, payload, &[])
+    }
+
+    fn push_command_parts(
+        &mut self,
+        opcode: u8,
+        flags: u8,
+        prefix: &[u8],
+        payload: &[u8],
+    ) -> Result<(), UiOutputEncodeError> {
         if usize::from(self.command_count) == MAX_UI_OUTPUT_COMMANDS {
             return Err(UiOutputEncodeError::CommandCount);
         }
-        let added = UI_OUTPUT_COMMAND_HEADER_BYTES
+        let payload_length = prefix
+            .len()
             .checked_add(payload.len())
+            .ok_or(UiOutputEncodeError::OutputLength)?;
+        let added = UI_OUTPUT_COMMAND_HEADER_BYTES
+            .checked_add(payload_length)
             .ok_or(UiOutputEncodeError::OutputLength)?;
         let next_length = self
             .destination
@@ -412,7 +464,8 @@ impl<'a> UiOutputEncoder<'a> {
         self.destination.push(opcode);
         self.destination.push(flags);
         push_u16(self.destination, 0);
-        push_u32(self.destination, payload.len() as u32);
+        push_u32(self.destination, payload_length as u32);
+        self.destination.extend_from_slice(prefix);
         self.destination.extend_from_slice(payload);
         self.command_count += 1;
         Ok(())
@@ -428,6 +481,8 @@ pub enum UiOutputEncodeError {
     CommandCount,
     /// Clipboard text exceeds [`MAX_UI_COPY_TEXT_BYTES`].
     CopyTextLength,
+    /// Clipboard image dimensions or byte length are outside the wire contract.
+    CopyImage,
     /// A URL is empty or exceeds [`MAX_UI_OPEN_URL_BYTES`].
     OpenUrlLength,
     /// The complete stream exceeds [`MAX_UI_OUTPUT_BYTES`].
@@ -450,6 +505,7 @@ impl fmt::Display for UiOutputEncodeError {
             Self::ImeBounds => "invalid UI IME bounds",
             Self::CommandCount => "too many UI output commands",
             Self::CopyTextLength => "UI clipboard text exceeds the wire limit",
+            Self::CopyImage => "UI clipboard image exceeds the wire limits",
             Self::OpenUrlLength => "UI URL is empty or exceeds the wire limit",
             Self::OutputLength => "UI output exceeds the wire limit",
             Self::Allocation(_) => "could not allocate the UI output stream",
@@ -488,6 +544,8 @@ pub enum UiOutputDecodeError {
     CopyTextLength,
     /// A URL is empty or exceeds [`MAX_UI_OPEN_URL_BYTES`].
     OpenUrlLength,
+    /// Clipboard image dimensions or byte length are outside the wire contract.
+    CopyImage,
     /// A command payload is not valid UTF-8.
     Utf8,
     /// Bytes remain after the declared command sequence.
@@ -510,6 +568,7 @@ impl fmt::Display for UiOutputDecodeError {
             Self::CommandFlags => "invalid UI output command flags",
             Self::CopyTextLength => "UI clipboard text exceeds the wire limit",
             Self::OpenUrlLength => "UI URL is empty or exceeds the wire limit",
+            Self::CopyImage => "UI clipboard image exceeds the wire limits",
             Self::Utf8 => "UI output command is not valid UTF-8",
             Self::TrailingBytes => "UI output has trailing bytes",
         })
@@ -599,6 +658,7 @@ pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeErro
                 if payload.len() > MAX_UI_COPY_TEXT_BYTES {
                     return Err(UiOutputDecodeError::CopyTextLength);
                 }
+                core::str::from_utf8(payload).map_err(|_| UiOutputDecodeError::Utf8)?;
             }
             UI_OUTPUT_COMMAND_OPEN_URL => {
                 if command_flags & !UI_OUTPUT_OPEN_URL_NEW_SURFACE != 0 {
@@ -607,10 +667,20 @@ pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeErro
                 if payload.is_empty() || payload.len() > MAX_UI_OPEN_URL_BYTES {
                     return Err(UiOutputDecodeError::OpenUrlLength);
                 }
+                core::str::from_utf8(payload).map_err(|_| UiOutputDecodeError::Utf8)?;
+            }
+            UI_OUTPUT_COMMAND_COPY_IMAGE => {
+                if command_flags != 0 {
+                    return Err(UiOutputDecodeError::CommandFlags);
+                }
+                let rgba = payload.get(8..).ok_or(UiOutputDecodeError::CopyImage)?;
+                let width = read_u32(payload, 0) as usize;
+                let height = read_u32(payload, 4) as usize;
+                validate_copy_image(width, height, rgba.len())
+                    .map_err(|_| UiOutputDecodeError::CopyImage)?;
             }
             _ => return Err(UiOutputDecodeError::CommandOpcode),
         }
-        core::str::from_utf8(payload).map_err(|_| UiOutputDecodeError::Utf8)?;
         offset = end;
     }
     if offset != bytes.len() {
@@ -626,6 +696,22 @@ pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeErro
         },
         command_count,
     })
+}
+
+fn validate_copy_image(width: usize, height: usize, rgba_bytes: usize) -> Result<(), ()> {
+    if width == 0
+        || height == 0
+        || width > MAX_UI_COPY_IMAGE_DIMENSION
+        || height > MAX_UI_COPY_IMAGE_DIMENSION
+        || width
+            .checked_mul(height)
+            .filter(|pixels| *pixels <= MAX_UI_COPY_IMAGE_PIXELS)
+            .and_then(|pixels| pixels.checked_mul(4))
+            != Some(rgba_bytes)
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn push_u16(destination: &mut Vec<u8>, value: u16) {
@@ -680,11 +766,14 @@ mod tests {
         let mut encoder = UiOutputEncoder::begin(&mut bytes, descriptor()).unwrap();
         encoder.copy_text("hello 🦀").unwrap();
         encoder.open_url("https://example.test/path", true).unwrap();
+        encoder
+            .copy_image(2, 1, &[255, 0, 0, 255, 0, 255, 0, 128])
+            .unwrap();
         encoder.finish();
 
         let output = decode_ui_output(&bytes).unwrap();
         assert_eq!(output.descriptor(), descriptor());
-        assert_eq!(output.command_count(), 2);
+        assert_eq!(output.command_count(), 3);
         assert_eq!(
             output.commands().collect::<Vec<_>>(),
             vec![
@@ -692,6 +781,11 @@ mod tests {
                 UiOutputCommand::OpenUrl {
                     url: "https://example.test/path",
                     new_surface: true,
+                },
+                UiOutputCommand::CopyImage {
+                    width: 2,
+                    height: 1,
+                    rgba: &[255, 0, 0, 255, 0, 255, 0, 128],
                 },
             ]
         );

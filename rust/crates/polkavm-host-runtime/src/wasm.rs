@@ -6,7 +6,7 @@ use crate::{
     keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, Frame,
     GpuBatch, InputEvent, InputEventType, PresentationProfile, Tri2dFrame, UiOutputFrame,
     UiSemanticsFrame, INPUT_EVENT_BYTES, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS,
-    MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES,
+    MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES, UPDATE_AFTER_IDLE,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -421,6 +421,24 @@ pub extern "C" fn polkavm_browser_update(time_ms: f64) -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn polkavm_browser_uses_update_scheduling() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => u32::from(runtime.uses_update_scheduling()),
+        _ => 0,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_update_after_ms() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) if runtime.uses_update_scheduling() => {
+            runtime.update_after_ms().unwrap_or(UPDATE_AFTER_IDLE)
+        }
+        _ => UPDATE_AFTER_IDLE,
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn polkavm_browser_send_input(event_type: u32, code: u32, x: u32, y: u32) -> u32 {
     status(|host| {
         let event_type = match event_type {
@@ -431,6 +449,10 @@ pub extern "C" fn polkavm_browser_send_input(event_type: u32, code: u32, x: u32,
             5 => InputEventType::PointerMove,
             6 => InputEventType::PointerDelta,
             7 => InputEventType::SurfaceMetrics,
+            18 => InputEventType::TouchStart,
+            19 => InputEventType::TouchMove,
+            20 => InputEventType::TouchEnd,
+            21 => InputEventType::TouchCancel,
             _ => return Err(anyhow!("invalid PolkaVM browser input event type")),
         };
         let code = u8::try_from(code).map_err(|_| anyhow!("input code exceeds u8"))?;

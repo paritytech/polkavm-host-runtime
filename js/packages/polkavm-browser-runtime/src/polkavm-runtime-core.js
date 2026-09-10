@@ -18,7 +18,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
   };
 
-  const FRAME_INTERVAL_MS = 1000 / 60;
+  const LEGACY_FRAME_INTERVAL_MS = 1000 / 60;
   const MAX_GAS_PER_UPDATE = 10_000_000_000;
   const MAX_TRANSLATED_LOOPS_PER_UPDATE = 50_000_000;
   const MAX_PROGRAM_BYTES = 64 * 1024 * 1024;
@@ -34,6 +34,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const INPUT_SAFE_AREA_INSETS = 16;
   const INPUT_KEYBOARD_INSETS = 17;
   const MAX_INSET_PIXELS = 65535;
+  const UPDATE_AFTER_IDLE = 0xffffffff;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -43,6 +44,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let backend = "interpreter";
   let running = false;
   let disposed = false;
+  let demandDriven = false;
+  let tickPending = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
   let pointerCaptureSupported = false;
@@ -52,7 +55,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let updateCount = 0;
   const updateSamples = [];
   const tickChannel = new MessageChannel();
-  tickChannel.port1.onmessage = tick;
+  tickChannel.port1.onmessage = () => {
+    tickPending = false;
+    tick();
+  };
 
   function stopRuntime() {
     if (disposed) {
@@ -251,6 +257,48 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({ type: "pointer-capture", capture: request });
   }
 
+  function scheduleTick(delayMs) {
+    if (!running) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = undefined;
+    if (delayMs <= 0) {
+      if (!tickPending) {
+        tickPending = true;
+        tickChannel.port2.postMessage(null);
+      }
+      return;
+    }
+    if (tickPending) {
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (!running || tickPending) {
+        return;
+      }
+      tickPending = true;
+      tickChannel.port2.postMessage(null);
+    }, delayMs);
+  }
+
+  function wake() {
+    if (demandDriven) {
+      scheduleTick(0);
+    }
+  }
+
+  function requestedUpdateDelay() {
+    if (!demandDriven) {
+      return LEGACY_FRAME_INTERVAL_MS;
+    }
+    const delay = translated
+      ? translated.updateAfterMilliseconds()
+      : pvm.polkavm_browser_update_after_ms();
+    return delay === UPDATE_AFTER_IDLE ? null : delay;
+  }
+
   function tick() {
     if (!running) {
       return;
@@ -311,11 +359,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         updateMaxMs: sorted[sorted.length - 1],
       });
     }
-    const delay = FRAME_INTERVAL_MS - elapsed;
-    if (delay > 0) {
-      timer = setTimeout(tick, delay);
-    } else {
-      tickChannel.port2.postMessage(null);
+    const requestedDelay = requestedUpdateDelay();
+    if (requestedDelay !== null) {
+      scheduleTick(Math.max(0, requestedDelay - elapsed));
     }
   }
 
@@ -677,6 +723,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     const usesPointerCapture = translated
       ? translated.usesPointerCapture()
       : pvm.polkavm_browser_uses_pointer_capture() === 1;
+    demandDriven = translated
+      ? translated.usesUpdateScheduling()
+      : typeof pvm.polkavm_browser_uses_update_scheduling === "function" &&
+        pvm.polkavm_browser_uses_update_scheduling() === 1;
     startedAt = performance.now();
     running = true;
     postMessage({
@@ -686,6 +736,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       compilerFallbackStage,
       usesMotion,
       usesPointerCapture,
+      usesUpdateScheduling: demandDriven,
       cacheHit,
       translationMs,
       compilationMs,
@@ -695,7 +746,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     for (const { output, transfers } of pendingOutputs) {
       postMessage(output, transfers);
     }
-    tick();
+    scheduleTick(0);
   }
 
   function sendInput(bytes) {
@@ -906,6 +957,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -920,6 +972,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           message.right,
           message.bottom,
         );
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -928,6 +981,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion-status") {
       try {
         setMotionAvailability(message.availability);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -939,6 +993,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture support");
         }
         setPointerCaptureSupported(message.supported);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -950,6 +1005,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           throw new Error("invalid PolkaVM browser pointer capture state");
         }
         setPointerCaptureActive(message.active);
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -958,6 +1014,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "motion") {
       try {
         sendMotionSample(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -966,6 +1023,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-capabilities") {
       try {
         sendGpuCapabilities(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -974,6 +1032,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } else if (message?.type === "gpu-event") {
       try {
         sendGpuEvent(new Uint8Array(message.bytes));
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });
@@ -988,6 +1047,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           );
         }
         if (sendHostFrameResponse(new Uint8Array(message.bytes))) {
+          wake();
           if (seq !== undefined) {
             postMessage({ type: "host-frame-response-accepted", seq });
           }

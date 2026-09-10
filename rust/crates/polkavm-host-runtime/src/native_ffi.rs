@@ -40,6 +40,10 @@ pub enum NativePolkaVmInputEventType {
     PointerMove,
     PointerDelta,
     SurfaceMetrics,
+    TouchStart,
+    TouchMove,
+    TouchEnd,
+    TouchCancel,
 }
 
 impl From<NativePolkaVmInputEventType> for InputEventType {
@@ -52,6 +56,10 @@ impl From<NativePolkaVmInputEventType> for InputEventType {
             NativePolkaVmInputEventType::PointerMove => Self::PointerMove,
             NativePolkaVmInputEventType::PointerDelta => Self::PointerDelta,
             NativePolkaVmInputEventType::SurfaceMetrics => Self::SurfaceMetrics,
+            NativePolkaVmInputEventType::TouchStart => Self::TouchStart,
+            NativePolkaVmInputEventType::TouchMove => Self::TouchMove,
+            NativePolkaVmInputEventType::TouchEnd => Self::TouchEnd,
+            NativePolkaVmInputEventType::TouchCancel => Self::TouchCancel,
         }
     }
 }
@@ -314,6 +322,14 @@ impl NativePolkaVmRuntime {
 
     pub fn uses_motion(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.uses_motion())
+    }
+
+    pub fn uses_update_scheduling(&self) -> Result<bool, NativePolkaVmError> {
+        Ok(self.lock()?.uses_update_scheduling())
+    }
+
+    pub fn update_after_ms(&self) -> Result<Option<u32>, NativePolkaVmError> {
+        Ok(self.lock()?.update_after_ms())
     }
 
     pub fn last_gas_used(&self) -> Result<u64, NativePolkaVmError> {

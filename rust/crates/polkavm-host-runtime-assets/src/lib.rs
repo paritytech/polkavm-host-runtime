@@ -26,13 +26,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "cc02069e620add906b655efb262fccc68fb3a41f76d99464160fe16193e22172",
+        sha256: "ab5bc997399f2e5d97cad7a0ebbc83d27016ff53dd9f2a55a55a5aa3fcc99ad3",
     },
     BrowserAsset {
         path: "polkavm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-worker.js"),
-        sha256: "d72f39975d92230cd6ffc96c22f79ec3af52bc0dbcb10769b529ac87e90008ca",
+        sha256: "d69df2e2e919a2feeff4137444b0aad60d0d6d0a798ed4da09dbbd90bfcd97e1",
     },
     BrowserAsset {
         path: "polkavm-gpu-worker.js",
@@ -44,13 +44,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-wasm-translated.js"),
-        sha256: "deef7534da5a03952c25730e4bd50037888cd67ebd7dc2bc6eb6eaa3d59bd1d8",
+        sha256: "d2d4967ec0653f83b88d6722bac150ebfc42d22c4d72c2b6035e6d52d8da7827",
     },
     BrowserAsset {
         path: "polkavm-runtime-core.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-runtime-core.js"),
-        sha256: "1cea6132ca44ab6bc42d903d6738df67f319ae03a660f983e33bf4ecee6c866e",
+        sha256: "2963a3fc19abaca2b311b05764c663928e599d5fa613f95d3dc7ff4dc33882ce",
     },
     BrowserAsset {
         path: "polkavm-wasm-worker-entry.js",
@@ -62,13 +62,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-computer.js"),
-        sha256: "baa5353c8a3abc87d85340b32902f645c9c3797f637e352e032f78e52b9a5902",
+        sha256: "1618dc2f93790a4ef9fbca8dfea92da7fc5c934fa46ce80e04f3fe1553aadcd6",
     },
     BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "1eed0bc0637bcf41156e86c5abb876abf1c7c6a3b445ec9b6d690851ae3478ba",
+        sha256: "376faaa02a9817588be04c24cd9eb33c7048a7ea0e9a7169b5d8d3ce83166f63",
     },
 ];
 

@@ -347,6 +347,55 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
   }
 });
 
+test("demand-driven guests idle until an external event wakes them", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  // Exercise scheduling independently of the guest's import declaration, while
+  // retaining real translation, guest execution and framebuffer output.
+  globalThis.TranslatedPolkaVmRuntime = class extends originalRuntime {
+    usesUpdateScheduling() {
+      return true;
+    }
+  };
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "demand-driven-idle",
+      },
+    });
+    const ready = await waitForMessage(messages, "ready");
+    assert.equal(ready.backend, "compiler");
+    await waitForMessage(messages, "frame");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(messages.filter((message) => message.type === "frame").length, 1);
+
+    messages.length = 0;
+    receiver.onmessage({ data: { type: "input", bytes: new Uint8Array(8) } });
+    await waitForMessage(messages, "frame");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(messages.filter((message) => message.type === "frame").length, 1);
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("compiler backend enforces the declared graphics profile", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
