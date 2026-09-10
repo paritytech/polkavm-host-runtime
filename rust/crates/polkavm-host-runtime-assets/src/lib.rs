@@ -26,7 +26,7 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "e377b9e876b4f5f3c385de684dbf5fad2499569e939408dca9ff3cbbb2003eff",
+        sha256: "bc64774397011490124c1d702034faf88efd6d32b52ce68ce61694f190ec7a37",
     },
     BrowserAsset {
         path: "polkavm-worker.js",
@@ -68,7 +68,7 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "91b8d2aefe5a4f7825f2240e177fd74ebe3cf276d73493534bbd5faa9676be31",
+        sha256: "38ef45eeae6f09570b6d860fdd833bf6062acfb51228c01d5ab6bf7e6d367377",
     },
 ];
 
