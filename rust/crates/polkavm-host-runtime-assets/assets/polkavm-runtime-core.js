@@ -356,7 +356,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
     const requestedDelay = requestedUpdateDelay();
     if (requestedDelay !== null) {
-      scheduleTick(Math.max(0, requestedDelay - elapsed));
+      scheduleTick(
+        demandDriven ? requestedDelay : Math.max(0, requestedDelay - elapsed),
+      );
     }
   }
 

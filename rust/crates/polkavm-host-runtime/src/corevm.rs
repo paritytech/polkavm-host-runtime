@@ -594,6 +594,7 @@ impl Vm {
 
     pub fn update_after_ms(&self) -> Option<u32> {
         self.update_after_ms
+            .filter(|delay_ms| *delay_ms != crate::UPDATE_AFTER_IDLE)
     }
 
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
