@@ -2732,10 +2732,16 @@
     }
 
     static async create(runtimeWasm) {
+      const imports = {
+        polkavm_browser: {
+          clock_wall_ms: () => 0,
+          random_fill: () => STATUS_DENIED,
+        },
+      };
       const { instance } =
         runtimeWasm instanceof WebAssembly.Module
-          ? { instance: new WebAssembly.Instance(runtimeWasm, {}) }
-          : await WebAssembly.instantiate(runtimeWasm, {});
+          ? { instance: new WebAssembly.Instance(runtimeWasm, imports) }
+          : await WebAssembly.instantiate(runtimeWasm, imports);
       const exports = instance.exports;
       if (exports.polkavm_browser_abi_version() !== 2) {
         throw new Error("PolkaVM browser runtime ABI mismatch");

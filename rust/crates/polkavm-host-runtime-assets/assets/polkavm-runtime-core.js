@@ -36,6 +36,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MAX_INSET_PIXELS = 65535;
   const UPDATE_AFTER_IDLE = 0xffffffff;
   const FORCE_INTERPRETER = Symbol("force-interpreter");
+  const CORE_STATUS_DENIED = -5;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
@@ -491,7 +492,32 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     let translatedWasmBytes = 0;
     let cacheHit = false;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
-    const instantiated = await WebAssembly.instantiate(message.runtime, {});
+    const instantiated = await WebAssembly.instantiate(message.runtime, {
+      polkavm_browser: {
+        clock_wall_ms: () => Date.now(),
+        random_fill: (pointer, length) => {
+          const browserCrypto = globalThis.crypto;
+          if (
+            pvm === undefined ||
+            typeof browserCrypto?.getRandomValues !== "function"
+          ) {
+            return CORE_STATUS_DENIED;
+          }
+          try {
+            browserCrypto.getRandomValues(
+              new Uint8Array(
+                pvm.memory.buffer,
+                pointer >>> 0,
+                length >>> 0,
+              ),
+            );
+            return 0;
+          } catch {
+            return CORE_STATUS_DENIED;
+          }
+        },
+      },
+    });
     pvm = instantiated.instance.exports;
     if (pvm.polkavm_browser_abi_version() !== 2) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
