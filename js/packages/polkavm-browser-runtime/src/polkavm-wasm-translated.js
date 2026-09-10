@@ -37,6 +37,10 @@
   const MAX_HOSTCALLS_PER_UPDATE = 65536;
   const MAX_HOSTCALL_BYTES = 32 * 1024 * 1024;
   const MAX_LOG_BYTES = 4 * 1024;
+  const MAX_CORE_RANDOM_BYTES = 4 * 1024;
+  const CORE_STATUS_INVALID = -3;
+  const CORE_STATUS_DENIED = -5;
+  const CORE_STATUS_LIMIT = -6;
   const MAX_SAVE_BYTES = 1024 * 1024;
   const MAX_AUDIO_SAMPLES = 48000 * 2;
   const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -1338,6 +1342,46 @@
             this.updateAfterMs === null
               ? delayMs
               : Math.min(this.updateAfterMs, delayMs);
+          return false;
+        }
+        case "polkadot_host_0_1_core_clock_monotonic": {
+          const timeMs =
+            this.timeMs ?? performance.now() - this.clockStartedAt;
+          this.#writeU64(
+            this.#u32(a0),
+            BigInt(Math.max(0, Math.trunc(timeMs * 1_000_000))),
+          );
+          this.#setReg(7, 0n);
+          return false;
+        }
+        case "polkadot_host_0_1_core_clock_wall":
+          this.#writeU64(this.#u32(a0), BigInt(Date.now()) * 1_000_000n);
+          this.#setReg(7, 0n);
+          return false;
+        case "polkadot_host_0_1_core_random": {
+          const length = this.#u32(a1);
+          if (length === 0) {
+            this.#setReg(7, BigInt(CORE_STATUS_INVALID));
+            return false;
+          }
+          if (length > MAX_CORE_RANDOM_BYTES) {
+            this.#setReg(7, BigInt(CORE_STATUS_LIMIT));
+            return false;
+          }
+          const browserCrypto = globalThis.crypto;
+          if (typeof browserCrypto?.getRandomValues !== "function") {
+            this.#setReg(7, BigInt(CORE_STATUS_DENIED));
+            return false;
+          }
+          const bytes = new Uint8Array(length);
+          try {
+            browserCrypto.getRandomValues(bytes);
+          } catch {
+            this.#setReg(7, BigInt(CORE_STATUS_DENIED));
+            return false;
+          }
+          this.#write(this.#u32(a0), bytes);
+          this.#setReg(7, 0n);
           return false;
         }
         case "host_time_ms": {

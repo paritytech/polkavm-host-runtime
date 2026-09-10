@@ -597,6 +597,19 @@ host_time_ms() -> u64
 host_sleep_ms(duration_ms: u32) -> ()
 ```
 
+Applications may also use the versioned `host.core` clock and entropy operations:
+
+```text
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
+```
+
+The clock operations write a little-endian `u64` nanosecond value and return
+zero. The wall clock is Unix time. `core_random` fills at most 4 KiB from the
+Host CSPRNG; it returns `-3` for an empty request, `-5` when secure entropy is
+unavailable, and `-6` above the per-call limit.
+
 `host_time_ms` returns a monotonic millisecond clock scoped to the execution.
 It is not wall-clock time.
 
