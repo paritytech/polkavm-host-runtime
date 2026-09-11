@@ -141,6 +141,8 @@ const MAX_SLEEP_MS_PER_UPDATE: u32 = 50;
 const MAX_QUEUED_AUDIO_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS as usize * 2;
 const MAX_QUEUED_INPUT_EVENTS: usize = 4_096;
 const MAX_SAVE_BYTES: usize = 1024 * 1024;
+const MAX_RANDOM_BYTES_PER_CALL: usize = 4 * 1024;
+const RANDOM_BYTES_PER_EXECUTION: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 4 * 1024;
 const MAX_QUEUED_LOGS: usize = 64;
 const MAX_QUEUED_GPU_BATCHES: usize = 4;
@@ -524,6 +526,20 @@ pub(crate) fn preferred_backend() -> BackendKind {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn execution_random_bytes() -> Vec<u8> {
+    let mut bytes = vec![0; RANDOM_BYTES_PER_EXECUTION];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes.clear();
+    }
+    bytes
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execution_random_bytes() -> Vec<u8> {
+    Vec::new()
+}
+
 struct HostState {
     frame: Option<Frame>,
     tri2d: Option<Tri2dFrame>,
@@ -542,6 +558,8 @@ struct HostState {
     clock: HostClock,
     logs: VecDeque<String>,
     save: Option<Vec<u8>>,
+    random: Vec<u8>,
+    random_offset: usize,
     hostcall_bytes_remaining: usize,
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
@@ -590,6 +608,8 @@ impl HostState {
             clock: HostClock::new(),
             logs: VecDeque::new(),
             save: None,
+            random: execution_random_bytes(),
+            random_offset: 0,
             hostcall_bytes_remaining: 0,
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
@@ -1540,6 +1560,37 @@ impl Runtime {
 
         linker
             .define_typed(
+                "host_random_fill",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if length == 0
+                        || length > MAX_RANDOM_BYTES_PER_CALL
+                        || caller
+                            .user_data
+                            .random_offset
+                            .checked_add(length)
+                            .is_none_or(|end| end > caller.user_data.random.len())
+                    {
+                        return Ok(1);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    let start = caller.user_data.random_offset;
+                    let end = start + length;
+                    caller
+                        .instance
+                        .write_memory(destination, &caller.user_data.random[start..end])
+                        .map_err(|error| anyhow!("write guest random bytes: {error:?}"))?;
+                    caller.user_data.random_offset = end;
+                    Ok(0)
+                },
+            )
+            .context("define host_random_fill")?;
+
+        linker
+            .define_typed(
                 "host_sleep_ms",
                 |caller: polkavm::Caller<'_, HostState>, duration_ms: u32| -> Result<()> {
                     caller.user_data.charge_hostcall(0)?;
@@ -1805,6 +1856,19 @@ impl Runtime {
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         let records = ui::encode_text_input(kind, text)?;
         self.state.queue_input_records(&records)
+    }
+
+    /// Supplies the CSPRNG output pool used by `host_random_fill` on Hosts
+    /// that cannot access operating-system entropy from inside this runtime.
+    pub fn set_random_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() != RANDOM_BYTES_PER_EXECUTION {
+            bail!(
+                "application random pool must contain exactly {RANDOM_BYTES_PER_EXECUTION} bytes"
+            );
+        }
+        self.state.random = bytes;
+        self.state.random_offset = 0;
+        Ok(())
     }
 
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {

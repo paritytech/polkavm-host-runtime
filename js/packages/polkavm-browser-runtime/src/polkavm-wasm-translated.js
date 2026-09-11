@@ -52,6 +52,8 @@
   const MAX_CORE_RANDOM_BYTES = 4 * 1024;
   const MAX_LOG_BYTES = 4 * 1024;
   const MAX_SAVE_BYTES = 1024 * 1024;
+  const MAX_RANDOM_BYTES_PER_CALL = 4 * 1024;
+  const RANDOM_BYTES_PER_EXECUTION = 64 * 1024;
   const MAX_AUDIO_SAMPLES = 48000 * 2;
   const MAX_FRAME_BYTES = 16 * 1024 * 1024;
   const MAX_TRI2D_BYTES = 8 * 1024 * 1024;
@@ -133,6 +135,20 @@
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const strictDecoder = new TextDecoder("utf-8", { fatal: true });
+
+  function executionRandomBytes() {
+    const bytes = new Uint8Array(RANDOM_BYTES_PER_EXECUTION);
+    const browserCrypto = globalThis.crypto;
+    if (typeof browserCrypto?.getRandomValues !== "function") {
+      return new Uint8Array();
+    }
+    try {
+      browserCrypto.getRandomValues(bytes);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  }
 
   function isWebGpuProfile(profile) {
     return profile === "webgpu-raster" || profile === "webgpu";
@@ -655,6 +671,8 @@
         request: null,
       };
       this.timeMs = null;
+      this.randomBytes = executionRandomBytes();
+      this.randomOffset = 0;
       this.updateAfterMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
@@ -1654,6 +1672,26 @@
         case "host_time_ms": {
           const timeMs = this.timeMs ?? performance.now() - this.clockStartedAt;
           this.#setU64Result(BigInt(Math.max(0, Math.trunc(timeMs))));
+          return false;
+        }
+        case "host_random_fill": {
+          const length = this.#u32(a1);
+          const end = this.randomOffset + length;
+          if (
+            !length ||
+            length > MAX_RANDOM_BYTES_PER_CALL ||
+            end > this.randomBytes.byteLength
+          ) {
+            this.#setReg(7, 1n);
+            return false;
+          }
+          this.#chargeBytes(length);
+          this.#write(
+            this.#u32(a0),
+            this.randomBytes.subarray(this.randomOffset, end),
+          );
+          this.randomOffset = end;
+          this.#setReg(7, 0n);
           return false;
         }
         case "host_sleep_ms":

@@ -29,6 +29,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MOTION_SAMPLE_BYTES = 48;
   const MAX_MEDIATED_INPUT_KIND_BYTES = 32;
   const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
+  const RANDOM_BYTES_PER_EXECUTION = 64 * 1024;
   // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
   // update carry a single axis, so a Host sends them through the dedicated
   // `view-insets` message that queues the pair together; the runtime rejects a
@@ -41,6 +42,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const CORE_STATUS_DENIED = -5;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+
+  function executionRandomBytes() {
+    const bytes = new Uint8Array(RANDOM_BYTES_PER_EXECUTION);
+    const browserCrypto = globalThis.crypto;
+    if (typeof browserCrypto?.getRandomValues !== "function") {
+      return new Uint8Array();
+    }
+    try {
+      browserCrypto.getRandomValues(bytes);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  }
 
   let pvm;
   let translated;
@@ -763,6 +778,15 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "startup", stage: "interpreter-launch-starting" });
       check(pvm.polkavm_browser_launch_start(), "start PolkaVM browser launch");
       postMessage({ type: "startup", stage: "interpreter-launch-started" });
+      const setRandomBytes = pvm.polkavm_browser_set_random_bytes;
+      if (typeof setRandomBytes !== "function") {
+        throw new Error("PolkaVM interpreter does not support secure random");
+      }
+      const randomBytes = executionRandomBytes();
+      if (randomBytes.byteLength > 0) {
+        stage(randomBytes);
+        check(setRandomBytes(), "set PolkaVM browser random bytes");
+      }
       check(
         pvm.polkavm_browser_set_motion_availability(motionAvailability),
         "set PolkaVM browser motion availability",
