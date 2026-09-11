@@ -52,6 +52,8 @@
   const MAX_CORE_RANDOM_BYTES = 4 * 1024;
   const MAX_LOG_BYTES = 4 * 1024;
   const MAX_SAVE_BYTES = 1024 * 1024;
+  const MAX_RANDOM_BYTES_PER_CALL = 4 * 1024;
+  const RANDOM_BYTES_PER_EXECUTION = 64 * 1024;
   const MAX_AUDIO_SAMPLES = 48000 * 2;
   const MAX_FRAME_BYTES = 16 * 1024 * 1024;
   const MAX_TRI2D_BYTES = 8 * 1024 * 1024;
@@ -133,6 +135,20 @@
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const strictDecoder = new TextDecoder("utf-8", { fatal: true });
+
+  function executionRandomBytes() {
+    const bytes = new Uint8Array(RANDOM_BYTES_PER_EXECUTION);
+    const browserCrypto = globalThis.crypto;
+    if (typeof browserCrypto?.getRandomValues !== "function") {
+      return new Uint8Array();
+    }
+    try {
+      browserCrypto.getRandomValues(bytes);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  }
 
   function isWebGpuProfile(profile) {
     return profile === "webgpu-raster" || profile === "webgpu";
@@ -655,6 +671,8 @@
         request: null,
       };
       this.timeMs = null;
+      this.randomBytes = executionRandomBytes();
+      this.randomOffset = 0;
       this.updateAfterMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
@@ -1656,6 +1674,26 @@
           this.#setU64Result(BigInt(Math.max(0, Math.trunc(timeMs))));
           return false;
         }
+        case "host_random_fill": {
+          const length = this.#u32(a1);
+          const end = this.randomOffset + length;
+          if (
+            !length ||
+            length > MAX_RANDOM_BYTES_PER_CALL ||
+            end > this.randomBytes.byteLength
+          ) {
+            this.#setReg(7, 1n);
+            return false;
+          }
+          this.#chargeBytes(length);
+          this.#write(
+            this.#u32(a0),
+            this.randomBytes.subarray(this.randomOffset, end),
+          );
+          this.randomOffset = end;
+          this.#setReg(7, 0n);
+          return false;
+        }
         case "host_sleep_ms":
           this.timeMs =
             (this.timeMs ?? performance.now() - this.clockStartedAt) +
@@ -2296,6 +2334,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MOTION_SAMPLE_BYTES = 48;
   const MAX_MEDIATED_INPUT_KIND_BYTES = 32;
   const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
+  const RANDOM_BYTES_PER_EXECUTION = 64 * 1024;
   // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
   // update carry a single axis, so a Host sends them through the dedicated
   // `view-insets` message that queues the pair together; the runtime rejects a
@@ -2308,6 +2347,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const CORE_STATUS_DENIED = -5;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+
+  function executionRandomBytes() {
+    const bytes = new Uint8Array(RANDOM_BYTES_PER_EXECUTION);
+    const browserCrypto = globalThis.crypto;
+    if (typeof browserCrypto?.getRandomValues !== "function") {
+      return new Uint8Array();
+    }
+    try {
+      browserCrypto.getRandomValues(bytes);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  }
 
   let pvm;
   let translated;
@@ -3030,6 +3083,15 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "startup", stage: "interpreter-launch-starting" });
       check(pvm.polkavm_browser_launch_start(), "start PolkaVM browser launch");
       postMessage({ type: "startup", stage: "interpreter-launch-started" });
+      const setRandomBytes = pvm.polkavm_browser_set_random_bytes;
+      if (typeof setRandomBytes !== "function") {
+        throw new Error("PolkaVM interpreter does not support secure random");
+      }
+      const randomBytes = executionRandomBytes();
+      if (randomBytes.byteLength > 0) {
+        stage(randomBytes);
+        check(setRandomBytes(), "set PolkaVM browser random bytes");
+      }
       check(
         pvm.polkavm_browser_set_motion_availability(motionAvailability),
         "set PolkaVM browser motion availability",

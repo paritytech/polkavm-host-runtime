@@ -244,6 +244,13 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn set_random_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_random_bytes(bytes),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support App ABI random bytes")),
+        }
+    }
+
     pub fn set_motion_availability(
         &mut self,
         availability: crate::motion_wire::MotionAvailability,
