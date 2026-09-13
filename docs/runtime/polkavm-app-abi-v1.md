@@ -689,6 +689,20 @@ It is not wall-clock time.
 sleep allowance for the current call. A Host MAY return earlier than the
 requested duration.
 
+### Random
+
+```text
+host_random_fill(destination: u32, length: u32) -> u32
+```
+
+The Host fills the requested guest range from a CSPRNG. Random bytes are
+independent for every execution and MUST NOT be derived from `host_time_ms`.
+
+```text
+0  accepted
+1  zero length, over the per-call limit, or execution pool exhausted
+```
+
 ### Audio
 
 ```text
@@ -775,6 +789,8 @@ audio samples per submission          96,000
 queued audio                           2 seconds
 queued input events                   4,096
 save data                             1 MiB
+random bytes per call                 4 KiB
+random bytes per execution            64 KiB
 one log                               4 KiB
 queued logs                           64
 queued GPU batches                    4

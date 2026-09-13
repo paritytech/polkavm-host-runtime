@@ -291,6 +291,14 @@ pub extern "C" fn polkavm_browser_launch_start() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn polkavm_browser_set_random_bytes() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        host.running()?.set_random_bytes(bytes)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn polkavm_browser_uses_motion() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
         Phase::Running(runtime) => u32::from(runtime.uses_motion()),
