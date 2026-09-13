@@ -40,6 +40,7 @@ const TYPE_UNARY_I64: u32 = 4;
 const TYPE_RESOLVER: u32 = 5;
 const TYPE_INDIRECT: u32 = 6;
 const TYPE_LOAD: u32 = 7;
+const TYPE_RESUME: u32 = 8;
 
 const GLOBAL_PC: u32 = REGISTER_COUNT;
 const GLOBAL_GAS: u32 = GLOBAL_PC + 1;
@@ -47,10 +48,15 @@ const GLOBAL_HEAP_SIZE: u32 = GLOBAL_GAS + 1;
 const GLOBAL_ECALL: u32 = GLOBAL_HEAP_SIZE + 1;
 const GLOBAL_TRAP_PC: u32 = GLOBAL_ECALL + 1;
 
-const LOCAL_ADDR: u32 = 0;
-const LOCAL_PHYS: u32 = 1;
-const LOCAL_I64_0: u32 = 2;
-const LOCAL_I64_1: u32 = 3;
+const LOCAL_GAS: u32 = 0;
+const LOCAL_ADDR: u32 = 1;
+const LOCAL_PHYS: u32 = 2;
+const LOCAL_I64_0: u32 = 3;
+const LOCAL_I64_1: u32 = 4;
+const INDIRECT_LOCAL_TARGET: u32 = 0;
+const INDIRECT_LOCAL_SOURCE_PC: u32 = 1;
+const INDIRECT_LOCAL_SOURCE_BLOCK: u32 = 2;
+const INDIRECT_LOCAL_GAS: u32 = 3;
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -140,7 +146,7 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
 
     let mut module = Module::new();
     let mut types = TypeSection::new();
-    types.ty().function([], [ValType::I32]);
+    types.ty().function([ValType::I64], [ValType::I32]);
     types
         .ty()
         .function([ValType::I64, ValType::I64], [ValType::I64]);
@@ -150,13 +156,15 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
     types.ty().function([ValType::I64], []);
     types.ty().function([ValType::I64], [ValType::I64]);
     types.ty().function([ValType::I32], [ValType::I32]);
-    types
-        .ty()
-        .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I64],
+        [ValType::I32],
+    );
     types.ty().function([ValType::I32], [ValType::I64]);
+    types.ty().function([], [ValType::I32]);
     module.section(&types);
 
-    let load_function_base = 7;
+    let load_function_base = 6;
     let helper_count = load_function_base + LoadKind::ALL.len() as u32;
     let root_helper_count = if partitioned { 0 } else { helper_count };
     let root_block_count = if partitioned { 0 } else { block_group_count };
@@ -173,7 +181,6 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
         TYPE_INDIRECT,
         TYPE_INDIRECT,
         TYPE_RESOLVER,
-        TYPE_BLOCK,
     ]
     .into_iter()
     .chain(std::iter::repeat_n(TYPE_LOAD, LoadKind::ALL.len()))
@@ -190,7 +197,7 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
     for _ in 0..resolver_group_count {
         functions.function(TYPE_RESOLVER);
     }
-    functions.function(TYPE_BLOCK);
+    functions.function(TYPE_RESUME);
     functions.function(TYPE_BEGIN);
     functions.function(TYPE_SET_GAS);
     module.section(&functions);
@@ -296,15 +303,16 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
         indirect_function: 3,
         return_function: 4,
         physical_address_function: 5,
-        gas_function: 6,
         load_function_base,
         local_block_start: 0,
         local_block_end: root_block_count,
+        dispatch_group: None,
+        dispatch_depth: 0,
+        current_block: None,
     };
     helper_code.function(&emit_indirect_helper(&context, true));
     helper_code.function(&emit_indirect_helper(&context, false));
     helper_code.function(&emit_physical_address_helper(layout));
-    helper_code.function(&emit_gas_helper());
     for kind in LoadKind::ALL {
         helper_code.function(&emit_load_helper(kind, context.physical_address_function));
     }
@@ -660,10 +668,12 @@ struct EmitContext<'a> {
     indirect_function: u32,
     return_function: u32,
     physical_address_function: u32,
-    gas_function: u32,
     load_function_base: u32,
     local_block_start: u32,
     local_block_end: u32,
+    dispatch_group: Option<u32>,
+    dispatch_depth: u32,
+    current_block: Option<u32>,
 }
 
 fn reg_index(reg: RawReg) -> u32 {
@@ -787,12 +797,17 @@ fn emit_dispatcher(block_count: u32) -> Function {
     f.instruction(&W::I32Const(STATUS_TRAP));
     f.instruction(&W::Return);
     f.instruction(&W::End);
-    emit_dispatch_from_pc(&mut f);
+    emit_dispatch_from_pc(&mut f, None);
     f.instruction(&W::End);
     f
 }
 
-fn emit_dispatch_from_pc(f: &mut Function) {
+fn emit_dispatch_from_pc(f: &mut Function, gas_local: Option<u32>) {
+    if let Some(local) = gas_local {
+        f.instruction(&W::LocalGet(local));
+    } else {
+        f.instruction(&W::GlobalGet(GLOBAL_GAS));
+    }
     f.instruction(&W::GlobalGet(GLOBAL_PC));
     f.instruction(&W::I32Const(BLOCKS_PER_FUNCTION.trailing_zeros() as i32));
     f.instruction(&W::I32ShrU);
@@ -870,25 +885,24 @@ fn encode_metadata(blob: &ProgramBlob, block_by_pc: &BlockMap, layout: Layout) -
     Ok(bytes)
 }
 
-fn emit_gas_helper() -> Function {
-    let mut f = Function::new([(1, ValType::I64)]);
-    f.instruction(&W::GlobalGet(GLOBAL_GAS));
-    f.instruction(&W::I64Const(1));
-    f.instruction(&W::I64Sub);
-    f.instruction(&W::LocalTee(0));
+// Gas stays in a function parameter across translated control flow. Persist it
+// only when execution returns to JavaScript so the exported global stays exact.
+fn emit_status_return(f: &mut Function, status: i32, gas_local: u32) {
+    f.instruction(&W::LocalGet(gas_local));
     f.instruction(&W::GlobalSet(GLOBAL_GAS));
-    f.instruction(&W::LocalGet(0));
-    f.instruction(&W::I64Const(0));
-    f.instruction(&W::I64LeS);
-    f.instruction(&W::End);
-    f
+    f.instruction(&W::I32Const(status));
+    f.instruction(&W::Return);
 }
 
-fn emit_gas_charge(f: &mut Function, gas_function: u32) {
-    f.instruction(&W::Call(gas_function));
+fn emit_gas_charge(f: &mut Function, gas_local: u32) {
+    f.instruction(&W::LocalGet(gas_local));
+    f.instruction(&W::I64Const(1));
+    f.instruction(&W::I64Sub);
+    f.instruction(&W::LocalTee(gas_local));
+    f.instruction(&W::I64Const(0));
+    f.instruction(&W::I64LeS);
     f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::I32Const(STATUS_OUT_OF_GAS));
-    f.instruction(&W::Return);
+    emit_status_return(f, STATUS_OUT_OF_GAS, gas_local);
     f.instruction(&W::End);
 }
 
@@ -910,67 +924,114 @@ fn emit_block_group(
     blocks: &[&[ParsedInstruction]],
 ) -> Result<Function> {
     let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
+    let group = context
+        .block_by_pc
+        .get(blocks[0][0].offset.0)
+        .expect("block group starts at a translated block")
+        / BLOCKS_PER_FUNCTION as u32;
+    // Re-dispatch branches within this bounded group using structured control
+    // flow. Cross-group transfers still tail-call to keep native stacks bounded.
     f.instruction(&W::GlobalGet(GLOBAL_PC));
     f.instruction(&W::LocalSet(LOCAL_ADDR));
+    f.instruction(&W::Loop(BlockType::Empty));
     emit_switch(&mut f, blocks.len(), LOCAL_ADDR, BLOCKS_PER_FUNCTION);
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         f.instruction(&W::End);
+        let block_index = context
+            .block_by_pc
+            .get(block[0].offset.0)
+            .expect("block starts at a translated target");
+        let block_context = EmitContext {
+            dispatch_group: Some(group),
+            dispatch_depth: (blocks.len() - index) as u32,
+            current_block: Some(block_index),
+            ..*context
+        };
         if context
             .metered_targets
             .binary_search(&block[0].offset.0)
             .is_ok()
         {
-            emit_gas_charge(&mut f, context.gas_function);
+            // Out-of-gas resumes at this block, so publish its selector before
+            // charging the function-local counter.
+            f.instruction(&W::I32Const(block_index as i32));
+            f.instruction(&W::GlobalSet(GLOBAL_PC));
+            emit_gas_charge(&mut f, LOCAL_GAS);
         }
         let mut terminated = false;
         for instruction in *block {
-            if emit_instruction(context, &mut f, instruction)? {
+            if emit_instruction(&block_context, &mut f, instruction)? {
                 terminated = true;
                 break;
             }
         }
         if !terminated {
-            emit_block_target(context, &mut f, block.last().unwrap().next_offset.0)?;
+            emit_block_target(
+                &block_context,
+                &mut f,
+                block.last().unwrap().next_offset.0,
+                0,
+            )?;
         }
     }
+    f.instruction(&W::End);
+    f.instruction(&W::Unreachable);
     f.instruction(&W::End);
     f.instruction(&W::Unreachable);
     f.instruction(&W::End);
     Ok(f)
 }
 
-fn emit_block_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Result<()> {
+fn emit_block_target(
+    context: &EmitContext<'_>,
+    f: &mut Function,
+    pc: u32,
+    nested_depth: u32,
+) -> Result<()> {
     let target = context
         .block_by_pc
         .get(pc)
         .ok_or_else(|| anyhow!("translated fallthrough target {pc} is missing"))?;
-    f.instruction(&W::I32Const(target as i32));
-    f.instruction(&W::GlobalSet(GLOBAL_PC));
     let group = target / BLOCKS_PER_FUNCTION as u32;
-    if (context.local_block_start..context.local_block_end).contains(&group) {
-        let helper_count = context.load_function_base + LoadKind::ALL.len() as u32;
-        f.instruction(&W::ReturnCall(
-            helper_count + group - context.local_block_start,
-        ));
+    // Avoid the mutable PC global and a tail call on same-group transfers.
+    if context.dispatch_group == Some(group) {
+        f.instruction(&W::I32Const(target as i32));
+        f.instruction(&W::LocalSet(LOCAL_ADDR));
+        f.instruction(&W::Br(context.dispatch_depth + nested_depth));
     } else {
-        f.instruction(&W::I32Const(group as i32));
-        f.instruction(&W::ReturnCallIndirect {
-            type_index: TYPE_BLOCK,
-            table_index: 0,
-        });
+        f.instruction(&W::I32Const(target as i32));
+        f.instruction(&W::GlobalSet(GLOBAL_PC));
+        f.instruction(&W::LocalGet(LOCAL_GAS));
+        if (context.local_block_start..context.local_block_end).contains(&group) {
+            let helper_count = context.load_function_base + LoadKind::ALL.len() as u32;
+            f.instruction(&W::ReturnCall(
+                helper_count + group - context.local_block_start,
+            ));
+        } else {
+            f.instruction(&W::I32Const(group as i32));
+            f.instruction(&W::ReturnCallIndirect {
+                type_index: TYPE_BLOCK,
+                table_index: 0,
+            });
+        }
     }
     Ok(())
 }
 
 fn emit_return_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Result<()> {
-    emit_block_target(context, f, pc)
+    emit_block_target(context, f, pc, 0)
 }
 
-fn emit_trap(f: &mut Function, pc: u32) {
+fn emit_trap(context: &EmitContext<'_>, f: &mut Function, pc: u32) {
+    f.instruction(&W::I32Const(
+        context
+            .current_block
+            .expect("trap is emitted inside a translated block") as i32,
+    ));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
     f.instruction(&W::I32Const(pc as i32));
     f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
-    f.instruction(&W::I32Const(STATUS_TRAP));
-    f.instruction(&W::Return);
+    emit_status_return(f, STATUS_TRAP, LOCAL_GAS);
 }
 
 fn emit_reg(f: &mut Function, reg: RawReg) {
@@ -1098,7 +1159,7 @@ fn emit_load(
             f.instruction(&W::I32Const(physical as i32));
             emit_load_at(f, kind);
         } else {
-            emit_trap(f, pc);
+            emit_trap(context, f, pc);
         }
         emit_set_reg(f, dst);
         return;
@@ -1155,7 +1216,7 @@ fn emit_store(
             f.instruction(&W::I32Const(physical as i32));
             emit_store_value(f, kind, source, immediate);
         } else {
-            emit_trap(f, pc);
+            emit_trap(context, f, pc);
         }
         return;
     }
@@ -1172,7 +1233,7 @@ fn emit_store(
     f.instruction(&W::I32Const(context.layout.rw_address as i32));
     f.instruction(&W::I32LtU);
     f.instruction(&W::If(BlockType::Empty));
-    emit_trap(f, pc);
+    emit_trap(context, f, pc);
     f.instruction(&W::End);
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::Call(context.physical_address_function));
@@ -1289,9 +1350,9 @@ fn emit_compare_branch(
     target: u32,
 ) -> Result<()> {
     f.instruction(&W::If(BlockType::Empty));
-    emit_block_target(context, f, target)?;
+    emit_block_target(context, f, target, 1)?;
     f.instruction(&W::Else);
-    emit_block_target(context, f, instruction.next_offset.0)?;
+    emit_block_target(context, f, instruction.next_offset.0, 1)?;
     f.instruction(&W::End);
     f.instruction(&W::Unreachable);
     Ok(())
@@ -1315,9 +1376,12 @@ fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32
         .partition_point(|target| *target <= pc)
         - 1];
     let current_block = context.block_by_pc.get(current_pc).unwrap();
+    f.instruction(&W::I32Const(current_block as i32));
+    f.instruction(&W::GlobalSet(GLOBAL_PC));
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::I32Const(pc as i32));
     f.instruction(&W::I32Const(current_block as i32));
+    f.instruction(&W::LocalGet(LOCAL_GAS));
     f.instruction(&W::ReturnCall(if meter {
         context.indirect_function
     } else {
@@ -1326,47 +1390,44 @@ fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32
 }
 
 fn emit_indirect_helper(context: &EmitContext<'_>, meter: bool) -> Function {
-    // Parameters: target address, source instruction PC, original source block.
-    // Specialize the backedge comparison for returns rather than passing a flag
-    // and branching at every callsite.
+    // Parameters: target address, source instruction PC, original source block,
+    // and remaining gas. Specialize the backedge comparison for returns rather
+    // than passing a flag and branching at every callsite.
     let mut f = Function::new([]);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Const(RETURN_TO_HOST as i32));
     f.instruction(&W::I32Eq);
     f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::I32Const(STATUS_FINISHED));
-    f.instruction(&W::Return);
+    emit_status_return(&mut f, STATUS_FINISHED, INDIRECT_LOCAL_GAS);
     f.instruction(&W::End);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Const(1));
     f.instruction(&W::I32And);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Eqz);
     f.instruction(&W::I32Or);
     f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::LocalGet(1));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_SOURCE_PC));
     f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
-    f.instruction(&W::I32Const(STATUS_TRAP));
-    f.instruction(&W::Return);
+    emit_status_return(&mut f, STATUS_TRAP, INDIRECT_LOCAL_GAS);
     f.instruction(&W::End);
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Const(2));
     f.instruction(&W::I32DivU);
     f.instruction(&W::I32Const(1));
     f.instruction(&W::I32Sub);
-    f.instruction(&W::LocalTee(LOCAL_ADDR));
+    f.instruction(&W::LocalTee(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Const(context.jump_table_len as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::LocalGet(1));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_SOURCE_PC));
     f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
-    f.instruction(&W::I32Const(STATUS_TRAP));
-    f.instruction(&W::Return);
+    emit_status_return(&mut f, STATUS_TRAP, INDIRECT_LOCAL_GAS);
     f.instruction(&W::End);
     // The resolver takes the full jump-table index and switches on its low
     // bits. Only one table entry/function is needed per resolver group.
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::I32Const(RESOLVERS_PER_FUNCTION.trailing_zeros() as i32));
     f.instruction(&W::I32ShrU);
     f.instruction(&W::I32Const(context.resolver_table_base as i32));
@@ -1375,18 +1436,18 @@ fn emit_indirect_helper(context: &EmitContext<'_>, meter: bool) -> Function {
         type_index: TYPE_RESOLVER,
         table_index: 0,
     });
-    f.instruction(&W::LocalTee(LOCAL_ADDR));
+    f.instruction(&W::LocalTee(INDIRECT_LOCAL_TARGET));
     f.instruction(&W::GlobalSet(GLOBAL_PC));
     // Resume at the resolved destination, not at the source block: a fused
     // load-and-jump may already have overwritten the register holding its target.
     // Compare against the original control-flow block, not an artificial split.
-    f.instruction(&W::LocalGet(LOCAL_ADDR));
-    f.instruction(&W::LocalGet(2));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_TARGET));
+    f.instruction(&W::LocalGet(INDIRECT_LOCAL_SOURCE_BLOCK));
     f.instruction(if meter { &W::I32LeU } else { &W::I32Eq });
     f.instruction(&W::If(BlockType::Empty));
-    emit_gas_charge(&mut f, context.gas_function);
+    emit_gas_charge(&mut f, INDIRECT_LOCAL_GAS);
     f.instruction(&W::End);
-    emit_dispatch_from_pc(&mut f);
+    emit_dispatch_from_pc(&mut f, Some(INDIRECT_LOCAL_GAS));
     f.instruction(&W::End);
     f
 }
@@ -1514,7 +1575,7 @@ fn emit_instruction(
     let pc = instruction.offset.0;
     match instruction.kind {
         trap | invalid => {
-            emit_trap(f, pc);
+            emit_trap(context, f, pc);
             return Ok(true);
         }
         fallthrough | unlikely => {}
@@ -1562,8 +1623,7 @@ fn emit_instruction(
                 .ok_or_else(|| anyhow!("ecall continuation is not a block"))?;
             f.instruction(&W::I32Const(next as i32));
             f.instruction(&W::GlobalSet(GLOBAL_PC));
-            f.instruction(&W::I32Const(STATUS_ECALL));
-            f.instruction(&W::Return);
+            emit_status_return(f, STATUS_ECALL, LOCAL_GAS);
             return Ok(true);
         }
         load_imm(dst, value) => {
@@ -1992,7 +2052,7 @@ fn emit_memset(context: &EmitContext<'_>, f: &mut Function, pc: u32) {
     f.instruction(&W::LocalGet(LOCAL_PHYS));
     f.instruction(&W::MemoryFill(1));
     f.instruction(&W::Else);
-    emit_trap(f, pc);
+    emit_trap(context, f, pc);
     f.instruction(&W::End);
     f.instruction(&W::End);
     emit_reg(f, Reg::A0.raw());
@@ -2832,8 +2892,24 @@ mod tests {
             .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
             .unwrap();
         assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            instance
+                .get_global(&store, "gas")
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(0),
+        );
         gas.call(&mut store, 3).unwrap();
         assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            instance
+                .get_global(&store, "gas")
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(0),
+        );
         assert_eq!(
             instance
                 .get_global(&store, Reg::A0.name_non_abi())
@@ -2844,6 +2920,14 @@ mod tests {
         );
         gas.call(&mut store, 2).unwrap();
         assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_FINISHED);
+        assert_eq!(
+            instance
+                .get_global(&store, "gas")
+                .unwrap()
+                .get(&store)
+                .i64(),
+            Some(1),
+        );
         assert_eq!(
             instance
                 .get_global(&store, Reg::A0.name_non_abi())
