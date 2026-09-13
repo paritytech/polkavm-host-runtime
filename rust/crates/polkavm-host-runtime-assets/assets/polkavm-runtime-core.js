@@ -727,7 +727,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         translated.sendMotionSample(pendingMotionSample);
       }
       translated.setPointerCaptureSupported(pointerCaptureSupported);
-      translated.initialize();
+      translated.initialize(MAX_GAS_PER_UPDATE);
       pendingGpuCapabilities = null;
       pendingMotionSample = null;
       backend = "compiler";
