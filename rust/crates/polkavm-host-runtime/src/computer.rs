@@ -529,12 +529,9 @@ pub struct ComputerRuntime {
 impl ComputerRuntime {
     /// Creates a runtime using the preferred backend for this platform.
     pub fn new(program: &[u8], context: ComputerContext, max_gas_per_run: u64) -> Result<Self> {
-        Self::new_with_backend(
-            program,
-            context,
-            max_gas_per_run,
-            crate::preferred_backend(),
-        )
+        crate::with_backend_fallback(|backend| {
+            Self::new_with_backend(program, context.clone(), max_gas_per_run, backend)
+        })
     }
 
     /// Creates a runtime using an explicitly selected PolkaVM backend.
@@ -886,12 +883,9 @@ enum PendingResolution {
 impl ComputerSupervisor {
     /// Creates a supervisor whose root process runs `program`.
     pub fn new(program: &[u8], context: ComputerContext, max_gas_per_run: u64) -> Result<Self> {
-        Self::new_with_backend(
-            program,
-            context,
-            max_gas_per_run,
-            crate::preferred_backend(),
-        )
+        crate::with_backend_fallback(|backend| {
+            Self::new_with_backend(program, context.clone(), max_gas_per_run, backend)
+        })
     }
 
     /// Creates a supervisor using an explicitly selected PolkaVM backend.

@@ -513,14 +513,42 @@ impl MotionState {
     }
 }
 
+/// The backend this platform asks polkavm for first.
+///
+/// wasm32 has no native code to emit, and iOS is excluded by polkavm's own
+/// platform gate (`any(target_os = "linux", ...)` in its `if_compiler_is_supported!`)
+/// as well as by Apple's JIT policy. Android is aarch64 Linux, which that gate
+/// accepts, so it asks for the compiler — a guest runs roughly an order of
+/// magnitude faster compiled than interpreted. A device whose policy refuses
+/// executable mappings is caught by `with_backend_fallback`, not by refusing
+/// the whole platform here.
 pub(crate) fn preferred_backend() -> BackendKind {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
     {
         BackendKind::Interpreter
     }
-    #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
     {
         BackendKind::Compiler
+    }
+}
+
+/// Builds a runtime with [`preferred_backend`], retrying on the interpreter.
+///
+/// Satisfying polkavm's compile-time platform gate does not guarantee that a
+/// particular device permits the writable-then-executable mappings its
+/// compiler needs; Android's SELinux policy is the case this exists for. A
+/// slow guest beats a guest that refuses to start, so a failed construction
+/// falls back once and the caller can report which backend it ended up with.
+pub(crate) fn with_backend_fallback<T>(build: impl Fn(BackendKind) -> Result<T>) -> Result<T> {
+    let preferred = preferred_backend();
+    match build(preferred) {
+        Err(error) if preferred != BackendKind::Interpreter => {
+            build(BackendKind::Interpreter).map_err(|fallback| {
+                fallback.context(format!("{preferred} backend unavailable: {error}"))
+            })
+        }
+        result => result,
     }
 }
 
@@ -891,14 +919,16 @@ impl Runtime {
         audio_enabled: bool,
         max_gas_per_update: u64,
     ) -> Result<Self> {
-        Self::new_with_backend(
-            program,
-            assets,
-            presentation,
-            audio_enabled,
-            max_gas_per_update,
-            preferred_backend(),
-        )
+        with_backend_fallback(|backend| {
+            Self::new_with_backend(
+                program,
+                assets.clone(),
+                presentation,
+                audio_enabled,
+                max_gas_per_update,
+                backend,
+            )
+        })
     }
 
     pub fn new_with_backend(
