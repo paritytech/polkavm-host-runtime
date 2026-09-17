@@ -543,11 +543,10 @@ pub(crate) fn preferred_backend() -> BackendKind {
 pub(crate) fn with_backend_fallback<T>(build: impl Fn(BackendKind) -> Result<T>) -> Result<T> {
     let preferred = preferred_backend();
     match build(preferred) {
-        Err(error) if preferred != BackendKind::Interpreter => {
-            build(BackendKind::Interpreter).map_err(|fallback| {
+        Err(error) if preferred != BackendKind::Interpreter => build(BackendKind::Interpreter)
+            .map_err(|fallback| {
                 fallback.context(format!("{preferred} backend unavailable: {error}"))
-            })
-        }
+            }),
         result => result,
     }
 }
