@@ -45,14 +45,16 @@ impl ApplicationRuntime {
         audio_enabled: bool,
         max_gas_per_update: u64,
     ) -> Result<Self> {
-        Self::new_with_backend(
-            program,
-            assets,
-            presentation,
-            audio_enabled,
-            max_gas_per_update,
-            crate::preferred_backend(),
-        )
+        crate::with_backend_fallback(|backend| {
+            Self::new_with_backend(
+                program,
+                assets.clone(),
+                presentation,
+                audio_enabled,
+                max_gas_per_update,
+                backend,
+            )
+        })
     }
 
     pub fn new_with_backend(
