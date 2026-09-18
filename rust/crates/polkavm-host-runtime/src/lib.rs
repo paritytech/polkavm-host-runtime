@@ -515,19 +515,21 @@ impl MotionState {
 
 /// The backend this platform asks polkavm for first.
 ///
-/// wasm32 has no native code to emit, and iOS is excluded by polkavm's own
-/// platform gate (`any(target_os = "linux", ...)` in its `if_compiler_is_supported!`)
-/// as well as by Apple's JIT policy. Android is aarch64 Linux, which that gate
-/// accepts, so it asks for the compiler — a guest runs roughly an order of
-/// magnitude faster compiled than interpreted. A device whose policy refuses
-/// executable mappings is caught by `with_backend_fallback`, not by refusing
-/// the whole platform here.
+/// wasm32 has no native code to emit. iOS and Android are excluded by
+/// polkavm's own platform gate, which enables its compiler for
+/// `target_os = "linux"` (plus macOS/FreeBSD under `generic-sandbox`) — and an
+/// Android target is `target_os = "android"`, not `"linux"`. Measured on an
+/// API 35 emulator: `BackendKind::Compiler.is_supported()` is `false` and
+/// `Engine::new` reports "the 'compiler' backend is not supported on this
+/// platform", so asking for it here would only buy a failed construction.
+/// Compiled execution on Android needs polkavm's generic sandbox ported to
+/// bionic first; until then the interpreter is the only native option.
 pub(crate) fn preferred_backend() -> BackendKind {
-    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
     {
         BackendKind::Interpreter
     }
-    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
     {
         BackendKind::Compiler
     }
