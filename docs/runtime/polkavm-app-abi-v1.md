@@ -79,6 +79,13 @@ input and audio. A Host call made outside its declared capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
 silently reinterpret a submission as another graphics profile.
 
+`capabilities.deviceInput.controls` MAY contain display-only control help.
+When present it MUST be an array of at most 32 strings; each string MUST be
+nonempty, have no leading or trailing whitespace, and contain at most 160
+UTF-8 bytes. Omission means no declared help. This field neither defines input
+mappings nor adds required device features. Hosts MAY show it in their own
+controls menu outside the guest presentation surface.
+
 ## Host imports
 
 ### Cooperative update scheduling
@@ -104,6 +111,14 @@ guest. Every such event MUST wake an opted-in guest promptly.
 A guest that does not import this call retains Host-defined continuous
 scheduling for compatibility. Scheduling does not weaken per-update gas or
 Host-call budgets.
+
+A Host may suspend execution for its menu or while backgrounded. It MUST
+release held input before pausing, discard queued gameplay actions and audio,
+and prevent new gameplay presses from accumulating during the pause. Releases
+and viewport state may remain pending until the first resumed update. Paused
+execution does not process updates or external-event wakes. Execution-scoped
+monotonic time excludes the pause; wall time does not. Resume MUST NOT replay
+missed update ticks or buffered audio.
 
 ### Framebuffer presentation
 

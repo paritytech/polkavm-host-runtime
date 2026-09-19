@@ -459,6 +459,15 @@ pub extern "C" fn polkavm_browser_update_after_ms() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn polkavm_browser_pause_input() -> u32 {
+    status(|host| {
+        host.running()?.pause_input();
+        host.audio = None;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn polkavm_browser_send_input(event_type: u32, code: u32, x: u32, y: u32) -> u32 {
     status(|host| {
         let event_type = match event_type {

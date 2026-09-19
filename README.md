@@ -38,6 +38,23 @@ and dispatch state before falling back to the interpreter. Cached compiled
 programs include the root and every code module; instantiation creates fresh
 guest state.
 
+Application hosts may pause through `ApplicationRuntime::set_paused(bool)`.
+Updates do not execute while paused, execution-scoped monotonic clocks freeze,
+and resume excludes paused wall time. Wall-clock imports remain real time.
+Release held controls before pausing and suspend/clear the host audio device;
+the runtime discards pending gameplay actions and audio while retaining input
+releases and viewport state for the next update.
+
+The browser endpoint accepts `{ type: "pause", paused: boolean }` and acknowledges
+every valid request with `{ type: "pause-state", paused: boolean }`. Hosts combine
+menu and background pause reasons before sending the effective state. Pause is
+retained before and during asynchronous startup: initialization completes, but
+the first update waits for resume. Resume queues at most one update, not missed
+frames. Paused input cannot wake execution, and stopping during compilation
+cannot bring the endpoint back to life. The worker and Wasm runtime must be
+rebuilt together: the interpreter uses `polkavm_browser_pause_input` to enforce
+the same queue boundary as the translated backend.
+
 Browser and native render passes accept registered texture views as offscreen
 color attachments; zero still selects the surface. Offscreen passes preserve
 the surface and retain generation and resource-handle validation. These changes

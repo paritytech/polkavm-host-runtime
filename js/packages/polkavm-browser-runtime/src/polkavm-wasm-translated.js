@@ -807,6 +807,21 @@
       this.#run(update, false);
     }
 
+    pauseInput() {
+      const survivesPause = (record) =>
+        record[0] === 2 || record[0] === 4 || record[0] === 7 ||
+        record[0] === 12 || record[0] === 16 || record[0] === 17 ||
+        record[0] === 20 || record[0] === 21 ||
+        ((record[0] === 13 || record[0] === 15) && record[1] === 0);
+      this.input = this.input.filter(survivesPause);
+      this.epocaInput = this.epocaInput.filter(survivesPause);
+      this.coreInput = this.coreInput.filter(
+        ([key, value]) => value === 0 && key !== 0xa3 && key !== 0xa4,
+      );
+      this.pointer = null;
+      this.motionSample = null;
+    }
+
     sendInput(bytes) {
       if (this.stopped || bytes.byteLength !== INPUT_EVENT_BYTES) {
         return;
@@ -1145,6 +1160,7 @@
       this.stopped = true;
       this.input.length = 0;
       this.coreInput.length = 0;
+      this.epocaInput.length = 0;
       this.hostFrameRequests = 0;
       this.hostFrameRequestBytes = 0;
       this.gpuEvents.length = 0;
