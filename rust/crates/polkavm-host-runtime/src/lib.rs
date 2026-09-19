@@ -388,6 +388,9 @@ pub struct UiOutputFrame {
 struct HostClock {
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
+    #[cfg(not(target_arch = "wasm32"))]
+    paused_at: Option<Instant>,
+    paused: bool,
     #[cfg(target_arch = "wasm32")]
     now_ms: u64,
 }
@@ -397,6 +400,9 @@ impl HostClock {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
+            paused_at: None,
+            paused: false,
             #[cfg(target_arch = "wasm32")]
             now_ms: 0,
         }
@@ -405,7 +411,10 @@ impl HostClock {
     fn elapsed_ms(&self) -> u64 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.started.elapsed().as_millis() as u64
+            self.paused_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_millis() as u64
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -413,7 +422,41 @@ impl HostClock {
         }
     }
 
+    fn elapsed_ns(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.paused_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.now_ms.saturating_mul(1_000_000)
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = Instant::now();
+            if paused {
+                self.paused_at = Some(now);
+            } else if let Some(paused_at) = self.paused_at.take() {
+                self.started += now.duration_since(paused_at);
+            }
+        }
+        self.paused = paused;
+    }
+
     fn sleep_ms(&mut self, duration_ms: u32) {
+        if self.paused {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::sleep(Duration::from_millis(duration_ms.into()));
         #[cfg(target_arch = "wasm32")]
@@ -424,7 +467,9 @@ impl HostClock {
 
     #[cfg(target_arch = "wasm32")]
     fn set_time_ms(&mut self, time_ms: u64) {
-        self.now_ms = self.now_ms.max(time_ms);
+        if !self.paused {
+            self.now_ms = self.now_ms.max(time_ms);
+        }
     }
 }
 
@@ -863,6 +908,12 @@ fn is_discardable_input(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
             || value == InputEventType::TouchMove as u8
             || value == ui::INPUT_WHEEL
     )
+}
+
+/// Retain releases and viewport state at a pause boundary, never queued actions.
+pub(crate) fn input_survives_pause(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
+    matches!(record[0], 2 | 4 | 7 | 12 | 16 | 17 | 20 | 21)
+        || (matches!(record[0], ui::INPUT_FOCUS | ui::INPUT_POINTER_CAPTURE) && record[1] == 0)
 }
 
 /// Classifies a batch that carries viewport insets.
@@ -1500,12 +1551,7 @@ impl Runtime {
                 "polkadot_host_0_1_core_clock_monotonic",
                 |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
                     caller.user_data.charge_hostcall(8)?;
-                    let nanoseconds = caller
-                        .user_data
-                        .clock
-                        .elapsed_ms()
-                        .saturating_mul(1_000_000)
-                        .to_le_bytes();
+                    let nanoseconds = caller.user_data.clock.elapsed_ns().to_le_bytes();
                     caller
                         .instance
                         .write_memory(destination, &nanoseconds)
@@ -1757,6 +1803,25 @@ impl Runtime {
         self.stopped
     }
 
+    /// Freezes guest updates and monotonic time. The Host releases held input
+    /// before pausing and owns suspension of its audio output device.
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.stopped || self.state.clock.paused == paused {
+            return;
+        }
+        if paused {
+            self.pause_input();
+        }
+        self.state.clock.set_paused(paused);
+    }
+
+    pub(crate) fn pause_input(&mut self) {
+        self.state.input.retain(input_survives_pause);
+        self.state.motion.consume();
+        self.state.audio.clear();
+        self.state.audio_samples = 0;
+    }
+
     pub fn init(&mut self) -> Result<()> {
         if self.stopped {
             bail!("runtime is stopped");
@@ -1787,6 +1852,9 @@ impl Runtime {
     pub fn update(&mut self) -> Result<()> {
         if self.stopped {
             bail!("runtime is stopped");
+        }
+        if self.state.clock.paused {
+            return Ok(());
         }
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
@@ -1840,20 +1908,32 @@ impl Runtime {
     }
 
     pub fn send_input(&mut self, event: InputEvent) {
+        if self.state.clock.paused && !input_survives_pause(&event.encode()) {
+            return;
+        }
         self.state.queue_input(event);
     }
 
     pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        if self.state.clock.paused && !input_survives_pause(&record) {
+            return Ok(());
+        }
         self.state.queue_input_record(record)
     }
 
     /// Queues one logical input event encoded as multiple records without
     /// exposing a partial event to the guest.
     pub fn send_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
+        if self.state.clock.paused && records.iter().any(|record| !input_survives_pause(record)) {
+            return Ok(());
+        }
         self.state.queue_input_records(records)
     }
 
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
+        if self.state.clock.paused {
+            return Ok(());
+        }
         let records = ui::encode_text_input(kind, text)?;
         self.state.queue_input_records(&records)
     }
@@ -1912,6 +1992,9 @@ impl Runtime {
     }
 
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.state.clock.paused {
+            return Ok(());
+        }
         self.state.motion.set_sample(bytes)
     }
 
@@ -2219,6 +2302,99 @@ mod tests {
     use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::{asm, InstructionSetKind};
     use polkavm_common::writer::ProgramBlobBuilder;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn native_pause_freezes_monotonic_time_without_resume_catchup() {
+        let mut clock = HostClock::new();
+        clock.set_paused(true);
+        let frozen = clock.elapsed_ns();
+        std::thread::sleep(Duration::from_millis(2));
+        clock.set_paused(true);
+        assert_eq!(clock.elapsed_ns(), frozen);
+        clock.sleep_ms(10);
+        assert_eq!(clock.elapsed_ns(), frozen);
+        let resuming = Instant::now();
+        clock.set_paused(false);
+        let resumed = clock.elapsed_ns();
+        assert!(resumed >= frozen);
+        assert!(u128::from(resumed - frozen) <= resuming.elapsed().as_nanos());
+    }
+
+    #[test]
+    fn native_pause_discards_actions_but_preserves_releases_for_the_guest() {
+        let rw_size = 64 * 1024;
+        let stack_size = 4 * 1024;
+        let output = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(rw_size)
+            .stack_size(stack_size)
+            .build()
+            .unwrap()
+            .rw_data_address();
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(rw_size);
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_poll_input");
+        builder.add_import(b"host_save_submit");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(1, b"update");
+        builder.set_code(
+            &[
+                asm::ret(),
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, INPUT_EVENT_BYTES as i32),
+                asm::ecalli(0),
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, INPUT_EVENT_BYTES as i32),
+                asm::ecalli(1),
+                asm::ret(),
+            ],
+            &[],
+        );
+        let program = builder.into_vec().unwrap();
+        let mut runtime = ApplicationRuntime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        runtime.init().unwrap();
+        let press = [1, 4, 0, 0, 0, 0, 0, 0];
+        let release = [2, 4, 0, 0, 0, 0, 0, 0];
+        runtime.send_input_record(press).unwrap();
+        runtime.send_input_record(release).unwrap();
+        runtime.send_input_record(focus_record(true)).unwrap();
+        runtime.send_input_record(focus_record(false)).unwrap();
+        runtime.set_paused(true);
+        runtime.send_input_record([1, 5, 0, 0, 0, 0, 0, 0]).unwrap();
+        runtime.update().unwrap();
+        assert!(
+            runtime.take_save().is_none(),
+            "a paused update cannot execute the guest"
+        );
+        runtime.set_paused(false);
+        runtime.update().unwrap();
+        assert_eq!(runtime.take_save().unwrap(), release);
+        runtime.update().unwrap();
+        assert_eq!(runtime.take_save().unwrap(), focus_record(false));
+        let fresh = [1, 6, 0, 0, 0, 0, 0, 0];
+        runtime.send_input_record(fresh).unwrap();
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.take_save().unwrap(),
+            fresh,
+            "paused presses must not replay"
+        );
+        runtime.stop();
+        runtime.set_paused(false);
+        assert!(
+            runtime.update().is_err(),
+            "resume cannot revive a stopped runtime"
+        );
+    }
 
     fn motion_test_program() -> (Vec<u8>, u32) {
         let rw_size = 64 * 1024;

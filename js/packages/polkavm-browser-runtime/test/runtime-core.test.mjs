@@ -541,6 +541,124 @@ test("compiler backend returns complete u64 clock values to 32-bit guests", asyn
   translated.stop();
 });
 
+test("both browser backends freeze time across startup pause and queued ticks", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(
+    repositoryRoot, "rust/crates/polkavm-host-runtime/tests/fixtures/clock-u64.polkavm",
+  ));
+  for (const forceInterpreter of [false, true]) {
+    await t.test(forceInterpreter ? "interpreter" : "compiler", async (t) => {
+      let now = 100;
+      const ticks = [];
+      const timers = new Map();
+      let nextTimer = 0;
+      t.mock.method(performance, "now", () => now);
+      t.mock.method(globalThis, "MessageChannel", class {
+        constructor() {
+          this.port1 = { onmessage: null, close() { this.onmessage = null; } };
+          this.port2 = {
+            postMessage: () => ticks.push(() => this.port1.onmessage?.()),
+            close() {},
+          };
+        }
+      });
+      const { messages, receiver } = endpoint();
+      const send = (data) => receiver.onmessage({ data });
+      try {
+        send({ type: "pause", paused: true });
+        send({
+          type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+          cacheKey: `paused-clock-${forceInterpreter}`, forceInterpreter,
+        });
+        const ready = await waitForMessage(messages, "ready");
+        assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+        assert.equal(ticks.length, 0, "startup must not run the paused first update");
+        t.mock.method(globalThis, "setTimeout", (callback) => {
+          const id = ++nextTimer;
+          timers.set(id, callback);
+          return id;
+        });
+        t.mock.method(globalThis, "clearTimeout", (id) => timers.delete(id));
+        const guestTime = () => {
+          const bytes = messages.findLast((message) => message.type === "save").bytes;
+          return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, true);
+        };
+        now = 10_000;
+        send({ type: "pause", paused: false });
+        assert.equal(ticks.length, 1);
+        ticks.shift()();
+        assert.equal(guestTime(), 0n, "startup pause is not guest elapsed time");
+        assert.equal(timers.size, 1);
+
+        now = 10_017;
+        const [timerId, callback] = timers.entries().next().value;
+        timers.delete(timerId);
+        callback();
+        assert.equal(ticks.length, 1);
+        send({ type: "pause", paused: true });
+        const savesBeforePause = messages.filter((message) => message.type === "save").length;
+        ticks.shift()();
+        assert.equal(messages.filter((message) => message.type === "save").length, savesBeforePause);
+        assert.equal(timers.size, 0);
+        now = 110_017;
+        send({ type: "input", bytes: new Uint8Array([1, 4, 0, 0, 0, 0, 0, 0]) });
+        send({ type: "pause", paused: true });
+        assert.equal(ticks.length, 0, "paused input cannot wake or spin");
+        send({ type: "pause", paused: false });
+        send({ type: "pause", paused: false });
+        assert.equal(ticks.length, 1, "resume and repeated acknowledgments cannot queue a burst");
+        ticks.shift()();
+        assert.equal(guestTime(), 17n, "resume excludes all paused wall time");
+        assert.equal(timers.size, 1, "resume returns to paced updates");
+        assert.equal(ticks.length, 0);
+        assert.deepEqual(messages.findLast((message) => message.type === "pause-state"), {
+          type: "pause-state", paused: false,
+        });
+      } finally {
+        receiver.onmessage?.({ data: { type: "stop" } });
+      }
+    });
+  }
+});
+
+test("stopping during asynchronous compilation cannot restart the endpoint", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(
+    repositoryRoot, "rust/crates/polkavm-host-runtime/tests/fixtures/clock-u64.polkavm",
+  ));
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const compile = Runtime.compile;
+  let release;
+  let entered;
+  let completed;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const compiling = new Promise((resolve) => { entered = resolve; });
+  const compiled = new Promise((resolve) => { completed = resolve; });
+  t.mock.method(Runtime, "compile", async (bytes) => {
+    entered();
+    await gate;
+    const result = await compile.call(Runtime, bytes);
+    completed();
+    return result;
+  });
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({ data: {
+    type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+    assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+    cacheKey: "stop-during-compile",
+  } });
+  await compiling;
+  receiver.onmessage({ data: { type: "pause", paused: true } });
+  receiver.onmessage({ data: { type: "stop" } });
+  release();
+  await compiled;
+  await settle();
+  assert.equal(receiver.onmessage, null);
+  assert.equal(messages.filter((message) => message.type === "terminated").length, 1);
+  assert.equal(messages.some((message) => ["ready", "save", "error"].includes(message.type)), false);
+});
+
 test("both browser backends expose application core clocks and entropy", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
