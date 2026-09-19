@@ -170,6 +170,7 @@ impl ApplicationRuntime {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn pause_input(&mut self) {
         match self {
             Self::Cooperative(runtime) => runtime.pause_input(),
