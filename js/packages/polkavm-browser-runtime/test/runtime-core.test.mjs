@@ -351,6 +351,30 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
   }
 });
 
+test("browser program admission accepts a 128 MiB view but rejects one byte more", async () => {
+  const bytes = new Uint8Array(128 * 1024 * 1024 + 1);
+  for (const [program, expected] of [
+    [bytes.subarray(1), /invalid PolkaVM browser graphics profile/],
+    [bytes, /program must contain/],
+  ]) {
+    const { messages, receiver } = endpoint();
+    // A later admission error avoids staging a giant invalid guest, while
+    // proving the boundary uses the view's length rather than its backing store.
+    receiver.onmessage({
+      data: invalidStart({ program, graphicsProfile: "invalid" }),
+    });
+    await settle();
+    assert.match(
+      messages.find((candidate) => candidate.type === "error")?.message ?? "",
+      expected,
+    );
+    assert.equal(
+      messages.some((candidate) => candidate.type === "startup"),
+      false,
+    );
+  }
+});
+
 test("demand-driven guests idle until an external event wakes them", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

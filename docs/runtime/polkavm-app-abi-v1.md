@@ -42,6 +42,16 @@ conforms to this document and the conformance fixtures associated with it.
 The executable is a valid PolkaVM program selected by the App manifest's
 archive-relative `runtime.entrypoint`.
 
+The runtime admits serialized programs of at most 128 MiB, with instruction
+sections of at most 64 MiB. These are independent admission limits; native
+code expansion, browser translation, and available process memory can still
+prevent execution. The native compiler rejects unrepresentable code sizes
+and branch displacements without increasing its sandbox address reservation.
+These limits do not increase guest heap, stack, gas, or asset budgets.
+Hosts must update their runtime before loading programs above the previous
+32 MiB instruction or 64 MiB serialized-program limits; the application ABI
+and existing bytecode encoding are unchanged.
+
 The program MUST export:
 
 ```text
@@ -784,10 +794,11 @@ application behavior.
 
 ## ABI v1 resource bounds
 
-The initial v1 implementation applies the following ceilings:
+The v1 implementation applies the following ceilings:
 
 ```text
-program bytes                         64 MiB
+serialized program bytes              128 MiB
+instruction-section bytes             64 MiB
 read-write data                       64 MiB
 stack                                 16 MiB
 heap                                  128 MiB

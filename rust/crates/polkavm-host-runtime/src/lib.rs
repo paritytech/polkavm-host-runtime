@@ -118,7 +118,7 @@ impl PresentationProfile {
     }
 }
 pub const BYTES_PER_PIXEL: usize = 4;
-pub const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PROGRAM_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GUEST_READ: usize = MAX_FRAME_BYTES;
 pub const MAX_GUEST_RW_DATA_BYTES: u32 = 64 * 1024 * 1024;
@@ -2996,7 +2996,8 @@ mod tests {
     #[test]
     fn launch_limits_reject_unbounded_native_inputs() {
         assert!(validate_program_configuration(0, 1).is_err());
-        assert!(validate_program_configuration(MAX_PROGRAM_BYTES + 1, 1).is_err());
+        assert!(validate_program_configuration(128 * 1024 * 1024, 1).is_ok());
+        assert!(validate_program_configuration(128 * 1024 * 1024 + 1, 1).is_err());
         assert!(validate_program_configuration(1, 0).is_err());
         assert!(validate_assets(MAX_ASSET_FILES + 1, std::iter::empty()).is_err());
         assert!(validate_assets(1, [("../escape", 1)]).is_err());
