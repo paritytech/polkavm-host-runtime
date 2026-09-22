@@ -351,6 +351,63 @@ test("browser runtime rejects unbounded launch inputs before compilation", async
   }
 });
 
+test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
+  const originalSetTimeout = globalThis.setTimeout;
+  const updateStartedAt = [];
+  t.mock.method(
+    globalThis,
+    "setTimeout",
+    (callback, delay = 0, ...args) =>
+      originalSetTimeout(callback, delay > 0 ? delay + 3 : delay, ...args),
+  );
+  globalThis.TranslatedPolkaVmRuntime = class extends originalRuntime {
+    update(timeMs) {
+      updateStartedAt.push(performance.now());
+      super.update(timeMs);
+    }
+  };
+  const { messages, receiver } = endpoint();
+  try {
+    receiver.onmessage({
+      data: {
+        type: "start",
+        runtime: bytesBuffer(runtime),
+        program: bytesBuffer(program),
+        assets: [],
+        graphicsProfile: "framebuffer",
+        audioEnabled: false,
+        cacheKey: "continuous-update-cadence",
+      },
+    });
+    await waitForMessage(messages, "ready");
+    const deadline = Date.now() + 2000;
+    while (updateStartedAt.length < 31 && Date.now() < deadline) {
+      await new Promise((resolve) => originalSetTimeout(resolve, 5));
+    }
+    assert.ok(updateStartedAt.length >= 31, "continuous updates stalled");
+    const elapsed = updateStartedAt[30] - updateStartedAt[0];
+    assert.ok(elapsed >= 450, `continuous updates ran too fast: ${elapsed} ms`);
+    assert.ok(
+      elapsed < 550,
+      `timer dispatch latency accumulated across updates: ${elapsed} ms`,
+    );
+  } finally {
+    receiver.onmessage({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+    await waitForMessage(messages, "terminated");
+  }
+});
+
 test("demand-driven guests idle until an external event wakes them", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

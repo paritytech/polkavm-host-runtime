@@ -73,6 +73,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let pendingGpuCapabilities = null;
   let timer;
   let startedAt = 0;
+  let legacyNextUpdateAt = 0;
   let updateCount = 0;
   const updateSamples = [];
   const activeMediatedInputHandles = new Set();
@@ -405,6 +406,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         }
       } else if (running) {
         startedAt += now - pausedAt;
+        legacyNextUpdateAt = now;
       }
       paused = next;
     }
@@ -414,9 +416,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
   }
 
-  function requestedUpdateDelay() {
+  function requestedUpdateDelay(completedAt) {
     if (!demandDriven) {
-      return LEGACY_FRAME_INTERVAL_MS;
+      legacyNextUpdateAt = Math.max(
+        legacyNextUpdateAt + LEGACY_FRAME_INTERVAL_MS,
+        completedAt,
+      );
+      return legacyNextUpdateAt - completedAt;
     }
     const delay = translated
       ? translated.updateAfterMilliseconds()
@@ -459,7 +465,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "terminated" });
       return;
     }
-    const elapsed = performance.now() - before;
+    const completedAt = performance.now();
+    const elapsed = completedAt - before;
     if (firstUpdate) {
       postMessage({ type: "startup", stage: "first-update-completed" });
     }
@@ -480,11 +487,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         updateMaxMs: sorted[sorted.length - 1],
       });
     }
-    const requestedDelay = requestedUpdateDelay();
+    const requestedDelay = requestedUpdateDelay(completedAt);
     if (requestedDelay !== null) {
-      scheduleTick(
-        demandDriven ? requestedDelay : Math.max(0, requestedDelay - elapsed),
-      );
+      scheduleTick(requestedDelay);
     }
   }
 
@@ -936,6 +941,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       : typeof pvm.polkavm_browser_uses_update_scheduling === "function" &&
         pvm.polkavm_browser_uses_update_scheduling() === 1;
     startedAt = performance.now();
+    legacyNextUpdateAt = startedAt;
     starting = false;
     if (paused) {
       pausedAt = startedAt;
