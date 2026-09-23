@@ -730,6 +730,10 @@
       return this.updateAfterMs;
     }
 
+    hasPendingContinuation() {
+      return !this.coreVm && this.resumePending;
+    }
+
     setPointerCaptureSupported(supported) {
       this.pointerCapture.supported = supported === true;
       if (!this.pointerCapture.supported) {

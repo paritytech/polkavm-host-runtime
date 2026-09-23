@@ -112,13 +112,43 @@ A guest that does not import this call retains Host-defined continuous
 scheduling for compatibility. Scheduling does not weaken per-update gas or
 Host-call budgets.
 
-A Host may suspend execution for its menu or while backgrounded. It MUST
-release held input before pausing, discard queued gameplay actions and audio,
-and prevent new gameplay presses from accumulating during the pause. Releases
-and viewport state may remain pending until the first resumed update. Paused
-execution does not process updates or external-event wakes. Execution-scoped
-monotonic time excludes the pause; wall time does not. Resume MUST NOT replay
-missed update ticks or buffered audio.
+A Host may hard-pause execution. It MUST release held input before pausing,
+discard queued gameplay actions and audio, and prevent new gameplay presses
+from accumulating. Releases and viewport state may remain pending until the
+first resumed update. Hard-paused execution does not process updates or
+external-event wakes. Execution-scoped monotonic time excludes the pause; wall
+time does not. Resume MUST NOT replay missed update ticks or buffered audio.
+
+The browser endpoint distinguishes this hard pause (`pause` / `pause-state`,
+with boolean `paused`) from presentation inactivity (`background` /
+`background-state`, with boolean `backgrounded`). A background request MAY carry
+a nonnegative safe-integer `seq`, echoed by its acknowledgment before resumed
+presentation. Both states are retained before and during startup, allowing
+initialization but withholding ordinary updates. Hard pause takes precedence.
+Overlapping inactive intervals freeze elapsed update time once, not once per
+reason, and both states discard gameplay input, motion, and audio.
+
+Background mode is **not simulation suspension**. Host-frame responses wake
+bounded service updates for legacy as well as demand-driven guests, without
+periodic background timers or honoring guest update-delay requests. Responses
+remain ordered in the existing bounded queue; rejection due to queue pressure
+is retryable and also wakes service work. A coalesced burst allows up to 32
+service updates, with up to 32 additional translated cooperative continuation
+slices per response wake; exhausted work waits for another external response
+or foreground resume rather than spinning indefinitely. Guests must poll their
+responses to make progress. Service updates may read real wall time, change
+guest state, submit saves, or perform external side effects. Hosts MUST NOT
+stop subscriptions, coalesce responses, or discard protocol/GPU work merely
+because presentation is inactive.
+
+The browser runtime retains the latest complete framebuffer for foreground
+resume, including idle guests. Tri2D retained-resource transitions MUST still
+be applied atomically and in order while inactive; a Host may hold only the
+latest completed offscreen presentation, not only the latest Tri2D byte stream.
+The same distinction applies to WebGPU command execution versus visible surface
+presentation. Hosts suppress clipboard/navigation interactions while inactive
+and retain current cursor/IME state for resume. Stopping MUST clear retained
+presentation so queued callbacks cannot replay stale output.
 
 ### Framebuffer presentation
 

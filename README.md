@@ -46,14 +46,35 @@ the runtime discards pending gameplay actions and audio while retaining input
 releases and viewport state for the next update.
 
 The browser endpoint accepts `{ type: "pause", paused: boolean }` and acknowledges
-every valid request with `{ type: "pause-state", paused: boolean }`. Hosts combine
-menu and background pause reasons before sending the effective state. Pause is
-retained before and during asynchronous startup: initialization completes, but
-the first update waits for resume. Resume queues at most one update, not missed
-frames. Paused input cannot wake execution, and stopping during compilation
-cannot bring the endpoint back to life. The worker and Wasm runtime must be
-rebuilt together: the interpreter uses `polkavm_browser_pause_input` to enforce
-the same queue boundary as the translated backend.
+every valid request with `{ type: "pause-state", paused: boolean }`. This is a hard
+pause: no updates or external-event wakes execute. Pause is retained before and
+during asynchronous startup: initialization completes, but updates wait for resume.
+
+For menu/visibility inactivity without interrupting host-response delivery, use
+`{ type: "background", backgrounded: boolean, seq?: number }`, acknowledged with
+`{ type: "background-state", backgrounded: boolean, seq?: number }`. An optional
+nonnegative safe-integer sequence is echoed before any resumed framebuffer.
+Hosts combine menu and visibility reasons before sending the effective state.
+Background mode freezes elapsed update time and discards gameplay input, motion,
+and audio, but services host responses with coalesced bounded update work for
+both legacy and demand-driven guests. Queue-full retries also wake servicing;
+there are no periodic background frames. Hard pause takes precedence, and
+overlapping inactive reasons exclude their combined duration exactly once.
+This is **not simulation suspension**: service updates execute guest code;
+wall-clock reads, host requests, saves, and other external side effects remain
+possible. Subscriptions are not interrupted or their responses coalesced.
+
+The runtime retains only the latest complete framebuffer while inactive and
+delivers it on resume, even if the guest is idle. Tri2D streams are not standalone
+snapshots: they include retained texture mutations. Hosts must apply every stream
+in order offscreen, retaining only the latest completed presentation for resume.
+GPU batches and protocol events likewise remain ordered and lossless; Hosts hide
+surface presentation rather than discard commands. Hosts also suppress inactive
+clipboard/navigation actions while retaining current cursor/IME state.
+Resume does not replay missed ticks or buffered audio, and stopping clears held
+presentation and cannot be reversed by queued work or asynchronous compilation.
+The worker and Wasm runtime must be rebuilt together: the interpreter uses
+`polkavm_browser_pause_input` to enforce the same input boundary as translation.
 
 Browser and native render passes accept registered texture views as offscreen
 color attachments; zero still selects the surface. Offscreen passes preserve

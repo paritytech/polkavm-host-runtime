@@ -204,6 +204,93 @@ function endpoint() {
   return { messages, receiver };
 }
 
+function controlledTicks(t) {
+  const ticks = [];
+  const timers = new Map();
+  let nextTimer = 0;
+  t.mock.method(globalThis, "MessageChannel", class {
+    constructor() {
+      this.port1 = { onmessage: null, close() { this.onmessage = null; } };
+      this.port2 = {
+        postMessage: () => ticks.push(() => this.port1.onmessage?.()),
+        close() {},
+      };
+    }
+  });
+  return {
+    ticks,
+    timers,
+    controlTimers() {
+      // Install after asynchronous Wasm startup; waitForMessage uses timers.
+      t.mock.method(globalThis, "setTimeout", (callback) => {
+        const id = ++nextTimer;
+        timers.set(id, callback);
+        return id;
+      });
+      t.mock.method(globalThis, "clearTimeout", (id) => timers.delete(id));
+    },
+    drain() {
+      let count = 0;
+      while (ticks.length) {
+        assert.ok(count++ < 100, "background work must become idle");
+        ticks.shift()();
+      }
+      return count;
+    },
+  };
+}
+
+function hostResponseEchoGuest(demandDriven = false, clockCalls = 0) {
+  // Tiny real Latest32 PolkaVM guest: init returns; each update polls one byte
+  // into rw_data (0x20000), then saves it. Distinct response bytes make ordering
+  // and loss observable through the same hostcalls on both execution backends.
+  const text = (value) => [...new TextEncoder().encode(value)];
+  const section = (id, bytes) => [id, bytes.length, ...bytes];
+  const imports = ["host_frame_poll", "host_save_submit"];
+  if (demandDriven) {
+    imports.push("host_update_after");
+  }
+  const clockImport = imports.length;
+  if (clockCalls) {
+    imports.push("host_time_ms");
+  }
+  const symbols = [];
+  const offsets = [];
+  for (const name of imports) {
+    offsets.push(symbols.length, 0, 0, 0);
+    symbols.push(...text(name));
+  }
+  const instructions = [
+    [50, 0], // init: ret
+    ...Array.from({ length: clockCalls }, () => [10, clockImport]),
+    [51, 7, 0, 0, 2], // update: a0 = 0x20000
+    [51, 8, 1], // a1 = capacity 1
+    [10], // host_frame_poll
+    [51, 7, 0, 0, 2], // a0 = saved response address
+    [51, 8, 1], // a1 = length 1
+    [10, 1], // host_save_submit
+    ...(demandDriven ? [[51, 7, 255], [10, 2]] : []), // idle
+    [50, 0], // ret
+  ];
+  const code = instructions.flat();
+  const bitmask = new Uint8Array(Math.ceil(code.length / 8));
+  let offset = 0;
+  for (const instruction of instructions) {
+    bitmask[offset >> 3] |= 1 << (offset & 7);
+    offset += instruction.length;
+  }
+  const bytes = new Uint8Array([
+    ...text("PVM\0"), 1, ...new Array(8).fill(0),
+    ...section(1, [0, 1, 0]), // ro_data, rw_data, stack sizes
+    ...section(4, [imports.length, ...offsets, ...symbols]),
+    ...section(5, [2, 0, 4, ...text("init"), 2, 6, ...text("update")]),
+    ...section(6, [0, 0, code.length, ...code, ...bitmask]),
+    0,
+  ]);
+  new DataView(bytes.buffer).setBigUint64(5, BigInt(bytes.length), true);
+  return bytes;
+}
+
 async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
@@ -679,6 +766,252 @@ test("both browser backends freeze time across startup pause and queued ticks", 
   }
 });
 
+test("background servicing preserves ordered bursts and retry backpressure without periodic work", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  for (const forceInterpreter of [false, true]) {
+    for (const demandDriven of [false, true]) {
+      await t.test(`${forceInterpreter ? "interpreter" : "compiler"} ${demandDriven ? "demand" : "legacy"}`, async (t) => {
+        const scheduling = controlledTicks(t);
+        const { messages, receiver } = endpoint();
+        const send = (data) => receiver.onmessage({ data });
+        try {
+          send({
+            type: "start", runtime: bytesBuffer(runtime),
+            program: bytesBuffer(hostResponseEchoGuest(demandDriven)),
+            assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+            cacheKey: `background-echo-${forceInterpreter}-${demandDriven}`, forceInterpreter,
+          });
+          const ready = await waitForMessage(messages, "ready");
+          assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+          assert.equal(ready.usesUpdateScheduling, demandDriven);
+          scheduling.controlTimers();
+          // These responses and the already posted first tick precede the
+          // background transition; neither may be forgotten at that boundary.
+          for (let seq = 0; seq < 33; seq++) {
+            send({ type: "host-frame-response", seq, bytes: new Uint8Array([seq + 1]) });
+          }
+          assert.deepEqual(messages.findLast((message) => message.type === "host-frame-response-rejected"), {
+            type: "host-frame-response-rejected", seq: 32, reason: "queue-full",
+          });
+          send({ type: "background", backgrounded: true, seq: 7 });
+          assert.equal(scheduling.ticks.length, 1, "bursts share one pending MessageChannel task");
+          assert.equal(scheduling.drain(), 32);
+          assert.deepEqual(messages.filter((message) => message.type === "save").map((message) => message.bytes[0]),
+            Array.from({ length: 32 }, (_, index) => index + 1));
+          assert.equal(scheduling.timers.size, 0, "legacy cadence and requested delays cannot spin in background");
+          for (let seq = 32; seq < 70; seq++) {
+            send({ type: "host-frame-response", seq, bytes: new Uint8Array([seq + 1]) });
+            assert.deepEqual(messages.at(-1), { type: "host-frame-response-accepted", seq });
+            assert.equal(scheduling.drain(), 1, "one response buys one service update, not a full burst");
+          }
+          assert.deepEqual(messages.filter((message) => message.type === "save").map((message) => message.bytes[0]),
+            Array.from({ length: 70 }, (_, index) => index + 1));
+          send({ type: "input", bytes: new Uint8Array([1, 4, 0, 0, 0, 0, 0, 0]) });
+          send({ type: "motion", bytes: motionSample() });
+          send({ type: "background", backgrounded: true, seq: 8 });
+          assert.equal(scheduling.ticks.length, 0);
+          assert.equal(scheduling.timers.size, 0);
+          send({ type: "pause", paused: true });
+          send({ type: "host-frame-response", seq: 70, bytes: new Uint8Array([71]) });
+          assert.equal(scheduling.ticks.length, 0, "hard pause takes precedence over response wakes");
+          send({ type: "pause", paused: false });
+          assert.equal(scheduling.drain(), 1);
+          assert.equal(messages.findLast((message) => message.type === "save").bytes[0], 71);
+          send({ type: "background", backgrounded: false, seq: 9 });
+          assert.deepEqual(messages.at(-1), { type: "background-state", backgrounded: false, seq: 9 });
+          scheduling.ticks.shift()();
+          assert.equal(scheduling.timers.size, demandDriven ? 0 : 1, "foreground cadence returns");
+        } finally {
+          receiver.onmessage?.({ data: { type: "stop" } });
+        }
+      });
+    }
+  }
+});
+
+test("background and hard pause freeze their combined interval across startup and queued ticks", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(repositoryRoot,
+    "rust/crates/polkavm-host-runtime/tests/fixtures/clock-u64.polkavm"));
+  for (const forceInterpreter of [false, true]) {
+    await t.test(forceInterpreter ? "interpreter" : "compiler", async (t) => {
+      let now = 100;
+      t.mock.method(performance, "now", () => now);
+      const scheduling = controlledTicks(t);
+      const { messages, receiver } = endpoint();
+      const send = (data) => receiver.onmessage({ data });
+      const guestTimes = () => messages.filter((message) => message.type === "save").map(({ bytes }) =>
+        new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, true));
+      try {
+        send({ type: "background", backgrounded: true });
+        send({
+          type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+          cacheKey: `background-clock-${forceInterpreter}`, forceInterpreter,
+        });
+        // This transition happens while asynchronous startup is in progress.
+        send({ type: "pause", paused: true });
+        await waitForMessage(messages, "ready");
+        scheduling.controlTimers();
+        assert.equal(scheduling.ticks.length, 0);
+        now = 10_000;
+        send({ type: "host-frame-response", bytes: new Uint8Array([1]) });
+        send({ type: "pause", paused: false });
+        scheduling.drain();
+        assert.deepEqual(guestTimes(), [0n], "background startup time is frozen during service");
+        now = 20_000;
+        send({ type: "pause", paused: true });
+        send({ type: "background", backgrounded: false });
+        send({ type: "host-frame-response", bytes: new Uint8Array([2]) });
+        assert.equal(scheduling.ticks.length, 0, "leaving background does not bypass hard pause");
+        now = 30_000;
+        send({ type: "pause", paused: false });
+        scheduling.ticks.shift()();
+        assert.deepEqual(guestTimes(), [0n, 0n], "overlapping inactivity is excluded exactly once");
+        now = 30_017;
+        const [id, callback] = scheduling.timers.entries().next().value;
+        scheduling.timers.delete(id);
+        callback();
+        send({ type: "background", backgrounded: true });
+        scheduling.drain();
+        assert.deepEqual(guestTimes(), [0n, 0n], "a late foreground tick must not execute in idle background");
+        now = 130_017;
+        send({ type: "host-frame-response", bytes: new Uint8Array([3]) });
+        scheduling.drain();
+        assert.deepEqual(guestTimes(), [0n, 0n, 17n]);
+        now = 230_017;
+        send({ type: "background", backgrounded: false });
+        scheduling.ticks.shift()();
+        assert.deepEqual(guestTimes(), [0n, 0n, 17n, 17n]);
+      } finally {
+        receiver.onmessage?.({ data: { type: "stop" } });
+      }
+    });
+  }
+});
+
+test("background framebuffer retention resumes once after acknowledgment and never after stop", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(repositoryRoot,
+    "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm"));
+  for (const forceInterpreter of [false, true]) {
+    await t.test(forceInterpreter ? "interpreter" : "compiler", async (t) => {
+      const scheduling = controlledTicks(t);
+      const { messages, receiver } = endpoint();
+      const send = (data) => receiver.onmessage({ data });
+      try {
+        send({ type: "background", backgrounded: true, seq: 1 });
+        send({
+          type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+          cacheKey: `background-frame-${forceInterpreter}`, forceInterpreter,
+        });
+        await waitForMessage(messages, "ready");
+        scheduling.controlTimers();
+        for (let seq = 0; seq < 3; seq++) {
+          send({ type: "host-frame-response", seq, bytes: new Uint8Array([seq]) });
+          scheduling.drain();
+        }
+        assert.equal(messages.some((message) => message.type === "frame"), false);
+        const start = messages.length;
+        send({ type: "background", backgrounded: false, seq: 2 });
+        assert.deepEqual(messages.slice(start).map((message) => message.type), ["background-state", "frame"]);
+        assert.equal(messages.at(-2).seq, 2);
+        assert.equal(messages.at(-1).pixels.byteLength, messages.at(-1).width * messages.at(-1).height * 4);
+        send({ type: "background", backgrounded: false, seq: 3 });
+        assert.equal(messages.filter((message) => message.type === "frame").length, 1,
+          "resume immediately delivers only the latest frame, without requiring another guest update");
+        send({ type: "background", backgrounded: true, seq: 4 });
+        send({ type: "host-frame-response", bytes: new Uint8Array([4]) });
+        scheduling.drain();
+        const staleHandler = receiver.onmessage;
+        send({ type: "stop" });
+        const stoppedAt = messages.length;
+        staleHandler({ data: { type: "background", backgrounded: false, seq: 5 } });
+        scheduling.drain();
+        assert.equal(messages.length, stoppedAt, "stale handlers and queued ticks cannot replay a stopped frame");
+      } finally {
+        receiver.onmessage?.({ data: { type: "stop" } });
+      }
+    });
+  }
+});
+
+test("translated background continuations complete bounded hostcall slices without idle spinning", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  for (const clockCalls of [0, 40]) {
+    await t.test(clockCalls ? "bounded long continuation" : "complete service continuation", async (t) => {
+      // Lower the real hostcall slice budget, not the execution path. The real
+      // translated guest resumes through pvm_resume and emits real save data.
+      globalThis.TranslatedPolkaVmRuntime = class extends Runtime {
+        constructor(...args) {
+          super(...args);
+          const exports = this.pvm;
+          this.pvm = {
+            ...exports,
+            pvm_begin: (...args) => {
+              this.hostcalls = 1;
+              return exports.pvm_begin(...args);
+            },
+            pvm_resume: () => {
+              this.hostcalls = 1;
+              return exports.pvm_resume();
+            },
+          };
+        }
+      };
+      const scheduling = controlledTicks(t);
+      const { messages, receiver } = endpoint();
+      const send = (data) => receiver.onmessage({ data });
+      try {
+        send({ type: "background", backgrounded: true });
+        send({
+          type: "start", runtime: bytesBuffer(runtime),
+          program: bytesBuffer(hostResponseEchoGuest(true, clockCalls)),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+          cacheKey: `background-continuation-${clockCalls}`,
+        });
+        assert.equal((await waitForMessage(messages, "ready")).backend, "compiler");
+        scheduling.controlTimers();
+        send({ type: "host-frame-response", bytes: new Uint8Array([41]) });
+        const ticks = scheduling.drain();
+        if (clockCalls) {
+          assert.equal(ticks, 32, "a pathological continuation must eventually yield to external work");
+          assert.equal(messages.some((message) => message.type === "save"), false);
+          send({ type: "pause", paused: true });
+          send({ type: "host-frame-response", bytes: new Uint8Array([42]) });
+          assert.equal(scheduling.ticks.length, 0);
+          send({ type: "pause", paused: false });
+          scheduling.drain();
+        } else {
+          assert.equal(ticks, 4, "one credit must finish poll, save and idle hostcall continuations");
+        }
+        assert.deepEqual(messages.filter((message) => message.type === "save").map((message) => message.bytes[0]), [41]);
+        assert.equal(scheduling.timers.size, 0);
+        assert.equal(scheduling.ticks.length, 0);
+      } finally {
+        receiver.onmessage?.({ data: { type: "stop" } });
+        globalThis.TranslatedPolkaVmRuntime = Runtime;
+      }
+    });
+  }
+});
+
+test("background state rejects malformed booleans and sequences", () => {
+  for (const message of [
+    { type: "background", backgrounded: 1 },
+    { type: "background", backgrounded: true, seq: -1 },
+    { type: "background", backgrounded: true, seq: 1.5 },
+    { type: "background", backgrounded: true, seq: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    const { messages, receiver } = endpoint();
+    receiver.onmessage({ data: message });
+    assert.equal(receiver.onmessage, null);
+    assert.deepEqual(messages.map((message) => message.type), ["error", "terminated"]);
+  }
+});
+
 test("stopping during asynchronous compilation cannot restart the endpoint", async (t) => {
   const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
   const program = await readFile(resolve(
@@ -707,6 +1040,7 @@ test("stopping during asynchronous compilation cannot restart the endpoint", asy
   } });
   await compiling;
   receiver.onmessage({ data: { type: "pause", paused: true } });
+  receiver.onmessage({ data: { type: "background", backgrounded: true } });
   receiver.onmessage({ data: { type: "stop" } });
   release();
   await compiled;
