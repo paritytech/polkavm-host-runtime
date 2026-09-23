@@ -400,6 +400,15 @@ pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
     })
 }
 
+/// Number of accepted responses still waiting for the guest to poll them.
+#[no_mangle]
+pub extern "C" fn polkavm_browser_pending_host_frame_responses() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => runtime.pending_host_frame_responses() as u32,
+        _ => 0,
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_mediated_input_kinds() -> u32 {
     status(|host| {

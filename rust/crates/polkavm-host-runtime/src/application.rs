@@ -357,6 +357,14 @@ impl ApplicationRuntime {
         result
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        match self {
+            Self::Cooperative(runtime) => runtime.pending_host_frame_responses(),
+            Self::CoreVm(runtime) => runtime.vm.pending_host_frame_responses(),
+        }
+    }
+
     pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_mediated_input_kinds(kinds),

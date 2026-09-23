@@ -734,6 +734,10 @@
       return !this.coreVm && this.resumePending;
     }
 
+    pendingHostFrameResponses() {
+      return this.hostFrameResponses.length;
+    }
+
     setPointerCaptureSupported(supported) {
       this.pointerCapture.supported = supported === true;
       if (!this.pointerCapture.supported) {
@@ -2685,13 +2689,19 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     postMessage({ type: "pointer-capture", capture: request });
   }
 
+  function pendingHostFrameResponses() {
+    return translated
+      ? translated.pendingHostFrameResponses()
+      : pvm.polkavm_browser_pending_host_frame_responses();
+  }
+
   function hasBackgroundWork() {
     // Only cooperative hostcall-budget yields are continuations. CoreVM's
     // frame yield is an update boundary, never a reason for an idle spin.
     if (translated?.hasPendingContinuation()) {
       return backgroundContinuationTicks > 0;
     }
-    return backgroundServiceTicks > 0;
+    return backgroundServiceTicks > 0 && pendingHostFrameResponses() > 0;
   }
 
   function scheduleTick(delayMs) {
@@ -2791,6 +2801,12 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       ? { type: "pause-state", paused }
       : { type: "background-state", backgrounded, ...(seq === undefined ? {} : { seq }) });
     if (changed && running && !paused) {
+      if (backgrounded) {
+        // Foreground updates need not poll. Recover actual queued work rather
+        // than assuming an update consumed the response that woke it.
+        backgroundServiceTicks = pendingHostFrameResponses();
+        backgroundContinuationTicks = MAX_BACKGROUND_CONTINUATION_TICKS;
+      }
       if (!backgrounded && pendingFrame !== null) {
         const { output, transfers } = pendingFrame;
         pendingFrame = null;

@@ -734,6 +734,10 @@
       return !this.coreVm && this.resumePending;
     }
 
+    pendingHostFrameResponses() {
+      return this.hostFrameResponses.length;
+    }
+
     setPointerCaptureSupported(supported) {
       this.pointerCapture.supported = supported === true;
       if (!this.pointerCapture.supported) {

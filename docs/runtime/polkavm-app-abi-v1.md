@@ -146,9 +146,11 @@ resume, including idle guests. Tri2D retained-resource transitions MUST still
 be applied atomically and in order while inactive; a Host may hold only the
 latest completed offscreen presentation, not only the latest Tri2D byte stream.
 The same distinction applies to WebGPU command execution versus visible surface
-presentation. Hosts suppress clipboard/navigation interactions while inactive
-and retain current cursor/IME state for resume. Stopping MUST clear retained
-presentation so queued callbacks cannot replay stale output.
+presentation; already submitted GPU work may complete at the transition.
+Hosts suppress clipboard/navigation interactions, defer pointer-capture
+acquisition, cancel new mediated-input prompts while inactive, and retain
+current cursor/IME state for resume. Stopping MUST clear retained presentation
+so queued callbacks cannot replay stale output.
 
 ### Framebuffer presentation
 

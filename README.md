@@ -68,13 +68,17 @@ The runtime retains only the latest complete framebuffer while inactive and
 delivers it on resume, even if the guest is idle. Tri2D streams are not standalone
 snapshots: they include retained texture mutations. Hosts must apply every stream
 in order offscreen, retaining only the latest completed presentation for resume.
-GPU batches and protocol events likewise remain ordered and lossless; Hosts hide
-surface presentation rather than discard commands. Hosts also suppress inactive
-clipboard/navigation actions while retaining current cursor/IME state.
+GPU batches and protocol events likewise remain ordered and lossless; Hosts
+suppress new surface presentation rather than discard commands. Already
+submitted GPU work may complete at the transition. Hosts also suppress inactive
+clipboard/navigation actions, defer pointer-capture acquisition, and cancel
+new mediated-input prompts while retaining current cursor/IME state.
 Resume does not replay missed ticks or buffered audio, and stopping clears held
 presentation and cannot be reversed by queued work or asynchronous compilation.
-The worker and Wasm runtime must be rebuilt together: the interpreter uses
-`polkavm_browser_pause_input` to enforce the same input boundary as translation.
+The worker and Wasm runtime must be rebuilt together:
+`polkavm_browser_pause_input` enforces the same input boundary as translation,
+and `polkavm_browser_pending_host_frame_responses` reports actual queued work
+when entering background mode instead of assuming foreground updates polled it.
 
 Browser and native render passes accept registered texture views as offscreen
 color attachments; zero still selects the surface. Offscreen passes preserve

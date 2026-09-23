@@ -874,15 +874,19 @@ test("background and hard pause freeze their combined interval across startup an
         callback();
         send({ type: "background", backgrounded: true });
         scheduling.drain();
-        assert.deepEqual(guestTimes(), [0n, 0n], "a late foreground tick must not execute in idle background");
+        // This clock guest deliberately never polls its responses. Foreground
+        // ticks must not erase the actual queued work at the next transition.
+        assert.deepEqual(guestTimes(), [0n, 0n, 17n, 17n]);
+        assert.equal(scheduling.ticks.length, 0, "unpolled work gets bounded opportunities, not a spin");
+        assert.equal(scheduling.timers.size, 0);
         now = 130_017;
         send({ type: "host-frame-response", bytes: new Uint8Array([3]) });
         scheduling.drain();
-        assert.deepEqual(guestTimes(), [0n, 0n, 17n]);
+        assert.deepEqual(guestTimes(), [0n, 0n, 17n, 17n, 17n]);
         now = 230_017;
         send({ type: "background", backgrounded: false });
         scheduling.ticks.shift()();
-        assert.deepEqual(guestTimes(), [0n, 0n, 17n, 17n]);
+        assert.deepEqual(guestTimes(), [0n, 0n, 17n, 17n, 17n, 17n]);
       } finally {
         receiver.onmessage?.({ data: { type: "stop" } });
       }

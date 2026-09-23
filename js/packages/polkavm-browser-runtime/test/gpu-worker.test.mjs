@@ -516,6 +516,37 @@ test("background batches retain resources, readbacks and ordered completion with
   }
 });
 
+test("non-surface background work preserves a snapshot but discarded surface contents never resume", async () => {
+  const { engine, visibleFrames } = backgroundEngine();
+  const capture = captureMessages();
+  try {
+    engine.setBackground(true);
+    const greenSurface = renderPass(0);
+    new DataView(greenSurface[0][1].buffer).setFloat32(20, 1, true);
+    engine.submit(commands(greenSurface));
+    engine.submit(commands(offscreenTextureCommands(), 2n));
+    engine.setBackground(false);
+    await engine.queue;
+    assert.deepEqual(visibleFrames.map(frame => frame.pixel), [[0, 255, 0, 255]]);
+    engine.setBackground(true);
+    engine.submit(commands(renderPass(0, 0), 3n));
+    engine.setBackground(false);
+    await engine.queue;
+    assert.deepEqual(visibleFrames.map(frame => frame.pixel), [[0, 255, 0, 255]],
+      "discarded surface contents must not replace the last visible frame");
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "event").map(message => [
+        eventType(message.bytes),
+        new DataView(message.bytes.buffer).getBigUint64(16, true),
+      ]),
+      [[5, 1n], [5, 2n], [5, 3n]],
+    );
+  } finally {
+    capture.restore();
+    engine.stop();
+  }
+});
+
 test("background targets follow resize and are released on reset and stop", async () => {
   const { engine, textures, visibleFrames } = backgroundEngine();
   engine.setBackground(true);
