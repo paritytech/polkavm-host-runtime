@@ -20,6 +20,8 @@ pub struct AppDescriptor {
     pub audio_enabled: bool,
     /// Required device-input features.
     pub input_features: Vec<String>,
+    /// Display-only control help, not an input mapping.
+    pub controls: Vec<String>,
     /// Required WebGPU limits, empty for other profiles.
     pub gpu_limits: BTreeMap<String, u64>,
 }
@@ -73,6 +75,8 @@ struct DeviceInput {
     abi_version: u32,
     #[serde(rename = "requiredFeatures", default)]
     required_features: Vec<String>,
+    #[serde(default)]
+    controls: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +149,7 @@ impl AppDescriptor {
         } else if !gpu_limits.is_empty() {
             bail!("non-WebGPU graphics profile declares required limits");
         }
-        let input_features = if let Some(input) = manifest.capabilities.device_input {
+        let (input_features, controls) = if let Some(input) = manifest.capabilities.device_input {
             if input.abi_version != 1 {
                 bail!("device input capability must use ABI version 1");
             }
@@ -158,9 +162,16 @@ impl AppDescriptor {
                     bail!("unsupported device input feature {feature}");
                 }
             }
-            input.required_features
+            if input.controls.len() > 32
+                || input.controls.iter().any(|control| {
+                    control.is_empty() || control.len() > 160 || control.trim() != control
+                })
+            {
+                bail!("device input controls must contain at most 32 nonempty trimmed strings of at most 160 UTF-8 bytes");
+            }
+            (input.required_features, input.controls)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let audio_enabled = if let Some(audio) = manifest.capabilities.audio {
             if audio.abi_version != 1 || !audio.required_features.is_empty() {
@@ -176,6 +187,7 @@ impl AppDescriptor {
             presentation,
             audio_enabled,
             input_features,
+            controls,
             gpu_limits,
         })
     }
@@ -223,6 +235,41 @@ mod tests {
     fn accepts_required_camera_ur_input() {
         let descriptor = AppDescriptor::parse_exact(CAMERA_UR, CAMERA_UR).unwrap();
         assert_eq!(descriptor.input_features, ["keyboard", "camera-ur"]);
+    }
+
+    #[test]
+    fn accepts_bounded_display_controls_without_changing_required_features() {
+        let mut manifest: serde_json::Value = serde_json::from_slice(FRAMEBUFFER).unwrap();
+        manifest["capabilities"]["deviceInput"]["controls"] =
+            serde_json::json!(vec!["é".repeat(80); 32]);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let descriptor = AppDescriptor::parse_exact(&bytes, &bytes).unwrap();
+        assert_eq!(descriptor.controls, vec!["é".repeat(80); 32]);
+        assert_eq!(descriptor.input_features, ["pointer", "keyboard"]);
+    }
+
+    #[test]
+    fn rejects_malformed_control_help() {
+        for controls in [
+            serde_json::json!(null),
+            serde_json::json!("Arrow keys: move"),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!(["   "]),
+            serde_json::json!([" Move"]),
+            serde_json::json!(["Move\n"]),
+            serde_json::json!(["é".repeat(81)]),
+            serde_json::json!(vec!["Move"; 33]),
+        ] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(FRAMEBUFFER).unwrap();
+            manifest["capabilities"]["deviceInput"]["controls"] = controls;
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            assert!(AppDescriptor::parse_exact(&bytes, &bytes).is_err());
+        }
+        let mut manifest: serde_json::Value = serde_json::from_slice(FRAMEBUFFER).unwrap();
+        manifest["capabilities"]["deviceInput"]["bindings"] = serde_json::json!([]);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(AppDescriptor::parse_exact(&bytes, &bytes).is_err());
     }
 
     #[test]

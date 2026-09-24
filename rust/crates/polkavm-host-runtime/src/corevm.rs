@@ -13,8 +13,6 @@ use polkavm::{
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 
 struct File {
     blob: Vec<u8>,
@@ -69,10 +67,7 @@ pub struct Vm {
     motion: crate::MotionState,
     pointer_capture: crate::PointerCaptureState,
     update_after_ms: Option<u32>,
-    #[cfg(not(target_arch = "wasm32"))]
-    started: Instant,
-    #[cfg(target_arch = "wasm32")]
-    now_ms: u64,
+    clock: crate::HostClock,
     host_frame_requests: VecDeque<Vec<u8>>,
     host_frame_request_bytes: usize,
     host_frame_responses: VecDeque<Vec<u8>>,
@@ -508,10 +503,7 @@ impl Vm {
             motion: crate::MotionState::new(),
             pointer_capture: crate::PointerCaptureState::default(),
             update_after_ms: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            started: Instant::now(),
-            #[cfg(target_arch = "wasm32")]
-            now_ms: 0,
+            clock: crate::HostClock::new(),
             host_frame_requests: VecDeque::new(),
             host_frame_request_bytes: 0,
             host_frame_responses: VecDeque::new(),
@@ -545,18 +537,27 @@ impl Vm {
 
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
-        self.now_ms = self.now_ms.max(time_ms);
+        self.clock.set_time_ms(time_ms);
     }
 
     fn time_ms(&self) -> u64 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.now_ms
-        }
+        self.clock.elapsed_ms()
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.clock.set_paused(paused);
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.started.elapsed().as_millis() as u64
-        }
+        self.computer.set_paused(paused);
+    }
+
+    pub(crate) fn pause_input(&mut self) {
+        self.input_events.retain(|event| {
+            event.value == 0
+                && event.key != crate::quake_keys::MOUSE_X
+                && event.key != crate::quake_keys::MOUSE_Y
+        });
+        self.epoca_input_events.retain(crate::input_survives_pause);
+        self.motion.consume();
     }
 
     pub fn set_motion_availability(
@@ -567,6 +568,9 @@ impl Vm {
     }
 
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.clock.paused {
+            return Ok(());
+        }
         self.motion
             .set_sample(bytes)
             .map_err(|error| error.to_string())
@@ -644,6 +648,11 @@ impl Vm {
         self.host_frame_response_bytes += bytes.len();
         self.host_frame_responses.push_back(bytes);
         Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        self.host_frame_responses.len()
     }
 
     pub(crate) fn clear_host_frame_queues(&mut self) {

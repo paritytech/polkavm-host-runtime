@@ -52,6 +52,8 @@
   const MAX_CORE_RANDOM_BYTES = 4 * 1024;
   const MAX_LOG_BYTES = 4 * 1024;
   const MAX_SAVE_BYTES = 1024 * 1024;
+  const MAX_RANDOM_BYTES_PER_CALL = 4 * 1024;
+  const RANDOM_BYTES_PER_EXECUTION = 64 * 1024;
   const MAX_AUDIO_SAMPLES = 48000 * 2;
   const MAX_FRAME_BYTES = 16 * 1024 * 1024;
   const MAX_TRI2D_BYTES = 8 * 1024 * 1024;
@@ -133,6 +135,20 @@
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const strictDecoder = new TextDecoder("utf-8", { fatal: true });
+
+  function executionRandomBytes() {
+    const bytes = new Uint8Array(RANDOM_BYTES_PER_EXECUTION);
+    const browserCrypto = globalThis.crypto;
+    if (typeof browserCrypto?.getRandomValues !== "function") {
+      return new Uint8Array();
+    }
+    try {
+      browserCrypto.getRandomValues(bytes);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  }
 
   function isWebGpuProfile(profile) {
     return profile === "webgpu-raster" || profile === "webgpu";
@@ -655,6 +671,8 @@
         request: null,
       };
       this.timeMs = null;
+      this.randomBytes = executionRandomBytes();
+      this.randomOffset = 0;
       this.updateAfterMs = null;
       this.clockStartedAt = performance.now();
       this.hostcalls = 0;
@@ -683,15 +701,16 @@
       }
     }
 
-    initialize() {
-      this.#resetBudget(MAX_HOSTCALLS_PER_INIT);
+    initialize(maxGas = this.maxGas) {
+      const gas = BigInt(maxGas);
+      this.#resetBudget(MAX_HOSTCALLS_PER_INIT, gas);
       if (this.coreVm) {
         this.#setupCoreVm();
         return;
       }
       const init = this.exports.get("init");
       if (init !== undefined) {
-        this.#run(init, false);
+        this.#run(init, false, gas);
       }
     }
 
@@ -709,6 +728,14 @@
 
     updateAfterMilliseconds() {
       return this.updateAfterMs;
+    }
+
+    hasPendingContinuation() {
+      return !this.coreVm && this.resumePending;
+    }
+
+    pendingHostFrameResponses() {
+      return this.hostFrameResponses.length;
     }
 
     setPointerCaptureSupported(supported) {
@@ -786,6 +813,21 @@
         throw new Error("translated PolkaVM guest has no update export");
       }
       this.#run(update, false);
+    }
+
+    pauseInput() {
+      const survivesPause = (record) =>
+        record[0] === 2 || record[0] === 4 || record[0] === 7 ||
+        record[0] === 12 || record[0] === 16 || record[0] === 17 ||
+        record[0] === 20 || record[0] === 21 ||
+        ((record[0] === 13 || record[0] === 15) && record[1] === 0);
+      this.input = this.input.filter(survivesPause);
+      this.epocaInput = this.epocaInput.filter(survivesPause);
+      this.coreInput = this.coreInput.filter(
+        ([key, value]) => value === 0 && key !== 0xa3 && key !== 0xa4,
+      );
+      this.pointer = null;
+      this.motionSample = null;
     }
 
     sendInput(bytes) {
@@ -1126,6 +1168,7 @@
       this.stopped = true;
       this.input.length = 0;
       this.coreInput.length = 0;
+      this.epocaInput.length = 0;
       this.hostFrameRequests = 0;
       this.hostFrameRequestBytes = 0;
       this.gpuEvents.length = 0;
@@ -1135,14 +1178,14 @@
       this.activeMediatedInputHandle = null;
     }
 
-    #resetBudget(hostcalls) {
+    #resetBudget(hostcalls, gas = this.maxGas) {
       this.hostcalls = hostcalls;
       this.hostcallBytes = MAX_HOSTCALL_BYTES;
       this.tri2dSubmitted = false;
-      this.pvm.pvm_set_gas(this.maxGas);
+      this.pvm.pvm_set_gas(gas);
     }
 
-    #run(entry, yieldOnFrame) {
+    #run(entry, yieldOnFrame, gas = this.maxGas) {
       let status;
       if (this.resumePending) {
         this.resumePending = false;
@@ -1151,7 +1194,7 @@
         if (entry === undefined) {
           throw new Error("translated PolkaVM entrypoint is missing");
         }
-        status = this.pvm.pvm_begin(entry, this.maxGas);
+        status = this.pvm.pvm_begin(entry, gas);
       }
       for (;;) {
         if (status === STATUS_FINISHED) {
@@ -1654,6 +1697,26 @@
         case "host_time_ms": {
           const timeMs = this.timeMs ?? performance.now() - this.clockStartedAt;
           this.#setU64Result(BigInt(Math.max(0, Math.trunc(timeMs))));
+          return false;
+        }
+        case "host_random_fill": {
+          const length = this.#u32(a1);
+          const end = this.randomOffset + length;
+          if (
+            !length ||
+            length > MAX_RANDOM_BYTES_PER_CALL ||
+            end > this.randomBytes.byteLength
+          ) {
+            this.#setReg(7, 1n);
+            return false;
+          }
+          this.#chargeBytes(length);
+          this.#write(
+            this.#u32(a0),
+            this.randomBytes.subarray(this.randomOffset, end),
+          );
+          this.randomOffset = end;
+          this.#setReg(7, 0n);
           return false;
         }
         case "host_sleep_ms":

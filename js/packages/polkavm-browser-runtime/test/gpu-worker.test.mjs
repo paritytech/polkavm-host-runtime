@@ -21,7 +21,9 @@ const context = vm.createContext({
   setTimeout(callback) {
     queueMicrotask(callback);
   },
-  GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01 },
+  GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01, COPY_DST: 0x02 },
+  GPUBufferUsage: { COPY_DST: 0x08, MAP_READ: 0x01 },
+  GPUMapMode: { READ: 0x01 },
 });
 vm.runInContext(
   `${source}\nglobalThis.gpuWorkerTest = { GpuEngine, parseCommand, parseCommands };`,
@@ -354,6 +356,298 @@ test("renders to a new texture without acquiring the surface and reuses it in a 
   assert.equal(attachments[2].loadOp, "clear");
   assert.equal(attachments[3].view, surfaceView);
   assert.equal(attachments[3].loadOp, "load");
+});
+
+function backgroundEngine() {
+  const textures = [];
+  const visibleFrames = [];
+  const canvas = {};
+  const makeTexture = descriptor => {
+    const texture = {
+      descriptor,
+      destroyed: false,
+      pixel: [0, 0, 0, 0],
+      createView() {
+        assert.equal(this.destroyed, false, "attachments must remain live");
+        return { texture: this };
+      },
+      destroy() { this.destroyed = true; },
+    };
+    return texture;
+  };
+  const device = {
+    addEventListener() {},
+    lost: new Promise(() => {}),
+    destroy() {},
+    pushErrorScope() {},
+    popErrorScope: async () => null,
+    createTexture(descriptor) {
+      const texture = makeTexture(descriptor);
+      textures.push(texture);
+      return texture;
+    },
+    createBuffer({ size }) {
+      const bytes = new Uint8Array(size);
+      return {
+        bytes,
+        mapAsync: async () => {},
+        getMappedRange: () => bytes.buffer,
+        unmap() {},
+        destroy() {},
+      };
+    },
+    createCommandEncoder() {
+      const operations = [];
+      return {
+        beginRenderPass({ colorAttachments: [attachment] }) {
+          operations.push(() => {
+            const texture = attachment.view.texture;
+            assert.equal(texture.destroyed, false);
+            if (attachment.loadOp === "clear") {
+              const { r, g, b, a } = attachment.clearValue;
+              texture.pixel = [r, g, b, a].map(value => Math.round(value * 255));
+            }
+          });
+          return { end() {} };
+        },
+        copyTextureToBuffer({ texture }, { buffer, offset }) {
+          operations.push(() => buffer.bytes.set(texture.pixel, offset));
+        },
+        copyTextureToTexture({ texture: source }, { texture: destination }) {
+          operations.push(() => {
+            assert.equal(source.destroyed, false);
+            destination.pixel = [...source.pixel];
+          });
+        },
+        finish: () => operations,
+      };
+    },
+    queue: {
+      submit(batches) {
+        for (const operations of batches) {
+          for (const operation of operations) operation();
+        }
+      },
+    },
+  };
+  const engine = new GpuEngine(
+    canvas,
+    device,
+    {
+      configure() {},
+      getCurrentTexture() {
+        const texture = makeTexture({ size: [canvas.width, canvas.height, 1] });
+        visibleFrames.push(texture);
+        return texture;
+      },
+    },
+    "rgba8unorm",
+    validationEngine().limits,
+    { physicalWidth: 64, physicalHeight: 64, logicalWidth: 64, logicalHeight: 64, scale: 1 },
+    true,
+    false,
+    {},
+  );
+  return { engine, textures, visibleFrames };
+}
+
+test("background batches retain resources, readbacks and ordered completion without presenting", async () => {
+  const { engine, textures, visibleFrames } = backgroundEngine();
+  const capture = captureMessages();
+  try {
+    engine.setBackground(true);
+    engine.submit(commands([
+      ...offscreenTextureCommands(),
+      ...renderPass(handle(2)),
+      ...renderPass(0),
+    ]));
+    const greenSurface = renderPass(0);
+    new DataView(greenSurface[0][1].buffer).setFloat32(20, 1, true);
+    engine.submit(commands([
+      ...renderPass(handle(2), 3),
+      ...greenSurface,
+    ], 2n));
+    await engine.queue;
+
+    assert.equal(visibleFrames.length, 0, "hidden work must not acquire a swapchain texture");
+    assert.equal(textures.length, 2, "one guest texture and one reused background surface");
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "event").map(message => [
+        eventType(message.bytes),
+        new DataView(message.bytes.buffer).getBigUint64(16, true),
+      ]),
+      [[5, 1n], [5, 2n]],
+      "both batches finish in order without rejection",
+    );
+    const readbacks = capture.messages.filter(message => message.type === "test-readback");
+    assert.equal(readbacks.length, 2);
+    assert.deepEqual(
+      readbacks.map(message => Array.from(message.samples, sample => Array.from(sample))),
+      [
+        [[0, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255]],
+        [[0, 255, 0, 255], [0, 255, 0, 255], [0, 255, 0, 255]],
+      ],
+    );
+    assert.equal(capture.messages.some(message => message.type === "presented"), false);
+
+    engine.setBackground(false);
+    await engine.queue;
+    assert.equal(visibleFrames.length, 1, "idle guests resume without a new batch");
+    assert.deepEqual(visibleFrames[0].pixel, [0, 255, 0, 255], "resume copies the latest hidden frame");
+    assert.equal(capture.messages.filter(message => message.type === "event").length, 2);
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "presented").map(message => message.sequence),
+      [2],
+      "the resume copy signals a real presentation without another guest completion",
+    );
+    await engine.execute(commands([
+      ...renderPass(handle(2), 3),
+      ...renderPass(0),
+    ], 3n));
+    assert.equal(visibleFrames.length, 2);
+    assert.deepEqual(visibleFrames[1].pixel, [0, 0, 0, 255]);
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "presented").map(message => message.sequence),
+      [2, 3],
+    );
+  } finally {
+    capture.restore();
+    engine.stop();
+  }
+});
+
+test("non-surface background work preserves a snapshot but discarded surface contents never resume", async () => {
+  const { engine, visibleFrames } = backgroundEngine();
+  const capture = captureMessages();
+  try {
+    engine.setBackground(true);
+    const greenSurface = renderPass(0);
+    new DataView(greenSurface[0][1].buffer).setFloat32(20, 1, true);
+    engine.submit(commands(greenSurface));
+    engine.submit(commands(offscreenTextureCommands(), 2n));
+    engine.setBackground(false);
+    await engine.queue;
+    assert.deepEqual(visibleFrames.map(frame => frame.pixel), [[0, 255, 0, 255]]);
+    engine.setBackground(true);
+    engine.submit(commands(renderPass(0, 0), 3n));
+    engine.setBackground(false);
+    await engine.queue;
+    assert.deepEqual(visibleFrames.map(frame => frame.pixel), [[0, 255, 0, 255]],
+      "discarded surface contents must not replace the last visible frame");
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "event").map(message => [
+        eventType(message.bytes),
+        new DataView(message.bytes.buffer).getBigUint64(16, true),
+      ]),
+      [[5, 1n], [5, 2n], [5, 3n]],
+    );
+  } finally {
+    capture.restore();
+    engine.stop();
+  }
+});
+
+test("background targets follow resize and are released on reset and stop", async () => {
+  const { engine, textures, visibleFrames } = backgroundEngine();
+  engine.setBackground(true);
+  await engine.execute(commands(renderPass(0)));
+  engine.scheduleResize({
+    physicalWidth: 128, physicalHeight: 96, logicalWidth: 128, logicalHeight: 96, scale: 1,
+  });
+  engine.submit(commands(renderPass(0, 2, 2), 2n));
+  await engine.queue;
+  assert.equal(textures[0].destroyed, true);
+  assert.deepEqual(Array.from(textures[1].descriptor.size), [128, 96, 1]);
+  assert.equal(textures.filter(texture => !texture.destroyed).length, 1);
+  assert.equal(visibleFrames.length, 0);
+
+  engine.setBackground(false);
+  await engine.queue;
+  await engine.execute(commands(renderPass(0, 2, 2), 3n));
+  assert.deepEqual(visibleFrames[0].descriptor.size, [128, 96, 1]);
+  engine.reset();
+  await engine.queue;
+  assert.equal(textures.every(texture => texture.destroyed), true);
+  engine.setBackground(true);
+  await engine.execute(commands(renderPass(0, 2, 2)));
+  engine.stop();
+  assert.equal(textures.every(texture => texture.destroyed), true);
+});
+
+test("hiding during batch completion suppresses presentation metrics without dropping completion", async () => {
+  const { engine } = backgroundEngine();
+  let releaseValidation;
+  const validation = new Promise(resolve => { releaseValidation = resolve; });
+  engine.device.popErrorScope = () => validation;
+  const capture = captureMessages();
+  try {
+    const executing = engine.execute(commands(renderPass(0)));
+    engine.setBackground(true);
+    releaseValidation(null);
+    await executing;
+    assert.equal(capture.messages.some(message => message.type === "presented"), false);
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "event").map(message => eventType(message.bytes)),
+      [5],
+    );
+  } finally {
+    capture.restore();
+    engine.stop();
+  }
+});
+
+test("rapid background transitions do not publish while hidden or replay stale snapshots", async () => {
+  const { engine, visibleFrames } = backgroundEngine();
+  engine.setBackground(true);
+  engine.submit(commands(renderPass(0)));
+  engine.setBackground(false);
+  engine.setBackground(true);
+  await engine.queue;
+  assert.equal(visibleFrames.length, 0);
+  engine.setBackground(false);
+  await engine.queue;
+  assert.equal(visibleFrames.length, 1);
+  engine.setBackground(true);
+  engine.setBackground(false);
+  await engine.queue;
+  assert.equal(visibleFrames.length, 1, "an empty hidden interval has no snapshot to replay");
+  engine.stop();
+});
+
+test("restoring a device invalidates the old background snapshot and keeps new work hidden", async () => {
+  const old = backgroundEngine();
+  const replacement = backgroundEngine();
+  const engine = old.engine;
+  engine.setBackground(true);
+  await engine.execute(commands(renderPass(0)));
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => ({
+    device: replacement.engine.device,
+    context: replacement.engine.context,
+    format: replacement.engine.format,
+    limits: replacement.engine.limits,
+  });
+  const capture = captureMessages();
+  try {
+    engine.stopped = true;
+    await engine.restore();
+    assert.equal(old.textures[0].destroyed, true);
+    await engine.execute(commands(renderPass(0)));
+    assert.equal(replacement.visibleFrames.length, 0);
+    engine.setBackground(false);
+    await engine.queue;
+    assert.deepEqual(replacement.visibleFrames[0].pixel, [0, 0, 0, 255]);
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "event").map(message => eventType(message.bytes)),
+      [8, 5],
+      "restoration and batch completion remain guest-visible while hidden",
+    );
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+    engine.stop();
+    replacement.engine.stop();
+  }
 });
 
 test("rejects missing, wrong-type and deleted color attachments before any GPU mutation", async t => {
