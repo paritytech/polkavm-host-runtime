@@ -650,6 +650,11 @@ impl Vm {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        self.host_frame_responses.len()
+    }
+
     pub(crate) fn clear_host_frame_queues(&mut self) {
         self.host_frame_requests.clear();
         self.host_frame_request_bytes = 0;

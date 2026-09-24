@@ -2038,6 +2038,11 @@ impl Runtime {
         self.state.queue_host_frame_response(bytes)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        self.state.host_frame_responses.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn host_frame_queues_are_empty(&self) -> bool {
         self.state.host_frame_requests.is_empty()
