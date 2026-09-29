@@ -168,7 +168,7 @@ pub(crate) struct ComputerDevices {
     pub(crate) filesystem: FileSession,
     network_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
-    monotonic_epoch: std::time::Instant,
+    monotonic_clock: crate::HostClock,
     #[cfg(not(target_arch = "wasm32"))]
     sockets: BTreeMap<u32, std::net::TcpStream>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -187,7 +187,7 @@ impl ComputerDevices {
             filesystem: FileSession::new(),
             network_enabled: false,
             #[cfg(not(target_arch = "wasm32"))]
-            monotonic_epoch: std::time::Instant::now(),
+            monotonic_clock: crate::HostClock::new(),
             #[cfg(not(target_arch = "wasm32"))]
             sockets: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -199,10 +199,12 @@ impl ComputerDevices {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn core_clock_monotonic(&self) -> u64 {
-        self.monotonic_epoch
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64
+        self.monotonic_clock.elapsed_ns()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.monotonic_clock.set_paused(paused);
     }
 
     #[cfg(target_arch = "wasm32")]

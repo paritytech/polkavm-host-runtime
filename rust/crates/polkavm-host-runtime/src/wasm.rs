@@ -180,7 +180,7 @@ pub extern "C" fn polkavm_browser_translation_length() -> u32 {
     HOST.with(|host| host.borrow().translation.len() as u32)
 }
 
-fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) -> u32 {
+fn launch_begin(max_gas_per_update: u64, audio_enabled: u32, presentation: u32) -> u32 {
     status(|host| {
         if !matches!(host.phase, Phase::Empty) {
             return Err(anyhow!("PolkaVM browser launch is already active"));
@@ -208,7 +208,7 @@ fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) 
             program,
             assets: HashMap::new(),
             asset_bytes: 0,
-            max_gas_per_update: max_gas_per_update.into(),
+            max_gas_per_update,
             audio_enabled: audio_enabled == 1,
             presentation,
         });
@@ -217,13 +217,13 @@ fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) 
 }
 
 #[no_mangle]
-pub extern "C" fn polkavm_browser_launch_begin(max_gas_per_update: u32, audio_enabled: u32) -> u32 {
+pub extern "C" fn polkavm_browser_launch_begin(max_gas_per_update: u64, audio_enabled: u32) -> u32 {
     launch_begin(max_gas_per_update, audio_enabled, 0)
 }
 
 #[no_mangle]
 pub extern "C" fn polkavm_browser_launch_begin_v2(
-    max_gas_per_update: u32,
+    max_gas_per_update: u64,
     audio_enabled: u32,
     presentation: u32,
 ) -> u32 {
@@ -287,6 +287,14 @@ pub extern "C" fn polkavm_browser_launch_start() -> u32 {
         )?;
         host.phase = Phase::Running(runtime);
         Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_set_random_bytes() -> u32 {
+    status(|host| {
+        let bytes = std::mem::take(&mut host.staging);
+        host.running()?.set_random_bytes(bytes)
     })
 }
 
@@ -392,6 +400,15 @@ pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
     })
 }
 
+/// Number of accepted responses still waiting for the guest to poll them.
+#[no_mangle]
+pub extern "C" fn polkavm_browser_pending_host_frame_responses() -> u32 {
+    HOST.with(|host| match &host.borrow().phase {
+        Phase::Running(runtime) => runtime.pending_host_frame_responses() as u32,
+        _ => 0,
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_mediated_input_kinds() -> u32 {
     status(|host| {
@@ -447,6 +464,15 @@ pub extern "C" fn polkavm_browser_update_after_ms() -> u32 {
             runtime.update_after_ms().unwrap_or(UPDATE_AFTER_IDLE)
         }
         _ => UPDATE_AFTER_IDLE,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn polkavm_browser_pause_input() -> u32 {
+    status(|host| {
+        host.running()?.pause_input();
+        host.audio = None;
+        Ok(())
     })
 }
 
