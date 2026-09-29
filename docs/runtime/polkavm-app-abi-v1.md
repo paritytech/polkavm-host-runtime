@@ -74,10 +74,11 @@ a returned status for that condition.
 
 ## Capability gating
 
-The App manifest selects exactly one graphics profile and may enable device
-input and audio. A Host call made outside its declared capability MUST fail
+The App manifest selects exactly one graphics profile and may enable audio.
+A Host call made outside its declared graphics or audio capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
-silently reinterpret a submission as another graphics profile.
+silently reinterpret a submission as another graphics profile. Application
+input is part of the base ABI and is never enabled by a manifest capability.
 
 ## Host imports
 
@@ -327,12 +328,13 @@ ABI v1 event types are:
 21  touch cancel
 ```
 
-Pointer button, position, and delta records are baseline optional input. An App
-does not list `pointer` in `deviceInput.requiredFeatures`: a Host with no
-pointer source simply emits no pointer records, and that absence is not a
-launch failure. Pointer capture is Host policy and is never selected by the
-manifest. The guest arms capture through the pointer-capture hostcall below,
-and the Host decides when an activation is eligible.
+Pointer movement and buttons, physical key transitions, committed text, IME,
+focus, wheel, and surface metrics are baseline application input. An App does
+not declare them in its manifest. A Host with no source for an optional input
+simply emits no records for it, and that absence is not a launch failure.
+Pointer capture is Host policy and is never selected by the manifest. The guest
+arms capture through the pointer-capture hostcall below, and the Host decides
+when an activation is eligible.
 
 Touch records use `code` as a Host-assigned contact ID and `x`/`y` as the
 physical-pixel position. An ID MUST remain stable from start through end or
@@ -437,9 +439,9 @@ teardown cancels every active request and releases every device stream.
 ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
 The Host owns camera access, QR recognition, UR fountain reconstruction, and
 type filtering; only the reconstructed UR CBOR bytes cross into guest memory.
-An App requiring this kind lists `"camera-ur"` in
-`deviceInput.requiredFeatures`. A conforming Host MUST reject launch when it
-cannot provide every required input feature.
+Apps discover `camera-ur` support through `host_input_register`. An unavailable
+kind returns `-2` from registration; it does not make the executable
+structurally incompatible.
 
 ### Pointer capture
 
@@ -654,9 +656,11 @@ bit 2  rotation is emulated from pointer movement
 All numeric fields MUST be finite. Pointer emulation sets alpha and all
 acceleration fields to zero, fills beta and gamma, and sets bits 1 and 2.
 
-An application that cannot operate without motion lists `"motion"` in
-`deviceInput.requiredFeatures`. An application with pointer or keyboard
-fallback does not require motion and MUST handle `-1` and `-2`.
+Importing `host_motion_read` declares runtime intent to use motion, not a
+manifest requirement. A Host that provides physical motion MUST authorize it
+only while the execution is in the foreground and MUST stop physical sensor
+acquisition when the execution loses the foreground, closes, or loses
+authorization. The application MUST handle `-1` and `-2`.
 
 ### Time
 
