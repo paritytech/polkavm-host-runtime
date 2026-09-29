@@ -31,6 +31,39 @@
   const MEDIATED_INPUT_STATUS_CANCELLED = 4;
   const MEDIATED_INPUT_STATUS_PERMISSION_DENIED = 5;
   const MEDIATED_INPUT_STATUS_FAILED = 6;
+  const MAX_FILE_DESCRIPTOR_BYTES = 4 * 1024;
+  const MAX_FILE_ID_BYTES = 64;
+  const MAX_FILE_LABEL_BYTES = 80;
+  const MAX_FILE_EXTENSIONS = 16;
+  const MAX_FILE_MIME_TYPES = 16;
+  const MAX_FILE_MIME_TYPE_BYTES = 127;
+  const MAX_FILE_MOUNT_PATH_BYTES = 1024;
+  const MAX_FILE_NAME_BYTES = 1024;
+  const MAX_INLINE_FILE_BYTES = 8 * 1024 * 1024;
+  const MAX_RELAUNCH_FILE_BYTES = 128 * 1024 * 1024;
+  const MAX_ASSET_FILES = 2048;
+  const MAX_ASSET_BYTES = 256 * 1024 * 1024;
+  const FILE_REGISTER_DELIVERY_UNAVAILABLE = -4;
+  const FILE_INFO_INVALID = -1;
+  const JSON_ESCAPES = Object.freeze({
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    b: "\b",
+    f: "\f",
+    n: "\n",
+    r: "\r",
+    t: "\t",
+  });
+  const FILE_DESCRIPTOR_FIELDS = new Set([
+    "id",
+    "label",
+    "extensions",
+    "mimeTypes",
+    "delivery",
+    "maxBytes",
+    "mountPath",
+  ]);
   const INPUT_POINTER_CAPTURE = 15;
   const INPUT_SAFE_AREA_INSETS = 16;
   const INPUT_KEYBOARD_INSETS = 17;
@@ -133,6 +166,10 @@
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const strictDecoder = new TextDecoder("utf-8", { fatal: true });
+  const descriptorDecoder = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  });
 
   function isWebGpuProfile(profile) {
     return profile === "webgpu-raster" || profile === "webgpu";
@@ -144,6 +181,289 @@
       bytes.byteLength > 0 &&
       bytes.byteLength <= maxBytes &&
       /^[a-z0-9][a-z0-9+._-]*[a-z0-9]$|^[a-z0-9]$/.test(value)
+    );
+  }
+
+  /**
+   * Parses JSON with the strictness of the native runtime: duplicate keys,
+   * lone surrogates, and numbers other than non-negative integers are errors.
+   */
+  function parseStrictJson(text) {
+    let index = 0;
+    const fail = () => {
+      throw new SyntaxError("invalid strict JSON");
+    };
+    const skipWhitespace = () => {
+      while (/[ \t\n\r]/.test(text[index] ?? "")) {
+        index++;
+      }
+    };
+    const parseString = () => {
+      if (text[index] !== '"') {
+        fail();
+      }
+      index++;
+      let value = "";
+      while (true) {
+        const character = text[index++];
+        if (character === undefined || character < " ") {
+          fail();
+        }
+        if (character === '"') {
+          break;
+        }
+        if (character !== "\\") {
+          value += character;
+          continue;
+        }
+        const escape = text[index++];
+        if (Object.hasOwn(JSON_ESCAPES, escape)) {
+          value += JSON_ESCAPES[escape];
+          continue;
+        }
+        if (escape !== "u") {
+          fail();
+        }
+        const hex = text.slice(index, index + 4);
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+          fail();
+        }
+        index += 4;
+        value += String.fromCharCode(Number.parseInt(hex, 16));
+      }
+      if (!value.isWellFormed()) {
+        fail();
+      }
+      return value;
+    };
+    const parseValue = () => {
+      skipWhitespace();
+      const character = text[index];
+      if (character === "{") {
+        index++;
+        const object = Object.create(null);
+        skipWhitespace();
+        if (text[index] === "}") {
+          index++;
+          return object;
+        }
+        while (true) {
+          skipWhitespace();
+          const key = parseString();
+          if (Object.hasOwn(object, key)) {
+            fail();
+          }
+          skipWhitespace();
+          if (text[index++] !== ":") {
+            fail();
+          }
+          object[key] = parseValue();
+          skipWhitespace();
+          const separator = text[index++];
+          if (separator === "}") {
+            return object;
+          }
+          if (separator !== ",") {
+            fail();
+          }
+        }
+      }
+      if (character === "[") {
+        index++;
+        const array = [];
+        skipWhitespace();
+        if (text[index] === "]") {
+          index++;
+          return array;
+        }
+        while (true) {
+          array.push(parseValue());
+          skipWhitespace();
+          const separator = text[index++];
+          if (separator === "]") {
+            return array;
+          }
+          if (separator !== ",") {
+            fail();
+          }
+        }
+      }
+      if (character === '"') {
+        return parseString();
+      }
+      for (const [literal, value] of [
+        ["true", true],
+        ["false", false],
+        ["null", null],
+      ]) {
+        if (text.startsWith(literal, index)) {
+          index += literal.length;
+          return value;
+        }
+      }
+      const number = /^(0|[1-9][0-9]*)(?![0-9.eE+-])/.exec(text.slice(index));
+      if (number === null) {
+        fail();
+      }
+      index += number[0].length;
+      return Number(number[0]);
+    };
+    const value = parseValue();
+    skipWhitespace();
+    if (index !== text.length) {
+      fail();
+    }
+    return value;
+  }
+
+  function byteLength(value) {
+    return encoder.encode(value).byteLength;
+  }
+
+  function validFileId(value) {
+    return (
+      typeof value === "string" &&
+      value.length <= MAX_FILE_ID_BYTES &&
+      /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(value)
+    );
+  }
+
+  function validFileLabel(value) {
+    return (
+      typeof value === "string" &&
+      value.length > 0 &&
+      byteLength(value) <= MAX_FILE_LABEL_BYTES
+    );
+  }
+
+  function validFileExtension(value) {
+    return typeof value === "string" && /^\.[a-z0-9]{1,16}$/.test(value);
+  }
+
+  function validFileMimeType(value) {
+    return (
+      typeof value === "string" &&
+      value.length <= MAX_FILE_MIME_TYPE_BYTES &&
+      /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(value)
+    );
+  }
+
+  function validFileMountPath(value) {
+    return (
+      typeof value === "string" &&
+      value.length > 0 &&
+      byteLength(value) <= MAX_FILE_MOUNT_PATH_BYTES &&
+      !value.startsWith("/") &&
+      !value.includes("\\") &&
+      !/[\u0000-\u001f\u007f-\u009f]/.test(value) &&
+      value
+        .split("/")
+        .every((segment) => segment && segment !== "." && segment !== "..")
+    );
+  }
+
+  function uniqueWithin(values, limit, valid) {
+    return (
+      Array.isArray(values) &&
+      values.length <= limit &&
+      values.every(valid) &&
+      new Set(values).size === values.length
+    );
+  }
+
+  function validFileTypeFilter(label, extensions, mimeTypes) {
+    return (
+      validFileLabel(label) &&
+      uniqueWithin(extensions, MAX_FILE_EXTENSIONS, validFileExtension) &&
+      uniqueWithin(mimeTypes, MAX_FILE_MIME_TYPES, validFileMimeType) &&
+      (extensions.length > 0 || mimeTypes.length > 0)
+    );
+  }
+
+  /** Parses one `host_file_register` descriptor, or returns null. */
+  function parseFileDescriptor(bytes) {
+    if (bytes.byteLength > MAX_FILE_DESCRIPTOR_BYTES) {
+      return null;
+    }
+    let raw;
+    try {
+      raw = parseStrictJson(descriptorDecoder.decode(bytes));
+    } catch {
+      return null;
+    }
+    if (
+      raw === null ||
+      typeof raw !== "object" ||
+      Array.isArray(raw) ||
+      Object.keys(raw).some((key) => !FILE_DESCRIPTOR_FIELDS.has(key))
+    ) {
+      return null;
+    }
+    const extensions = raw.extensions ?? [];
+    const mimeTypes = raw.mimeTypes ?? [];
+    const { id, label, delivery, maxBytes, mountPath } = raw;
+    if (
+      (Object.hasOwn(raw, "extensions") && !Array.isArray(raw.extensions)) ||
+      (Object.hasOwn(raw, "mimeTypes") && !Array.isArray(raw.mimeTypes))
+    ) {
+      return null;
+    }
+    const bound =
+      delivery === "inline"
+        ? MAX_INLINE_FILE_BYTES
+        : delivery === "relaunch"
+          ? MAX_RELAUNCH_FILE_BYTES
+          : 0;
+    const mountPathValid =
+      delivery === "inline"
+        ? !Object.hasOwn(raw, "mountPath")
+        : validFileMountPath(mountPath);
+    if (
+      !validFileId(id) ||
+      !validFileTypeFilter(label, extensions, mimeTypes) ||
+      !Number.isInteger(maxBytes) ||
+      maxBytes < 1 ||
+      maxBytes > bound ||
+      !mountPathValid
+    ) {
+      return null;
+    }
+    const descriptor = { id, label, extensions, mimeTypes, delivery, maxBytes };
+    if (delivery === "relaunch") {
+      descriptor.mountPath = mountPath;
+    }
+    return descriptor;
+  }
+
+  function sameFileDescriptor(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  /** Reduces a Host-received name to the base name the guest may see. */
+  function sanitizeFileName(name) {
+    if (typeof name !== "string") {
+      throw new Error("file name must be a string");
+    }
+    const base = name.toWellFormed().split(/[/\\]/).at(-1);
+    const sanitized = base.replace(/[\u0000-\u001f\u007f-\u009f]/g, "�");
+    if (!sanitized || byteLength(sanitized) > MAX_FILE_NAME_BYTES) {
+      throw new Error(`file name must reduce to 1..=${MAX_FILE_NAME_BYTES} bytes`);
+    }
+    return sanitized;
+  }
+
+  function validateSelectedMimeType(mimeType) {
+    if (
+      typeof mimeType !== "string" ||
+      (mimeType !== "" && !validFileMimeType(mimeType))
+    ) {
+      throw new Error(`invalid file MIME type ${mimeType}`);
+    }
+  }
+
+  function encodeFileInfo(file) {
+    return encoder.encode(
+      JSON.stringify({ name: file.name, mimeType: file.mimeType, size: file.size }),
     );
   }
 
@@ -572,6 +892,7 @@
       gpuCapabilities = null,
       motionAvailability = MOTION_STATUS_UNAVAILABLE,
       mediatedInputKinds = [],
+      fileInput = null,
     ) {
       if (!TranslatedPolkaVmRuntime.isCompiledProgram(program)) {
         throw new TypeError("invalid translated PolkaVM compiled program");
@@ -635,6 +956,19 @@
         throw new Error("translated PolkaVM runtime has invalid mediated-input kinds");
       }
       this.mediatedInputKinds = new Set(mediatedInputKinds);
+      if (
+        fileInput !== null &&
+        (typeof fileInput?.inline !== "boolean" ||
+          typeof fileInput.relaunch !== "boolean" ||
+          ((fileInput.inline || fileInput.relaunch) &&
+            !validFileMountPath(fileInput.entrypoint)))
+      ) {
+        throw new Error("translated PolkaVM runtime has invalid file-input support");
+      }
+      this.fileInput =
+        fileInput?.inline || fileInput?.relaunch ? { ...fileInput } : null;
+      this.mountedFile = null;
+      this.initialized = false;
       this.mediatedInputRegistrations = new Map();
       this.nextMediatedInputHandle = 0;
       this.activeMediatedInputHandle = null;
@@ -684,6 +1018,7 @@
     }
 
     initialize() {
+      this.initialized = true;
       this.#resetBudget(MAX_HOSTCALLS_PER_INIT);
       if (this.coreVm) {
         this.#setupCoreVm();
@@ -1028,6 +1363,11 @@
         throw new Error("invalid translated mediated-input result");
       }
       if (status === MEDIATED_INPUT_STATUS_READY) {
+        if (registration.descriptor) {
+          throw new Error(
+            "translated file results are delivered with their name and MIME type",
+          );
+        }
         if (!bytes.byteLength || bytes.byteLength > registration.maxBytes) {
           throw new Error("translated mediated-input result exceeds its registered bound");
         }
@@ -1036,6 +1376,7 @@
         throw new Error("translated mediated-input failure carries unexpected bytes");
       } else {
         registration.result = null;
+        registration.file = null;
       }
       this.activeMediatedInputHandle = null;
       registration.status = status;
@@ -1056,6 +1397,7 @@
       }
       for (const [handle, registration] of this.mediatedInputRegistrations) {
         if (
+          !registration.descriptor &&
           registration.kind === kind &&
           registration.mediaType === mediaType &&
           registration.maxBytes === maxBytes
@@ -1063,6 +1405,10 @@
           return handle;
         }
       }
+      return this.#insertRegistration({ kind, mediaType, maxBytes });
+    }
+
+    #insertRegistration(source) {
       if (
         this.mediatedInputRegistrations.size === MAX_MEDIATED_INPUT_REGISTRATIONS
       ) {
@@ -1077,13 +1423,175 @@
         this.mediatedInputRegistrations.has(this.nextMediatedInputHandle)
       );
       this.mediatedInputRegistrations.set(this.nextMediatedInputHandle, {
-        kind,
-        mediaType,
-        maxBytes,
+        ...source,
         status: MEDIATED_INPUT_STATUS_REGISTERED,
         result: null,
+        file: null,
       });
       return this.nextMediatedInputHandle;
+    }
+
+    #registerFile(bytes) {
+      const descriptor = parseFileDescriptor(bytes);
+      if (descriptor === null) {
+        return -1;
+      }
+      if (this.fileInput === null) {
+        return -2;
+      }
+      if (!this.fileInput[descriptor.delivery]) {
+        return FILE_REGISTER_DELIVERY_UNAVAILABLE;
+      }
+      if (descriptor.mountPath === this.fileInput.entrypoint) {
+        return -1;
+      }
+      for (const [handle, registration] of this.mediatedInputRegistrations) {
+        const existing = registration.descriptor;
+        if (!existing) {
+          continue;
+        }
+        if (sameFileDescriptor(existing, descriptor)) {
+          return handle;
+        }
+        if (
+          existing.id === descriptor.id ||
+          (descriptor.mountPath !== undefined &&
+            existing.mountPath === descriptor.mountPath)
+        ) {
+          return -1;
+        }
+      }
+      let mounted = null;
+      if (this.mountedFile?.id === descriptor.id) {
+        mounted = this.mountedFile;
+        this.mountedFile = null;
+        if (
+          descriptor.mountPath !== mounted.mountPath ||
+          mounted.file.size > descriptor.maxBytes
+        ) {
+          mounted = null;
+        }
+      }
+      const handle = this.#insertRegistration({
+        descriptor,
+        maxBytes: descriptor.maxBytes,
+      });
+      if (handle > 0) {
+        if (mounted !== null) {
+          const registration = this.mediatedInputRegistrations.get(handle);
+          registration.status = MEDIATED_INPUT_STATUS_READY;
+          registration.file = mounted.file;
+        }
+        this.emit({
+          type: "file-registrations",
+          registrations: this.fileRegistrations(),
+        });
+      }
+      return handle;
+    }
+
+    /** Every file registration of the execution, in handle order. */
+    fileRegistrations() {
+      return [...this.mediatedInputRegistrations]
+        .filter(([, registration]) => registration.descriptor)
+        .sort(([left], [right]) => left - right)
+        .map(([handle, registration]) => ({
+          handle,
+          descriptor: structuredClone(registration.descriptor),
+        }));
+    }
+
+    /**
+     * Delivers a file the user selected in Host UI, either for the guest's
+     * active request or onto an idle registration.
+     */
+    deliverFile(handle, name, mimeType, bytes) {
+      const sanitized = sanitizeFileName(name);
+      validateSelectedMimeType(mimeType);
+      if (this.stopped || !(bytes instanceof Uint8Array)) {
+        throw new Error("invalid translated file delivery");
+      }
+      const registration = this.mediatedInputRegistrations.get(handle);
+      if (!registration?.descriptor) {
+        throw new Error(`translated handle ${handle} is not a file registration`);
+      }
+      const accepted =
+        this.activeMediatedInputHandle === null
+          ? registration.status !== MEDIATED_INPUT_STATUS_READY
+          : this.activeMediatedInputHandle === handle;
+      if (!accepted) {
+        return { outcome: "refused" };
+      }
+      if (handle === this.activeMediatedInputHandle) {
+        this.activeMediatedInputHandle = null;
+      }
+      registration.result = null;
+      registration.file = null;
+      if (!bytes.byteLength || bytes.byteLength > registration.maxBytes) {
+        registration.status = MEDIATED_INPUT_STATUS_FAILED;
+        return { outcome: "rejected" };
+      }
+      const file = { name: sanitized, mimeType, size: bytes.byteLength };
+      if (registration.descriptor.delivery === "inline") {
+        registration.result = bytes.slice();
+        registration.file = file;
+        registration.status = MEDIATED_INPUT_STATUS_READY;
+        return { outcome: "ready" };
+      }
+      registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+      this.stop();
+      return {
+        outcome: "relaunch",
+        relaunch: {
+          id: registration.descriptor.id,
+          mountPath: registration.descriptor.mountPath,
+          name: sanitized,
+          mimeType,
+          bytes,
+        },
+      };
+    }
+
+    /**
+     * Mounts a relaunch-delivered file in place of the asset at its mount
+     * path before initialization.
+     */
+    setFileRelaunch(relaunch) {
+      if (this.initialized || this.stopped) {
+        throw new Error("translated relaunch files are mounted before init");
+      }
+      const bytes = relaunch?.bytes;
+      if (
+        !validFileId(relaunch?.id) ||
+        !validFileMountPath(relaunch.mountPath) ||
+        sanitizeFileName(relaunch.name) !== relaunch.name ||
+        !(bytes instanceof Uint8Array) ||
+        !bytes.byteLength ||
+        bytes.byteLength > MAX_RELAUNCH_FILE_BYTES
+      ) {
+        throw new Error("invalid translated relaunch file");
+      }
+      validateSelectedMimeType(relaunch.mimeType);
+      const replaced = this.assets.get(relaunch.mountPath)?.byteLength ?? 0;
+      let total = bytes.byteLength - replaced;
+      for (const asset of this.assets.values()) {
+        total += asset.byteLength;
+      }
+      const count =
+        this.assets.size + (this.assets.has(relaunch.mountPath) ? 0 : 1);
+      if (count > MAX_ASSET_FILES || total > MAX_ASSET_BYTES) {
+        throw new Error("translated relaunch file exceeds the asset bounds");
+      }
+      this.assets.set(relaunch.mountPath, bytes.slice());
+      this.mountedFile = {
+        id: relaunch.id,
+        mountPath: relaunch.mountPath,
+        file: {
+          name: relaunch.name,
+          mimeType: relaunch.mimeType,
+          size: bytes.byteLength,
+        },
+      };
     }
 
     #triggerMediatedInput(handle) {
@@ -1097,6 +1605,15 @@
       registration.status = MEDIATED_INPUT_STATUS_ACTIVE;
       this.activeMediatedInputHandle = handle;
       registration.result = null;
+      registration.file = null;
+      if (registration.descriptor) {
+        this.emit({
+          type: "file-input-request",
+          handle,
+          descriptor: structuredClone(registration.descriptor),
+        });
+        return 0;
+      }
       this.emit({
         type: "mediated-input-request",
         handle,
@@ -1112,11 +1629,18 @@
       if (!registration) {
         return 1;
       }
+      if (registration.status === MEDIATED_INPUT_STATUS_READY) {
+        registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+        registration.result = null;
+        registration.file = null;
+        return 0;
+      }
       if (registration.status !== MEDIATED_INPUT_STATUS_ACTIVE) {
         return 2;
       }
-      registration.status = MEDIATED_INPUT_STATUS_CANCELLED;
+      registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
       registration.result = null;
+      registration.file = null;
       this.activeMediatedInputHandle = null;
       this.emit({ type: "mediated-input-cancel", handle });
       return 0;
@@ -1554,6 +2078,52 @@
           this.#setReg(7, BigInt(result));
           return false;
         }
+        case "host_file_register": {
+          const length = this.#u32(a1);
+          let result = -1;
+          if (length <= MAX_FILE_DESCRIPTOR_BYTES) {
+            this.#chargeBytes(length);
+            let bytes = null;
+            try {
+              bytes = this.#range(this.#u32(a0), length).slice();
+            } catch {}
+            if (bytes !== null) {
+              result = this.#registerFile(bytes);
+            }
+          }
+          this.#setReg(7, BigInt(result));
+          return false;
+        }
+        case "host_file_info": {
+          const registration = this.mediatedInputRegistrations.get(
+            this.#u32(a0),
+          );
+          if (!registration?.descriptor) {
+            this.#setReg(7, BigInt(FILE_INFO_INVALID));
+            return false;
+          }
+          if (
+            registration.status !== MEDIATED_INPUT_STATUS_READY ||
+            registration.file === null
+          ) {
+            this.#setReg(7, 0n);
+            return false;
+          }
+          const info = encodeFileInfo(registration.file);
+          if (this.#u32(a2) < info.byteLength) {
+            this.#setReg(7, BigInt(-info.byteLength));
+            return false;
+          }
+          this.#chargeBytes(info.byteLength);
+          let written = true;
+          try {
+            this.#range(this.#u32(a1), info.byteLength, true).set(info);
+          } catch {
+            written = false;
+          }
+          this.#setReg(7, BigInt(written ? info.byteLength : FILE_INFO_INVALID));
+          return false;
+        }
         case "host_input_trigger": {
           this.#setReg(
             7,
@@ -1573,6 +2143,17 @@
             this.#u32(a0),
           );
           if (
+            registration?.status === MEDIATED_INPUT_STATUS_READY &&
+            registration.result === null &&
+            registration.file !== null
+          ) {
+            // A mounted relaunch file is an asset; reading acknowledges it.
+            registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+            registration.file = null;
+            this.#setReg(7, 0n);
+            return false;
+          }
+          if (
             !registration ||
             registration.status !== MEDIATED_INPUT_STATUS_READY ||
             !(registration.result instanceof Uint8Array)
@@ -1588,6 +2169,7 @@
           this.#chargeBytes(required);
           this.#write(this.#u32(a1), registration.result);
           registration.result = null;
+          registration.file = null;
           registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
           this.#setReg(7, BigInt(required));
           return false;
@@ -2296,6 +2878,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MOTION_SAMPLE_BYTES = 48;
   const MAX_MEDIATED_INPUT_KIND_BYTES = 32;
   const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
+  const MAX_RELAUNCH_FILE_BYTES = 128 * 1024 * 1024;
+  const FILE_INPUT_OUTCOMES = ["ready", "error", "", "rejected", "refused", "relaunch"];
   // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
   // update carry a single axis, so a Host sends them through the dedicated
   // `view-insets` message that queues the pair together; the runtime rejects a
@@ -2325,6 +2909,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let updateCount = 0;
   const updateSamples = [];
   const activeMediatedInputHandles = new Set();
+  // The newest registration snapshot a Host has not received yet. It is
+  // flushed on teardown so a Host keeps the registrations of an execution
+  // that failed before becoming ready.
+  let unpostedFileRegistrations = null;
   const tickChannel = new MessageChannel();
   tickChannel.port1.onmessage = () => {
     tickPending = false;
@@ -2336,6 +2924,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       return;
     }
     disposed = true;
+    if (unpostedFileRegistrations !== null) {
+      postMessage(unpostedFileRegistrations);
+      unpostedFileRegistrations = null;
+    }
     for (const handle of activeMediatedInputHandles) {
       postMessage({ type: "mediated-input-cancel", handle });
     }
@@ -2350,12 +2942,36 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function postRuntimeOutput(output, transfers = []) {
-    if (output?.type === "mediated-input-request") {
+    if (
+      output?.type === "mediated-input-request" ||
+      output?.type === "file-input-request"
+    ) {
       activeMediatedInputHandles.add(output.handle);
     } else if (output?.type === "mediated-input-cancel") {
       activeMediatedInputHandles.delete(output.handle);
+    } else if (output?.type === "file-registrations") {
+      unpostedFileRegistrations = null;
     }
     postMessage(output, transfers);
+  }
+
+  function wasmJson(pointer, length) {
+    return JSON.parse(
+      decoder.decode(new Uint8Array(pvm.memory.buffer, pointer, length)),
+    );
+  }
+
+  function drainFileRegistrations() {
+    if (!pvm.polkavm_browser_take_file_registrations?.()) {
+      return;
+    }
+    postRuntimeOutput({
+      type: "file-registrations",
+      registrations: wasmJson(
+        pvm.polkavm_browser_file_registrations_pointer(),
+        pvm.polkavm_browser_file_registrations_length(),
+      ),
+    });
   }
 
   function errorText() {
@@ -2493,6 +3109,17 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       const handle = pvm.polkavm_browser_mediated_input_handle();
       if (operation === 2) {
         postRuntimeOutput({ type: "mediated-input-cancel", handle });
+        continue;
+      }
+      if (operation === 3) {
+        postRuntimeOutput({
+          type: "file-input-request",
+          handle,
+          descriptor: wasmJson(
+            pvm.polkavm_browser_mediated_input_descriptor_pointer(),
+            pvm.polkavm_browser_mediated_input_descriptor_length(),
+          ),
+        });
         continue;
       }
       if (operation !== 1) {
@@ -2644,6 +3271,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         drainUiOutput();
         drainGpuBatches();
         drainHostFrameRequests();
+        drainFileRegistrations();
         drainMediatedInputCommands();
         drainAudio();
         drainSave();
@@ -2805,7 +3433,58 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     ) {
       throw new Error("invalid PolkaVM browser mediated-input kinds");
     }
+    const fileInput = message.fileInput;
+    if (
+      fileInput !== undefined &&
+      (typeof fileInput?.inline !== "boolean" ||
+        typeof fileInput.relaunch !== "boolean" ||
+        typeof fileInput.entrypoint !== "string" ||
+        ((fileInput.inline || fileInput.relaunch) && !fileInput.entrypoint))
+    ) {
+      throw new Error("invalid PolkaVM browser file-input support");
+    }
+    const relaunch = message.fileRelaunch;
+    if (relaunch !== undefined) {
+      if (
+        ["id", "mountPath", "name", "mimeType"].some(
+          (field) => typeof relaunch?.[field] !== "string",
+        )
+      ) {
+        throw new Error("invalid PolkaVM browser relaunch file");
+      }
+      validateAssetPath(relaunch.mountPath);
+      const length = asBytes(
+        relaunch.bytes,
+        "PolkaVM browser relaunch file",
+      ).byteLength;
+      const replaced = message.assets.find(
+        (asset) => asset.path === relaunch.mountPath,
+      );
+      assetBytes +=
+        length - (replaced ? asBytes(replaced.bytes, "asset").byteLength : 0);
+      if (
+        !length ||
+        length > MAX_RELAUNCH_FILE_BYTES ||
+        paths.size + (replaced ? 0 : 1) > MAX_ASSET_FILES ||
+        assetBytes > MAX_ASSET_BYTES
+      ) {
+        throw new Error("PolkaVM browser relaunch file exceeds the asset bounds");
+      }
+    }
     return program;
+  }
+
+  function relaunchFile(message) {
+    const relaunch = message.fileRelaunch;
+    return relaunch === undefined
+      ? null
+      : {
+          id: relaunch.id,
+          mountPath: relaunch.mountPath,
+          name: relaunch.name,
+          mimeType: relaunch.mimeType,
+          bytes: asBytes(relaunch.bytes, "PolkaVM browser relaunch file"),
+        };
   }
 
   async function start(message) {
@@ -2965,6 +3644,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             postRuntimeOutput(output, transfers);
           } else {
             pendingOutputs.push({ output, transfers });
+            if (output?.type === "file-registrations") {
+              unpostedFileRegistrations = output;
+            }
           }
         },
         MAX_TRANSLATED_LOOPS_PER_UPDATE,
@@ -2973,7 +3655,12 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         pendingGpuCapabilities,
         motionAvailability,
         message.mediatedInputKinds ?? [],
+        message.fileInput ?? null,
       );
+      const relaunch = relaunchFile(message);
+      if (relaunch !== null) {
+        translated.setFileRelaunch(relaunch);
+      }
       compilerStage = "compiler-initializing";
       if (pendingMotionSample !== null) {
         translated.sendMotionSample(pendingMotionSample);
@@ -2986,6 +3673,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     } catch (error) {
       translated = null;
       pendingOutputs.length = 0;
+      unpostedFileRegistrations = null;
       if (error !== FORCE_INTERPRETER) {
         compilerFallbackReason =
           error instanceof Error ? error.message : String(error);
@@ -3047,6 +3735,30 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           "set PolkaVM browser mediated-input kinds",
         );
       }
+      if (message.fileInput?.inline || message.fileInput?.relaunch) {
+        stage(encoder.encode(message.fileInput.entrypoint));
+        check(
+          pvm.polkavm_browser_set_file_input_support(
+            message.fileInput.inline ? 1 : 0,
+            message.fileInput.relaunch ? 1 : 0,
+          ),
+          "set PolkaVM browser file-input support",
+        );
+      }
+      const relaunch = relaunchFile(message);
+      if (relaunch !== null) {
+        const { bytes, ...metadata } = relaunch;
+        stage(encoder.encode(JSON.stringify(metadata)));
+        check(
+          pvm.polkavm_browser_stage_file_metadata(),
+          "stage PolkaVM browser relaunch file",
+        );
+        stage(bytes);
+        check(
+          pvm.polkavm_browser_set_file_relaunch(),
+          "mount PolkaVM browser relaunch file",
+        );
+      }
       if (pendingMotionSample !== null) {
         stage(pendingMotionSample);
         check(
@@ -3073,8 +3785,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         check(pvm.polkavm_browser_init(), "initialize PolkaVM browser guest");
       } catch (initError) {
         drainLogs();
+        drainFileRegistrations();
         throw initError;
       }
+      drainFileRegistrations();
       drainMediatedInputCommands();
       postMessage({ type: "startup", stage: "interpreter-initialized" });
       drainTri2d();
@@ -3336,6 +4050,63 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     );
     activeMediatedInputHandles.delete(handle);
   }
+  /**
+   * Delivers a file the user selected in Host UI and reports the outcome. A
+   * relaunch delivery stops this execution.
+   */
+  function sendFileInput(handle, name, mimeType, bytes) {
+    if (
+      !running ||
+      !Number.isInteger(handle) ||
+      handle <= 0 ||
+      typeof name !== "string" ||
+      typeof mimeType !== "string"
+    ) {
+      throw new Error("invalid PolkaVM browser file input");
+    }
+    let delivery;
+    if (translated) {
+      delivery = translated.deliverFile(handle, name, mimeType, bytes);
+    } else {
+      stage(encoder.encode(JSON.stringify({ name, mimeType })));
+      check(
+        pvm.polkavm_browser_stage_file_metadata(),
+        "stage PolkaVM browser file input",
+      );
+      if (bytes.byteLength) {
+        stage(bytes);
+      }
+      const code = pvm.polkavm_browser_send_file_input(handle);
+      const outcome = FILE_INPUT_OUTCOMES[code];
+      if (!outcome || outcome === "error") {
+        throw new Error(`send PolkaVM browser file input: ${errorText()}`);
+      }
+      delivery = { outcome };
+      if (outcome === "relaunch") {
+        delivery.relaunch = {
+          ...wasmJson(
+            pvm.polkavm_browser_file_relaunch_pointer(),
+            pvm.polkavm_browser_file_relaunch_length(),
+          ),
+          bytes,
+        };
+      }
+    }
+    if (delivery.outcome !== "refused") {
+      activeMediatedInputHandles.delete(handle);
+    }
+    if (delivery.outcome !== "relaunch") {
+      postMessage({ type: "file-input-delivery", handle, outcome: delivery.outcome });
+      return false;
+    }
+    const relaunch = { ...delivery.relaunch, bytes: delivery.relaunch.bytes.slice() };
+    postMessage(
+      { type: "file-input-delivery", handle, outcome: "relaunch", relaunch },
+      [relaunch.bytes.buffer],
+    );
+    return true;
+  }
+
   endpoint.onmessage = (event) => {
     const message = event.data;
     if (message?.type === "start") {
@@ -3466,6 +4237,26 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           new Uint8Array(message.bytes),
         );
         wake();
+      } catch (error) {
+        stopRuntime();
+        postMessage({ type: "error", message: error.message });
+        postMessage({ type: "terminated" });
+      }
+    } else if (message?.type === "file-input") {
+      try {
+        if (
+          sendFileInput(
+            message.handle,
+            message.name,
+            message.mimeType,
+            asBytes(message.bytes, "PolkaVM browser file input"),
+          )
+        ) {
+          stopRuntime();
+          postMessage({ type: "terminated" });
+        } else {
+          wake();
+        }
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

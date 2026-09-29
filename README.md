@@ -38,6 +38,16 @@ and dispatch state before falling back to the interpreter. Cached compiled
 programs include the root and every code module; instantiation creates fresh
 guest state.
 
+File handlers are runtime registrations on the mediated-input lifecycle
+(ABI v1 §File input). A Host declares the deliveries it serves with
+`set_file_input_support` (browser start option `fileInput`), reads the
+registrations with `file_registrations` (`file-registrations` messages), and
+delivers a selected file with `send_file_input` (`file-input`). The runtime
+enforces descriptor rules and `maxBytes` before any byte reaches the guest. A
+relaunch delivery stops the execution and returns the file, which the Host
+mounts in a fresh execution with `set_file_relaunch` (`fileRelaunch`).
+Registrations stay readable after an execution stops or fails.
+
 Browser and native render passes accept registered texture views as offscreen
 color attachments; zero still selects the surface. Offscreen passes preserve
 the surface and retain generation and resource-handle validation. These changes
