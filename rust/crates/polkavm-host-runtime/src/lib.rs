@@ -5,6 +5,7 @@
 mod application;
 mod computer;
 mod corevm;
+mod file_input;
 mod filesystem;
 pub use polkavm_gpu_wire as gpu_wire;
 pub use polkavm_motion_wire as motion_wire;
@@ -41,8 +42,14 @@ pub use computer::{
     MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_RANDOM_BYTES,
     MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
 };
+pub use file_input::{
+    FileDelivery, FileDescriptor, FileInputDelivery, FileInputRequest, FileInputSupport,
+    FileRegistration, FileRelaunch, FileSelection, FILE_INFO_INVALID,
+    FILE_REGISTER_DELIVERY_UNAVAILABLE, MAX_FILE_DESCRIPTOR_BYTES, MAX_FILE_NAME_BYTES,
+    MAX_INLINE_FILE_BYTES, MAX_RELAUNCH_FILE_BYTES,
+};
 pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
-pub use manifest::AppDescriptor;
+pub use manifest::{AppDescriptor, FileTypeHint};
 pub use mediated_input::{
     MediatedInputCommand, MediatedInputRequest, MediatedInputStatus, MAX_MEDIATED_INPUT_BYTES,
     MAX_MEDIATED_INPUT_KIND_BYTES, MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES,
@@ -880,6 +887,7 @@ pub struct Runtime {
     max_gas_per_update: u64,
     last_gas_used: u64,
     backend: polkavm::BackendKind,
+    initialized: bool,
     stopped: bool,
 }
 
@@ -1382,6 +1390,10 @@ impl Runtime {
                         .result(handle)
                         .map(<[u8]>::len)
                     else {
+                        caller
+                            .user_data
+                            .mediated_input
+                            .acknowledge_mounted_file(handle);
                         return Ok(0);
                     };
                     if (capacity as usize) < required {
@@ -1403,6 +1415,56 @@ impl Runtime {
                 },
             )
             .context("define host_input_read")?;
+
+        linker
+            .define_typed(
+                "host_file_register",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let length = length as usize;
+                    if length > MAX_FILE_DESCRIPTOR_BYTES {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    }
+                    caller.user_data.charge_hostcall_bytes(length)?;
+                    let Ok(descriptor) = read_guest_memory(caller.instance, pointer, length) else {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    };
+                    Ok(caller.user_data.mediated_input.register_file(&descriptor))
+                },
+            )
+            .context("define host_file_register")?;
+
+        linker
+            .define_typed(
+                "host_file_info",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let Ok(info) = caller.user_data.mediated_input.file_info(handle) else {
+                        return Ok(FILE_INFO_INVALID);
+                    };
+                    let Some(info) = info else {
+                        return Ok(0);
+                    };
+                    let required = i32::try_from(info.len())
+                        .map_err(|_| anyhow!("file info length overflow"))?;
+                    if (capacity as usize) < info.len() {
+                        return Ok(-required);
+                    }
+                    caller.user_data.charge_hostcall_bytes(info.len())?;
+                    if caller.instance.write_memory(pointer, &info).is_err() {
+                        return Ok(FILE_INFO_INVALID);
+                    }
+                    Ok(required)
+                },
+            )
+            .context("define host_file_info")?;
 
         linker
             .define_typed(
@@ -1690,6 +1752,7 @@ impl Runtime {
             max_gas_per_update,
             last_gas_used: 0,
             backend,
+            initialized: false,
             stopped: false,
         })
     }
@@ -1710,6 +1773,7 @@ impl Runtime {
         if self.stopped {
             bail!("runtime is stopped");
         }
+        self.initialized = true;
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
         self.state
@@ -1914,6 +1978,67 @@ impl Runtime {
         bytes: Vec<u8>,
     ) -> Result<()> {
         self.state.mediated_input.complete(handle, status, bytes)
+    }
+
+    /// Declares the file deliveries this Host serves. Without support,
+    /// `host_file_register` returns `-2`; without the requested delivery, `-4`.
+    /// Existing registrations are unaffected.
+    pub fn set_file_input_support(&mut self, support: FileInputSupport) -> Result<()> {
+        self.state.mediated_input.set_file_support(support)
+    }
+
+    /// Every file registration of this execution, including after it stopped
+    /// or failed, so the Host can offer another file.
+    pub fn file_registrations(&self) -> Vec<FileRegistration> {
+        self.state.mediated_input.file_registrations()
+    }
+
+    /// The file registrations when the guest added one since the last take.
+    pub fn take_file_registrations(&mut self) -> Option<Vec<FileRegistration>> {
+        self.state.mediated_input.take_file_registrations()
+    }
+
+    /// Delivers a file the user selected in Host UI, either for the guest's
+    /// active request or onto an idle registration. A file that is empty or
+    /// above `maxBytes` is rejected with status 6 before any byte reaches the
+    /// guest. A relaunch delivery stops this execution; the Host obtains any
+    /// confirmation first and starts the returned file in a fresh execution.
+    pub fn send_file_input(
+        &mut self,
+        handle: u32,
+        selection: FileSelection,
+    ) -> Result<FileInputDelivery> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
+        let delivery = self.state.mediated_input.deliver_file(handle, selection)?;
+        if matches!(delivery, FileInputDelivery::Relaunch(_)) {
+            self.stop();
+        }
+        Ok(delivery)
+    }
+
+    /// Mounts a relaunch-delivered file in place of the asset at its mount
+    /// path before `init`. The handler that registers the same `id` and mount
+    /// path reports status 3 until the guest reads the selection.
+    pub fn set_file_relaunch(&mut self, relaunch: FileRelaunch) -> Result<()> {
+        if self.initialized || self.stopped {
+            bail!("relaunch files are mounted before init");
+        }
+        relaunch.validate()?;
+        let assets = &self.state.assets;
+        let replaced = assets.get(&relaunch.mount_path).map_or(0, Vec::len);
+        let count = assets.len() + usize::from(!assets.contains_key(&relaunch.mount_path));
+        let total = assets.values().map(Vec::len).sum::<usize>() - replaced + relaunch.bytes.len();
+        validate_asset_count(count)?;
+        if total > MAX_ASSET_BYTES {
+            bail!("guest assets exceed {MAX_ASSET_BYTES} bytes");
+        }
+        self.state.mediated_input.set_mounted_file(&relaunch);
+        self.state
+            .assets
+            .insert(relaunch.mount_path, relaunch.bytes);
+        Ok(())
     }
 
     #[cfg(target_arch = "wasm32")]

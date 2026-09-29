@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use crate::file_input::{self, FileDescriptor};
 use crate::PresentationProfile;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -20,7 +21,25 @@ pub struct AppDescriptor {
     pub audio_enabled: bool,
     /// Required WebGPU limits, empty for other profiles.
     pub gpu_limits: BTreeMap<String, u64>,
+    /// Advisory `fileTypes` hint; it grants nothing.
+    pub file_types: Vec<FileTypeHint>,
 }
+
+/// One advisory `fileTypes` entry naming files the App opens.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FileTypeHint {
+    pub label: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub mime_types: Vec<String>,
+    /// The runtime registration `id` for these files.
+    #[serde(default, deserialize_with = "crate::file_input::present_string")]
+    pub handler: Option<String>,
+}
+
+const MAX_FILE_TYPE_HINTS: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +51,8 @@ struct Manifest {
     app_version: Vec<u32>,
     runtime: Runtime,
     capabilities: Capabilities,
+    #[serde(rename = "fileTypes", default)]
+    file_types: Vec<FileTypeHint>,
 }
 
 #[derive(Deserialize)]
@@ -140,13 +161,26 @@ impl AppDescriptor {
         } else {
             false
         };
+        if manifest.file_types.len() > MAX_FILE_TYPE_HINTS
+            || !manifest.file_types.iter().all(FileTypeHint::is_valid)
+        {
+            bail!("invalid fileTypes hint");
+        }
         Ok(Self {
             app_version: manifest.app_version,
             program_path: manifest.runtime.entrypoint,
             presentation,
             audio_enabled,
             gpu_limits,
+            file_types: manifest.file_types,
         })
+    }
+}
+
+impl FileTypeHint {
+    fn is_valid(&self) -> bool {
+        FileDescriptor::valid_type_filter(&self.label, &self.extensions, &self.mime_types)
+            && self.handler.as_deref().is_none_or(file_input::valid_id)
     }
 }
 
@@ -204,6 +238,41 @@ mod tests {
             .unwrap()
             .replace("\"abiVersion\":1", "\"abiVersion\":2");
         assert!(AppDescriptor::parse_exact(unknown.as_bytes(), unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn file_types_are_an_advisory_bounded_hint() {
+        let with_hint = |hint: &str| {
+            String::from_utf8(MINIMAL.to_vec()).unwrap().replace(
+                "\"kind\":\"app\"",
+                &format!("\"kind\":\"app\",\"fileTypes\":{hint}"),
+            )
+        };
+        let valid = with_hint(
+            r#"[{"label":"SNES cartridge image","extensions":[".sfc",".smc"],"handler":"snes-rom"},{"label":"Text","mimeTypes":["text/plain"]}]"#,
+        );
+        let descriptor = AppDescriptor::parse_exact(valid.as_bytes(), valid.as_bytes()).unwrap();
+        assert_eq!(descriptor.file_types.len(), 2);
+        assert_eq!(
+            descriptor.file_types[0].handler.as_deref(),
+            Some("snes-rom")
+        );
+        for invalid in [
+            r#"[{"label":"L"}]"#,
+            r#"[{"label":"L","extensions":[".x"],"handler":"Bad"}]"#,
+            r#"[{"label":"L","extensions":[".x"],"handler":null}]"#,
+            r#"[{"label":"L","extensions":[".x"],"delivery":"inline"}]"#,
+            r#"[{"label":"","extensions":[".x"]}]"#,
+        ] {
+            let manifest = with_hint(invalid);
+            assert!(
+                AppDescriptor::parse_exact(manifest.as_bytes(), manifest.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        let entry = r#"{"label":"L","extensions":[".x"]}"#;
+        let too_many = with_hint(&format!("[{}]", vec![entry; 17].join(",")));
+        assert!(AppDescriptor::parse_exact(too_many.as_bytes(), too_many.as_bytes()).is_err());
     }
 
     #[test]
