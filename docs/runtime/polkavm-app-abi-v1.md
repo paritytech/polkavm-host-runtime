@@ -78,7 +78,32 @@ The App manifest selects exactly one graphics profile and may enable audio.
 A Host call made outside its declared graphics or audio capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
 silently reinterpret a submission as another graphics profile. Application
-input is part of the base ABI and is never enabled by a manifest capability.
+input and file input are part of the base ABI and are never enabled by a
+manifest capability.
+
+## File-type hint
+
+An App manifest MAY carry a top-level `fileTypes` list naming the files the App
+opens:
+
+```json
+{
+  "fileTypes": [
+    {
+      "label": "SNES cartridge image",
+      "extensions": [".sfc", ".smc"],
+      "handler": "snes-rom"
+    }
+  ]
+}
+```
+
+Each entry has a `label`, at least one of `extensions` or `mimeTypes`, and an
+optional `handler`, each following the rules for the matching §File input
+descriptor field; `handler` names the `id` the App registers for those files.
+The list holds at most 16 entries. A Host MAY use it to suggest the App for a
+file before the App runs. The list is not a capability and grants nothing: a
+Host delivers a file only to a runtime registration.
 
 ## Host imports
 
@@ -437,8 +462,10 @@ host_input_cancel(handle: u32) -> u32
 
 `kind` and `media_type` are lowercase ASCII tokens using letters, digits,
 `-`, `.`, `_`, or `+`; each starts and ends with a letter or digit. Kinds are
-at most 32 bytes and media types at most 64 bytes. `max_bytes` is in
-`1..=1048576`. One execution may hold at most eight registrations. Repeating
+at most 32 bytes and media types at most 64 bytes. A media type is a
+kind-defined token, such as the UR type for `camera-ur`; it is not a MIME type. `max_bytes` is in
+`1..=1048576`. One execution may hold at most eight registrations, counting
+file registrations from `host_file_register`. Repeating
 an identical registration returns the existing positive handle. Registration
 otherwise returns:
 
@@ -482,6 +509,120 @@ type filtering; only the reconstructed UR CBOR bytes cross into guest memory.
 Apps discover `camera-ur` support through `host_input_register`. An unavailable
 kind returns `-2` from registration; it does not make the executable
 structurally incompatible.
+
+#### File input
+
+```text
+host_file_register(pointer: u32, length: u32) -> i32
+host_file_info(handle: u32, pointer: u32, capacity: u32) -> i32
+```
+
+`host_file_register` registers one file handler described by a UTF-8 JSON
+object of at most 4 KiB:
+
+```json
+{
+  "id": "snes-rom",
+  "label": "SNES cartridge image",
+  "extensions": [".sfc", ".smc", ".swc", ".fig"],
+  "maxBytes": 16777216,
+  "delivery": "relaunch",
+  "mountPath": "game/cartridge.sfc"
+}
+```
+
+- `id` is 1 to 64 bytes of lowercase letters, digits, and `-`, starting and
+  ending with a letter or digit, and is unique within the execution.
+- `label` is 1 to 80 UTF-8 bytes shown in Host UI.
+- `extensions` holds at most 16 unique values of `.` followed by 1 to 16
+  lowercase letters or digits.
+- `mimeTypes` holds at most 16 unique lowercase `type/subtype` values of at
+  most 127 bytes, each part using letters, digits, and `!#$&^_.+-`. Wildcards
+  and parameters are invalid.
+- At least one of `extensions` or `mimeTypes` is non-empty.
+- `delivery` is `inline` or `relaunch`.
+- `maxBytes` is an integer in `1..=8388608` for `inline` and
+  `1..=134217728` for `relaunch`.
+- `mountPath` is present only for `relaunch`. It is an archive-relative UTF-8
+  path of at most 1,024 bytes with no empty, `.`, or `..` segment, no leading
+  `/`, no `\`, and no control character. It differs from `runtime.entrypoint`
+  and from every other relaunch registration of the execution.
+
+The descriptor MUST NOT contain unknown fields or duplicate keys, and every
+number is an integer. Rejecting unknown fields means a guest cannot probe for a
+field a Host does not implement; a new field requires a new descriptor shape.
+
+The call returns a positive handle shared with mediated input, so
+`host_input_trigger`, `host_input_status`, `host_input_read`, and
+`host_input_cancel` apply unchanged. Registering a descriptor equal after
+parsing to an existing one returns the existing handle. Registration otherwise
+returns:
+
+```text
+-1  malformed descriptor, guest range, or an existing id with a different
+    descriptor
+-2  file input unavailable for this execution
+-3  registration quota exhausted
+-4  delivery mode unavailable for this execution
+```
+
+A file reaches the guest only through Host UI: a picker opened by
+`host_input_trigger`, a Host menu entry, or a file the user brings to the App,
+such as by dropping it on the surface, opening it from a share sheet, or
+choosing the App in an open-with chooser. The user's selection is the consent.
+The Host activates only an idle registration. When a file matches several
+registrations, the user chooses among them; the Host never picks silently. A
+file that matches no registration is refused in Host UI and does not change any
+status. The Host rejects a matched file above `maxBytes` and reports status 6
+without exposing any bytes. A dismissed picker reports status 4. Every status
+change is an external event and wakes a guest that imports
+`host_update_after`.
+
+Extension and MIME-type matching selects a registration; it does not validate
+the contents. The guest MUST treat the bytes as untrusted input.
+
+While status is 3, `host_file_info` writes a UTF-8 JSON object describing the
+selected file:
+
+```json
+{ "name": "Example Game.sfc", "mimeType": "", "size": 1048576 }
+```
+
+`name` is the base name the Host received, with any path removed and control
+characters replaced. `mimeType` is the type the Host resolved, or empty when it
+has none. The call returns the written byte length, the negated required length
+when `capacity` is too small, zero when no file is selected, or `-1` for an
+unknown handle or invalid guest range.
+
+For `inline` delivery, the selected file becomes a status 3 result read with
+`host_input_read`. The read counts against the per-update Host-call byte
+budget.
+
+For `relaunch` delivery, the Host stops the execution and starts a fresh
+execution of the same App. A Host MUST obtain confirmation before stopping an
+execution the user is interacting with. In the fresh execution,
+`host_asset_read` at `mountPath` returns the selected file in place of any
+archive asset at that path. The fresh execution starts with no registrations
+and registers its handlers again during `init`; once it registers a handler
+with the same `id`, that handle reports status 3 and `host_file_info` describes
+the mounted file until the guest reads or cancels it. Whether a later launch
+reuses the selection is Host policy; a Host SHOULD offer to reopen the last
+file.
+
+The Host retains the most recent non-empty set of registrations until a later
+execution of the App registers a handler, so it can offer to choose another
+file after an execution fails, including one that fails during `init`.
+
+When a file is opened with an App that is not running, the Host launches the
+App holding the file and delivers it to the first registration that matches it.
+A `relaunch` match causes one immediate relaunch with the file mounted.
+
+ABI v1 delivers one file per selection. Multi-file inputs, such as a disc image
+with its cue sheet, are outside this ABI.
+
+Mobile platform pickers filter by system type rather than extension. A Host MAY
+present an unfiltered picker and match the extension afterwards, and Apps
+SHOULD list `mimeTypes` wherever the format has a registered type.
 
 ### Pointer capture
 
@@ -776,13 +917,16 @@ host_asset_read(
 ) -> u32
 ```
 
-The asset name is UTF-8 and relative to the verified application archive. The
+The asset name is UTF-8 and relative to the application archive. The
 Host writes at most `capacity` bytes starting at `offset` and returns the
 number written.
 
 Zero means the name was invalid, the asset was absent, or the offset was at or
 past the end of the asset. Assets are immutable for the lifetime of one
-execution.
+execution. Assets come from the verified archive, except that a file delivered
+through a relaunch registration replaces the asset at that registration's mount
+path. That file is untrusted user input, and it counts toward the asset bounds
+below.
 
 ### Save data
 
@@ -858,7 +1002,8 @@ Host stops the execution on an unhandled guest trap, gas exhaustion, invalid
 memory access, unrecoverable profile error, or Host transport failure.
 
 The Host may stop an execution when its App surface closes, the Product is
-replaced, or platform lifecycle policy requires termination. ABI v1 does not
+replaced, the user selects a file for a relaunch registration, or platform
+lifecycle policy requires termination. ABI v1 does not
 promise transparent restoration of guest memory or graphics resources after a
 stop.
 
@@ -893,6 +1038,8 @@ results covering:
 - save submission;
 - bounded logging;
 - host-frame request/response round trips and queue bounds;
+- file registration bounds, file info, inline delivery, and relaunch delivery
+  through assets;
 - graphics-profile enforcement;
 - demand-driven update deadlines, idle suspension, and external-event wakes.
 
