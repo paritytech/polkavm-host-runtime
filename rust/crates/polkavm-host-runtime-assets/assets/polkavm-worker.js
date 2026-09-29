@@ -791,7 +791,7 @@
       if (this.stopped) {
         return;
       }
-      this.timeMs = timeMs;
+      this.timeMs = Math.max(this.timeMs ?? 0, timeMs);
       this.updateAfterMs = null;
       this.gpuSubmits = 0;
       this.hostFrameRequests = 0;
@@ -3262,7 +3262,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       postMessage({ type: "startup", stage: "interpreter-program-staged" });
       postMessage({ type: "startup", stage: "interpreter-launch-begin" });
       check(
-        begin(MAX_GAS_PER_UPDATE, message.audioEnabled ? 1 : 0, presentation),
+        begin(
+          BigInt(MAX_GAS_PER_UPDATE),
+          message.audioEnabled ? 1 : 0,
+          presentation,
+        ),
         "begin PolkaVM browser launch",
       );
       postMessage({ type: "startup", stage: "interpreter-launch-begun" });

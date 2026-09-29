@@ -1885,6 +1885,79 @@ test("compiler backend honors CoreVM update deadlines", async () => {
   assert.equal(translated.updateAfterMilliseconds(), 250);
 });
 
+test("interpreter backend starts a CoreVM guest", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/update-schedule-corevm.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "corevm-interpreter",
+      forceInterpreter: true,
+    },
+  });
+  const ready = await waitForMessage(messages, "ready");
+  assert.equal(ready.backend, "interpreter");
+  assert.equal(
+    messages.some((message) => message.type === "error"),
+    false,
+  );
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+});
+
+test("compiler backend keeps application time monotonic", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/update-schedule-corevm.polkavm",
+    ),
+  );
+  const { messages, receiver } = endpoint();
+  receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "framebuffer",
+      audioEnabled: false,
+      cacheKey: "monotonic-application-time",
+    },
+  });
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.program,
+    [],
+    () => {},
+    1_000_000,
+    false,
+    "framebuffer",
+  );
+  translated.initialize();
+  translated.update(50);
+  translated.update(10);
+  assert.equal(translated.timeMs, 50);
+});
+
 test("compiler backend discards stale CoreVM mouse movement", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

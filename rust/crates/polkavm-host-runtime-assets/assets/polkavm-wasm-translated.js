@@ -791,7 +791,7 @@
       if (this.stopped) {
         return;
       }
-      this.timeMs = timeMs;
+      this.timeMs = Math.max(this.timeMs ?? 0, timeMs);
       this.updateAfterMs = null;
       this.gpuSubmits = 0;
       this.hostFrameRequests = 0;
