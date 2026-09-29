@@ -582,6 +582,12 @@ status 6 without exposing any bytes. A dismissed picker reports status 4. Every 
 change is an external event and wakes a guest that imports
 `host_update_after`.
 
+Host UI races the guest, so the runtime ignores a result for a registration
+that is no longer active and refuses a file for an unknown handle. It
+normalizes the Host's MIME type to lowercase without parameters and drops an
+invalid one, and it rejects with status 6 a file whose name is empty after
+sanitizing.
+
 Extension and MIME-type matching selects a registration; it does not validate
 the contents. The guest MUST treat the bytes as untrusted input.
 
