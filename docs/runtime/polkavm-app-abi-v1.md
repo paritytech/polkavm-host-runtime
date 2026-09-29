@@ -500,8 +500,10 @@ The Host MUST reject empty results and results larger than the registration's
 bound before they become visible to the guest.
 
 `host_input_cancel` returns 0 and tells the Host to stop capture for an active
-request, 1 for an unknown handle, or 2 when that handle is not active. Runtime
-teardown cancels every active request and releases every device stream.
+request, returns 0 and discards the result of a handle in status 3, 1 for an
+unknown handle, or 2 for any other state. Either success resets the
+registration to status 1. Runtime teardown cancels every active request and
+releases every device stream.
 
 ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
 The Host owns camera access, QR recognition, UR fountain reconstruction, and
