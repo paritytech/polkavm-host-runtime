@@ -557,7 +557,8 @@ field a Host does not implement; a new field requires a new descriptor shape.
 The call returns a positive handle shared with mediated input, so
 `host_input_trigger`, `host_input_status`, `host_input_read`, and
 `host_input_cancel` apply unchanged. Registering a descriptor equal after
-parsing to an existing one returns the existing handle. Registration otherwise
+parsing to an existing one returns the existing handle; `extensions` and
+`mimeTypes` compare as ordered lists. Registration otherwise
 returns:
 
 ```text
@@ -572,11 +573,12 @@ A file reaches the guest only through Host UI: a picker opened by
 `host_input_trigger`, a Host menu entry, or a file the user brings to the App,
 such as by dropping it on the surface, opening it from a share sheet, or
 choosing the App in an open-with chooser. The user's selection is the consent.
-The Host activates only an idle registration. When a file matches several
+The Host activates only an idle registration, one in status 1, 4, 5, or 6
+while no other registration is active. When a file matches several
 registrations, the user chooses among them; the Host never picks silently. A
 file that matches no registration is refused in Host UI and does not change any
-status. The Host rejects a matched file above `maxBytes` and reports status 6
-without exposing any bytes. A dismissed picker reports status 4. Every status
+status. The Host rejects an empty matched file or one above `maxBytes` and reports
+status 6 without exposing any bytes. A dismissed picker reports status 4. Every status
 change is an external event and wakes a guest that imports
 `host_update_after`.
 
@@ -591,8 +593,9 @@ selected file:
 ```
 
 `name` is the base name the Host received, with any path removed and control
-characters replaced. `mimeType` is the type the Host resolved, or empty when it
-has none. The call returns the written byte length, the negated required length
+characters replaced; it is 1 to 1,024 bytes, and a file whose name is empty
+after sanitizing is rejected. `mimeType` is the lowercase `type/subtype` the
+Host resolved, without parameters, or empty when it has none. The call returns the written byte length, the negated required length
 when `capacity` is too small, zero when no file is selected, or `-1` for an
 unknown handle or invalid guest range.
 
@@ -605,9 +608,13 @@ execution of the same App. A Host MUST obtain confirmation before stopping an
 execution the user is interacting with. In the fresh execution,
 `host_asset_read` at `mountPath` returns the selected file in place of any
 archive asset at that path. The fresh execution starts with no registrations
-and registers its handlers again during `init`; once it registers a handler
-with the same `id`, that handle reports status 3 and `host_file_info` describes
-the mounted file until the guest reads or cancels it. Whether a later launch
+and registers its handlers again during `init`. A handler registered with the
+same `id`, `delivery`, and `mountPath` and a `maxBytes` no smaller than the
+file reports status 3, and `host_file_info` describes the mounted file until the
+guest acknowledges it; any other re-registration stays at status 1 while the
+file remains mounted. For a relaunch handle, `host_input_read` writes nothing,
+returns zero, and acknowledges the file, as does `host_input_cancel`; both
+reset the registration to status 1. Whether a later launch
 reuses the selection is Host policy; a Host SHOULD offer to reopen the last
 file.
 
