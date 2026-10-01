@@ -37,6 +37,7 @@ pub struct CoreVmRuntime {
     max_gas_per_update: u64,
     exited: bool,
     stopped: bool,
+    paused: bool,
 }
 
 impl ApplicationRuntime {
@@ -104,6 +105,7 @@ impl ApplicationRuntime {
             max_gas_per_update,
             exited: false,
             stopped: false,
+            paused: false,
         }))
     }
 
@@ -146,6 +148,35 @@ impl ApplicationRuntime {
         match self {
             Self::Cooperative(runtime) => runtime.is_stopped(),
             Self::CoreVm(runtime) => runtime.stopped,
+        }
+    }
+
+    /// Freezes updates and execution-scoped monotonic time, never wall time.
+    /// Release held controls before pausing; audio-device suspension is Host policy.
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.is_stopped() {
+            return;
+        }
+        match self {
+            Self::Cooperative(runtime) => runtime.set_paused(paused),
+            Self::CoreVm(runtime) => {
+                if runtime.paused == paused {
+                    return;
+                }
+                if paused {
+                    runtime.pause_input();
+                }
+                runtime.vm.set_paused(paused);
+                runtime.paused = paused;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pause_input(&mut self) {
+        match self {
+            Self::Cooperative(runtime) => runtime.pause_input(),
+            Self::CoreVm(runtime) => runtime.pause_input(),
         }
     }
 
@@ -246,6 +277,13 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn set_random_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_random_bytes(bytes),
+            Self::CoreVm(_) => Ok(()),
+        }
+    }
+
     pub fn set_motion_availability(
         &mut self,
         availability: crate::motion_wire::MotionAvailability,
@@ -319,6 +357,14 @@ impl ApplicationRuntime {
             self.stop();
         }
         result
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        match self {
+            Self::Cooperative(runtime) => runtime.pending_host_frame_responses(),
+            Self::CoreVm(runtime) => runtime.vm.pending_host_frame_responses(),
+        }
     }
 
     pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
@@ -463,6 +509,12 @@ impl ApplicationRuntime {
 }
 
 impl CoreVmRuntime {
+    fn pause_input(&mut self) {
+        self.vm.pause_input();
+        self.pointer = None;
+        self.audio.clear();
+    }
+
     fn stop(&mut self) {
         if self.stopped {
             return;
@@ -472,7 +524,7 @@ impl CoreVmRuntime {
     }
 
     fn update(&mut self) -> Result<()> {
-        if self.exited {
+        if self.exited || self.paused {
             return Ok(());
         }
         self.vm.begin_update();
@@ -583,6 +635,9 @@ impl CoreVmRuntime {
     }
 
     fn send_input(&mut self, event: InputEvent) {
+        if self.paused && !crate::input_survives_pause(&event.encode()) {
+            return;
+        }
         let pointer_delta = if event.event_type == InputEventType::PointerDelta {
             match (corevm_pointer_delta(event.x), corevm_pointer_delta(event.y)) {
                 (Some(delta_x), Some(delta_y)) => Some((delta_x, delta_y)),

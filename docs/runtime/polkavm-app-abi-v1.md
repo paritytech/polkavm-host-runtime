@@ -131,6 +131,46 @@ A guest that does not import this call retains Host-defined continuous
 scheduling for compatibility. Scheduling does not weaken per-update gas or
 Host-call budgets.
 
+A Host may hard-pause execution. It MUST release held input before pausing,
+discard queued gameplay actions and audio, and prevent new gameplay presses
+from accumulating. Releases and viewport state may remain pending until the
+first resumed update. Hard-paused execution does not process updates or
+external-event wakes. Execution-scoped monotonic time excludes the pause; wall
+time does not. Resume MUST NOT replay missed update ticks or buffered audio.
+
+The browser endpoint distinguishes this hard pause (`pause` / `pause-state`,
+with boolean `paused`) from presentation inactivity (`background` /
+`background-state`, with boolean `backgrounded`). A background request MAY carry
+a nonnegative safe-integer `seq`, echoed by its acknowledgment before resumed
+presentation. Both states are retained before and during startup, allowing
+initialization but withholding ordinary updates. Hard pause takes precedence.
+Overlapping inactive intervals freeze elapsed update time once, not once per
+reason, and both states discard gameplay input, motion, and audio.
+
+Background mode is **not simulation suspension**. Host-frame responses wake
+bounded service updates for legacy as well as demand-driven guests, without
+periodic background timers or honoring guest update-delay requests. Responses
+remain ordered in the existing bounded queue; rejection due to queue pressure
+is retryable and also wakes service work. A coalesced burst allows up to 32
+service updates, with up to 32 additional translated cooperative continuation
+slices per response wake; exhausted work waits for another external response
+or foreground resume rather than spinning indefinitely. Guests must poll their
+responses to make progress. Service updates may read real wall time, change
+guest state, submit saves, or perform external side effects. Hosts MUST NOT
+stop subscriptions, coalesce responses, or discard protocol/GPU work merely
+because presentation is inactive.
+
+The browser runtime retains the latest complete framebuffer for foreground
+resume, including idle guests. Tri2D retained-resource transitions MUST still
+be applied atomically and in order while inactive; a Host may hold only the
+latest completed offscreen presentation, not only the latest Tri2D byte stream.
+The same distinction applies to WebGPU command execution versus visible surface
+presentation; already submitted GPU work may complete at the transition.
+Hosts suppress clipboard/navigation interactions, defer pointer-capture
+acquisition, cancel new mediated-input prompts (including file pickers) while
+inactive, and retain current cursor/IME state for resume. Stopping MUST clear
+retained presentation so queued callbacks cannot replay stale output.
+
 ### Framebuffer presentation
 
 ```text
@@ -650,7 +690,8 @@ file that matches no registration is refused in Host UI and does not change any
 status. The Host rejects an empty matched file or one above `maxBytes` and reports
 status 6 without exposing any bytes. A dismissed picker reports status 4. Every status
 change is an external event and wakes a guest that imports
-`host_update_after`.
+`host_update_after`. While the execution is paused or backgrounded, the change
+is retained and observed by the next executed update; it does not start one.
 
 Extension and MIME-type matching selects a registration; it does not validate
 the contents. The guest MUST treat the bytes as untrusted input.
@@ -1019,6 +1060,20 @@ It is not wall-clock time.
 sleep allowance for the current call. A Host MAY return earlier than the
 requested duration.
 
+### Random
+
+```text
+host_random_fill(destination: u32, length: u32) -> u32
+```
+
+The Host fills the requested guest range from a CSPRNG. Random bytes are
+independent for every execution and MUST NOT be derived from `host_time_ms`.
+
+```text
+0  accepted
+1  zero length, over the per-call limit, or execution pool exhausted
+```
+
 ### Audio
 
 ```text
@@ -1108,6 +1163,8 @@ audio samples per submission          96,000
 queued audio                           2 seconds
 queued input events                   4,096
 save data                             1 MiB
+random bytes per call                 4 KiB
+random bytes per execution            64 KiB
 one log                               4 KiB
 queued logs                           64
 queued GPU batches                    4

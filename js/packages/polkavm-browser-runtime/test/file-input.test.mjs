@@ -437,6 +437,34 @@ test("both browser backends deliver a triggered inline file with its info", asyn
   }
 });
 
+test("both browser backends hold a file delivered while paused until resume", async () => {
+  for (const forceInterpreter of BACKENDS) {
+    const { receiver, messages } = await launch({
+      records: [INLINE, { trigger: 0 }],
+      forceInterpreter,
+    });
+    try {
+      await nextMessage(messages, 0, "file-input-request");
+      receiver.onmessage({ data: { type: "pause", paused: true } });
+      await nextMessage(messages, 0, "pause-state");
+      const { delivery, from } = await deliver(receiver, messages, 1, "a.txt", "", "abc");
+      assert.equal(delivery.outcome, "ready");
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      assert.equal(
+        messages.slice(from).some((message) => message.type === "save"),
+        false,
+        "a paused execution must not run an update for the delivery",
+      );
+      receiver.onmessage({ data: { type: "pause", paused: false } });
+      const ready = await snapshotAfter(messages, from);
+      assert.equal(ready.probes[0].status, 3);
+      assert.equal(ready.probes[0].read, "abc");
+    } finally {
+      await stop(receiver, messages);
+    }
+  }
+});
+
 test("both browser backends activate idle registrations and reject over-bound files", async () => {
   for (const forceInterpreter of BACKENDS) {
     const { receiver, messages } = await launch({
