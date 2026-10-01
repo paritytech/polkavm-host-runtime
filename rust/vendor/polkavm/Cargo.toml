@@ -1,0 +1,157 @@
+# Vendored from the immutable revision in package.metadata.upstream.
+# Workspace inheritance is expanded; non-vendored PolkaVM dependencies retain that pin.
+
+
+[package]
+"name" = "polkavm"
+"version" = "0.37.0"
+"authors" = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
+"license" = "MIT/Apache-2.0"
+"edition" = "2021"
+"rust-version" = "1.86.0"
+"repository" = "https://github.com/koute/polkavm"
+"documentation" = "https://docs.rs/polkavm"
+"description" = "A fast and secure RISC-V based virtual machine"
+"metadata" = { "upstream" = { "repository" = "https://github.com/paritytech/polkavm.git", "revision" = "c160c13c3c29bf3219ce1404ec95976000235a94", "patch" = "Bound interpreter stack residency to the declared stack size; preserve the lower guard and Host reads." } }
+
+[dependencies]
+"log" = { "version" = "0.4.20" }
+"picosimd" = { "version" = "0.9.6", "features" = ["ops"] }
+"polkavm-assembler" = { "version" = "0.37.0", "git" = "https://github.com/paritytech/polkavm.git", "rev" = "c160c13c3c29bf3219ce1404ec95976000235a94", "features" = ["alloc"] }
+"polkavm-common" = { "version" = "0.37.0", "git" = "https://github.com/paritytech/polkavm.git", "rev" = "c160c13c3c29bf3219ce1404ec95976000235a94", "features" = ["alloc", "logging", "regmap", "unique-id", "simd"] }
+"schnellru" = { "version" = "0.2.3", "optional" = true }
+
+[target."cfg(all(not(miri), target_arch = \"x86_64\", target_os = \"linux\"))".dependencies]
+"polkavm-linux-raw" = { "version" = "0.37.0", "git" = "https://github.com/paritytech/polkavm.git", "rev" = "c160c13c3c29bf3219ce1404ec95976000235a94", "features" = ["std"] }
+
+[target."cfg(all(not(miri), target_arch = \"x86_64\", any(target_os = \"macos\", target_os = \"freebsd\")))".dependencies]
+"libc" = { "version" = "0.2.149" }
+
+[target."cfg(all(not(miri), target_arch = \"aarch64\", any(target_os = \"macos\", target_os = \"freebsd\")))".dependencies]
+"libc" = { "version" = "0.2.149" }
+
+[dev-dependencies]
+"env_logger" = { "version" = "0.10.0", "default-features" = false }
+"polkavm-common" = { "version" = "0.37.0", "git" = "https://github.com/paritytech/polkavm.git", "rev" = "c160c13c3c29bf3219ce1404ec95976000235a94", "features" = ["export-internals-for-testing"] }
+"polkavm-linker" = { "version" = "0.37.0", "git" = "https://github.com/paritytech/polkavm.git", "rev" = "c160c13c3c29bf3219ce1404ec95976000235a94" }
+"image" = { "version" = "0.24.7", "default-features" = false, "features" = ["tga"] }
+"ruzstd" = { "version" = "0.5.0", "default-features" = false }
+"paste" = { "version" = "1.0.15" }
+"oorandom" = "11.1.5"
+
+[lints.rust]
+"unexpected_cfgs" = { "level" = "warn", "check-cfg" = ["cfg(kani)", "cfg(polkavm_dev_debug_zygote)"] }
+"mismatched_lifetime_syntaxes" = "allow"
+"unknown_lints" = "allow"
+
+[lints.clippy]
+"unwrap_or_default" = "allow"
+"get_first" = "allow"
+"manual_range_contains" = "allow"
+"let_unit_value" = "allow"
+"unit_arg" = "allow"
+"type_complexity" = "allow"
+"too_many_arguments" = "allow"
+"needless_late_init" = "allow"
+"neg_multiply" = "allow"
+"needless_lifetimes" = "allow"
+"unnecessary_map_or" = "allow"
+"manual_range_patterns" = "allow"
+"alloc_instead_of_core" = "warn"
+"as_ptr_cast_mut" = "warn"
+"as_underscore" = "warn"
+"borrow_as_ptr" = "warn"
+"branches_sharing_code" = "warn"
+"cast_ptr_alignment" = "warn"
+"clear_with_drain" = "warn"
+"clone_on_ref_ptr" = "warn"
+"cloned_instead_of_copied" = "warn"
+"collection_is_never_read" = "warn"
+"copy_iterator" = "warn"
+"dbg_macro" = "warn"
+"debug_assert_with_mut_call" = "warn"
+"default_union_representation" = "warn"
+"disallowed_script_idents" = "warn"
+"doc_link_with_quotes" = "warn"
+"empty_line_after_doc_comments" = "warn"
+"empty_line_after_outer_attr" = "warn"
+"exit" = "warn"
+"filter_map_next" = "warn"
+"flat_map_option" = "warn"
+"fn_params_excessive_bools" = "warn"
+"fn_to_numeric_cast_any" = "warn"
+"format_push_string" = "warn"
+"ignored_unit_patterns" = "warn"
+"implicit_clone" = "warn"
+"implicit_hasher" = "warn"
+"inconsistent_struct_constructor" = "warn"
+"index_refutable_slice" = "warn"
+"inefficient_to_string" = "warn"
+"iter_not_returning_iterator" = "warn"
+"iter_on_empty_collections" = "warn"
+"iter_on_single_items" = "warn"
+"large_stack_arrays" = "warn"
+"large_stack_frames" = "warn"
+"large_types_passed_by_value" = "warn"
+"lossy_float_literal" = "warn"
+"manual_instant_elapsed" = "warn"
+"manual_let_else" = "warn"
+"manual_ok_or" = "warn"
+"manual_string_new" = "warn"
+"match_wild_err_arm" = "warn"
+"match_wildcard_for_single_variants" = "warn"
+"maybe_infinite_iter" = "warn"
+"mismatching_type_param_order" = "warn"
+"missing_fields_in_debug" = "warn"
+"mixed_read_write_in_expression" = "warn"
+"mut_mut" = "warn"
+"mutex_atomic" = "warn"
+"mutex_integer" = "warn"
+"needless_collect" = "warn"
+"needless_for_each" = "warn"
+"needless_pass_by_ref_mut" = "warn"
+"needless_raw_string_hashes" = "warn"
+"needless_raw_strings" = "warn"
+"no_mangle_with_rust_abi" = "warn"
+"nonstandard_macro_braces" = "warn"
+"partial_pub_fields" = "warn"
+"path_buf_push_overwrite" = "warn"
+"print_stderr" = "warn"
+"print_stdout" = "warn"
+"ptr_as_ptr" = "warn"
+"ptr_cast_constness" = "warn"
+"range_minus_one" = "warn"
+"read_zero_byte_vec" = "warn"
+"readonly_write_lock" = "warn"
+"redundant_clone" = "warn"
+"ref_option_ref" = "warn"
+"rest_pat_in_fully_bound_structs" = "warn"
+"same_functions_in_if_condition" = "warn"
+"same_name_method" = "warn"
+"std_instead_of_core" = "warn"
+"str_to_string" = "warn"
+"string_add" = "warn"
+"string_add_assign" = "warn"
+"string_to_string" = "warn"
+"trailing_empty_array" = "warn"
+"trait_duplication_in_bounds" = "warn"
+"transmute_undefined_repr" = "warn"
+"trivially_copy_pass_by_ref" = "warn"
+"type_repetition_in_bounds" = "warn"
+"undocumented_unsafe_blocks" = "warn"
+"unsafe_derive_deserialize" = "warn"
+"unused_peekable" = "warn"
+"unused_self" = "warn"
+"use_debug" = "warn"
+"used_underscore_binding" = "warn"
+"cast_lossless" = "deny"
+"expl_impl_clone_on_copy" = "deny"
+"transmute_ptr_to_ptr" = "deny"
+
+[features]
+"default" = ["std"]
+"std" = ["ruzstd/std"]
+"module-cache" = ["dep:schnellru", "polkavm-common/blake3"]
+"generic-sandbox" = []
+"export-internals-for-testing" = []
+"interpreter-musttail-dispatch" = []

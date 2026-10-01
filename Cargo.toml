@@ -8,6 +8,7 @@ members = [
     "rust/crates/polkavm-host-runtime-assets",
     "rust/crates/polkavm-assets-export",
 ]
+exclude = ["rust/vendor/polkavm"]
 
 [workspace.package]
 version = "0.3.0"

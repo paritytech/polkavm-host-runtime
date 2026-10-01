@@ -58,6 +58,10 @@ const manifest = {
   polkavm: {
     nativeRevision: revision("PolkaVM native revision"),
     wasmRevision: revision("PolkaVM wasm revision"),
+    localPatch: {
+      sourcePath: "rust/vendor/polkavm",
+      description: "Bound interpreter stack residency to the declared stack size",
+    },
   },
   artifacts,
 };
