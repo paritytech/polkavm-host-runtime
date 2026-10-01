@@ -26,31 +26,31 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "010735cd12021c55f840109eebe832e3bb69b498cc24ef58a8fb70e4750b6efe",
+        sha256: "b3aa0834da6d758ddd7d9586d90a0307f60bf665a2cee883e11b8244ab77fa1f",
     },
     BrowserAsset {
         path: "polkavm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-worker.js"),
-        sha256: "5f9b41a877ad104bd73fed8c2235fc15b34db8904cb4a63351d378462551887a",
+        sha256: "75245bf222b2b16136f44acd9bb8c668fcd66de93158a32b9601b1e3b3e409d5",
     },
     BrowserAsset {
         path: "polkavm-gpu-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-gpu-worker.js"),
-        sha256: "447e1a9f8ffe4db4db83c37b70bfbeb2409b5ca9e437cb68d0d1822c053c07b4",
+        sha256: "a10d8d02401f145c99077f4ffc4eb82e2ff736bb6838dc7726f712234d1764f8",
     },
     BrowserAsset {
         path: "polkavm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-wasm-translated.js"),
-        sha256: "0c17cbd6d0e4d964ffde754cf49006b8fef1d29555464b1909e74fa268f3caf7",
+        sha256: "16b1d16f14da55945e6af62f8d321cc347d6696958d064e441abfe40e1fb50af",
     },
     BrowserAsset {
         path: "polkavm-runtime-core.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-runtime-core.js"),
-        sha256: "2b6a08a73c19917b6b43648cad5b76c7c962ca078a28398a11fa2cfa0f83d799",
+        sha256: "20c3cde8609fc5d28c221b0d0511c837951d8fff8e85ef2361c2485a2e2e401a",
     },
     BrowserAsset {
         path: "polkavm-wasm-worker-entry.js",
@@ -62,13 +62,13 @@ const ASSETS: [BrowserAsset; 8] = [
         path: "polkavm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-computer.js"),
-        sha256: "d16fb4c2898b2d04671103e0c193d6e21cbb12378c1cd9191ead47b022ca5878",
+        sha256: "4522404314309b5075630dee4595db557fff03dc20530a6aee846eb44ab7f607",
     },
     BrowserAsset {
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "be62ff95fd3acaafefead57cff32bb53883dbfec778972ed72e53cd3085ecc09",
+        sha256: "77a0cf4afeef81b61535ae689f3f2cbb2cab12117f58c62f33d0e4dc07fffd67",
     },
 ];
 

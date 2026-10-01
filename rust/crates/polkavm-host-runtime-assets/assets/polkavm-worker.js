@@ -41,6 +41,9 @@
   const MAX_FILE_NAME_BYTES = 1024;
   const MAX_INLINE_FILE_BYTES = 8 * 1024 * 1024;
   const MAX_RELAUNCH_FILE_BYTES = 128 * 1024 * 1024;
+  const MAX_STREAM_FILE_BYTES = 0xffffffff;
+  const MAX_FILE_READ_BYTES = 65536;
+  const MAX_FILE_CACHE_BYTES = 512 * 1024 * 1024;
   const MAX_ASSET_FILES = 2048;
   const MAX_ASSET_BYTES = 256 * 1024 * 1024;
   const FILE_REGISTER_DELIVERY_UNAVAILABLE = -4;
@@ -413,9 +416,11 @@
         ? MAX_INLINE_FILE_BYTES
         : delivery === "relaunch"
           ? MAX_RELAUNCH_FILE_BYTES
-          : 0;
+          : delivery === "stream"
+            ? MAX_STREAM_FILE_BYTES
+            : 0;
     const mountPathValid =
-      delivery === "inline"
+      delivery === "inline" || delivery === "stream"
         ? !Object.hasOwn(raw, "mountPath")
         : validFileMountPath(mountPath);
     if (
@@ -960,16 +965,23 @@
         fileInput !== null &&
         (typeof fileInput?.inline !== "boolean" ||
           typeof fileInput.relaunch !== "boolean" ||
-          ((fileInput.inline || fileInput.relaunch) &&
+          (fileInput.stream !== undefined && typeof fileInput.stream !== "boolean") ||
+          ((fileInput.inline || fileInput.relaunch || fileInput.stream) &&
             !validFileMountPath(fileInput.entrypoint)))
       ) {
         throw new Error("translated PolkaVM runtime has invalid file-input support");
       }
       this.fileInput =
-        fileInput?.inline || fileInput?.relaunch ? { ...fileInput } : null;
+        fileInput?.inline || fileInput?.relaunch || fileInput?.stream
+          ? { ...fileInput, stream: fileInput.stream ?? false }
+          : null;
       this.mountedFile = null;
       this.initialized = false;
       this.mediatedInputRegistrations = new Map();
+      this.fileCacheBytes = 0;
+      this.fileCacheCleanups = new Set();
+      this.fileCacheCleanupFailed = false;
+      this.fileCacheStopped = null;
       this.nextMediatedInputHandle = 0;
       this.activeMediatedInputHandle = null;
       this.tri2dSubmitted = false;
@@ -1427,6 +1439,8 @@
         status: MEDIATED_INPUT_STATUS_REGISTERED,
         result: null,
         file: null,
+        source: null,
+        cache: null,
       });
       return this.nextMediatedInputHandle;
     }
@@ -1515,6 +1529,9 @@
       if (!registration?.descriptor) {
         throw new Error(`translated handle ${handle} is not a file registration`);
       }
+      if (registration.descriptor.delivery === "stream") {
+        throw new Error("translated streamed files require metadata-only delivery");
+      }
       const accepted =
         this.activeMediatedInputHandle === null
           ? registration.status !== MEDIATED_INPUT_STATUS_READY
@@ -1550,6 +1567,253 @@
           bytes,
         },
       };
+    }
+
+    /** Takes ownership of a Host-retained source without reading its contents. */
+    sendFileStream(handle, name, mimeType, size, source, cache = null) {
+      let installed = false;
+      try {
+        const sanitized = sanitizeFileName(name);
+        validateSelectedMimeType(mimeType);
+        if (
+          this.stopped ||
+          !Number.isSafeInteger(size) ||
+          size < 0 ||
+          typeof source?.read !== "function" ||
+          typeof source.close !== "function" ||
+          (cache !== null && ["size", "reset", "write", "read", "flush", "close"]
+            .some((method) => typeof cache?.[method] !== "function"))
+        ) {
+          throw new Error("invalid translated stream selection");
+        }
+        const registration = this.mediatedInputRegistrations.get(handle);
+        if (registration?.descriptor?.delivery !== "stream") {
+          throw new Error(`translated handle ${handle} is not a stream registration`);
+        }
+        const accepted =
+          this.activeMediatedInputHandle === null
+            ? registration.status !== MEDIATED_INPUT_STATUS_READY
+            : this.activeMediatedInputHandle === handle;
+        if (!accepted) {
+          return { outcome: "refused" };
+        }
+        this.activeMediatedInputHandle = null;
+        registration.result = null;
+        registration.file = null;
+        if (!size || size > registration.maxBytes || size > MAX_STREAM_FILE_BYTES) {
+          registration.status = MEDIATED_INPUT_STATUS_FAILED;
+          return { outcome: "rejected" };
+        }
+        registration.file = { name: sanitized, mimeType, size };
+        registration.source = source;
+        registration.cache = cache === null
+          ? null
+          : { backend: cache, size: 0, cursor: 0, sealed: false };
+        registration.status = MEDIATED_INPUT_STATUS_READY;
+        installed = true;
+        return { outcome: "ready" };
+      } finally {
+        if (!installed) {
+          try {
+            source?.close?.();
+          } finally {
+            if (typeof cache?.close === "function") this.#releaseFileCache(cache);
+          }
+        }
+      }
+    }
+
+    #closeFileStream(registration) {
+      const source = registration.source;
+      registration.source = null;
+      try {
+        source?.close();
+      } finally {
+        this.#closeFileCache(registration);
+      }
+    }
+
+    #closeFileCache(registration) {
+      const cache = registration.cache;
+      registration.cache = null;
+      if (cache !== null) {
+        this.fileCacheBytes -= cache.size;
+        this.#releaseFileCache(cache.backend);
+      }
+    }
+
+    #releaseFileCache(cache) {
+      const failed = (error) => {
+        this.fileCacheCleanupFailed = true;
+        this.emit({
+          type: "error",
+          message: `PolkaVM private cache cleanup failed: ${error?.message ?? error}`,
+        });
+      };
+      try {
+        const closing = cache.close();
+        if (closing?.then) {
+          const pending = Promise.resolve(closing).catch(failed);
+          this.fileCacheCleanups.add(pending);
+          void pending.then(() => this.fileCacheCleanups.delete(pending));
+        }
+      } catch (error) {
+        failed(error);
+      }
+    }
+
+    #fileCache(handle) {
+      const registration = this.mediatedInputRegistrations.get(handle);
+      return registration?.status === MEDIATED_INPUT_STATUS_READY &&
+        registration.source !== null && registration.cache !== null
+        ? registration
+        : null;
+    }
+
+    #resetFileCache(handle, size) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (size < 1 || size > MAX_FILE_CACHE_BYTES ||
+          this.fileCacheBytes - cache.size + size > MAX_FILE_CACHE_BYTES) {
+        return -2;
+      }
+      try {
+        cache.backend.reset(size);
+        if (cache.backend.size() !== size) {
+          throw new Error("invalid translated cache size");
+        }
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      this.fileCacheBytes += size - cache.size;
+      cache.size = size;
+      cache.cursor = 0;
+      cache.sealed = false;
+      return 0;
+    }
+
+    #writeFileCache(handle, offset, pointer, length) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (cache.sealed || length < 1 || length > MAX_FILE_READ_BYTES ||
+          offset !== cache.cursor || offset + length > cache.size) {
+        return -2;
+      }
+      this.#chargeBytes(length);
+      let bytes;
+      try {
+        bytes = this.#range(pointer, length);
+      } catch {
+        return -3;
+      }
+      try {
+        if (cache.backend.write(offset, bytes) !== length) {
+          throw new Error("short translated cache write");
+        }
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      cache.cursor += length;
+      return length;
+    }
+
+    #commitFileCache(handle) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (cache.sealed || cache.size === 0 || cache.cursor !== cache.size) {
+        return -2;
+      }
+      try {
+        cache.backend.flush();
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      cache.sealed = true;
+      return 0;
+    }
+
+    #readFileCache(handle, offset, pointer, length) {
+      const registration = this.#fileCache(handle);
+      if (registration === null || !registration.cache.sealed) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (length < 1 || length > MAX_FILE_READ_BYTES || offset > cache.size) {
+        return -2;
+      }
+      const actual = Math.min(length, cache.size - offset);
+      this.#chargeBytes(actual);
+      if (actual === 0) {
+        return 0;
+      }
+      let destination;
+      try {
+        destination = this.#range(pointer, actual, true);
+      } catch {
+        return -3;
+      }
+      try {
+        const bytes = cache.backend.read(offset, actual);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== actual) {
+          throw new Error("short translated cache read");
+        }
+        destination.set(bytes);
+        return actual;
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+    }
+
+    #readFileStream(handle, offset, pointer, length) {
+      const registration = this.mediatedInputRegistrations.get(handle);
+      if (
+        registration?.descriptor?.delivery !== "stream" ||
+        registration.file === null ||
+        registration.source === null
+      ) {
+        return -1;
+      }
+      if (length < 1 || length > MAX_FILE_READ_BYTES || offset > registration.file.size) {
+        return -2;
+      }
+      const actual = Math.min(length, registration.file.size - offset);
+      this.#chargeBytes(actual);
+      if (actual === 0) {
+        return 0;
+      }
+      let destination;
+      try {
+        destination = this.#range(pointer, actual, true);
+      } catch {
+        return -3;
+      }
+      try {
+        const bytes = registration.source.read(offset, actual);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== actual) {
+          throw new Error("short translated stream read");
+        }
+        destination.set(bytes);
+        return actual;
+      } catch {
+        registration.file = null;
+        registration.status = MEDIATED_INPUT_STATUS_FAILED;
+        this.#closeFileStream(registration);
+        this.emit({ type: "mediated-input-cancel", handle });
+        return -4;
+      }
     }
 
     /**
@@ -1595,12 +1859,15 @@
     }
 
     #triggerMediatedInput(handle) {
+      const registration = this.mediatedInputRegistrations.get(handle);
       if (this.activeMediatedInputHandle !== null) {
         return 2;
       }
-      const registration = this.mediatedInputRegistrations.get(handle);
       if (!registration) {
         return 1;
+      }
+      if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
+        this.#cancelMediatedInput(handle);
       }
       registration.status = MEDIATED_INPUT_STATUS_ACTIVE;
       this.activeMediatedInputHandle = handle;
@@ -1633,6 +1900,10 @@
         registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
         registration.result = null;
         registration.file = null;
+        if (registration.descriptor?.delivery === "stream") {
+          this.#closeFileStream(registration);
+          this.emit({ type: "mediated-input-cancel", handle });
+        }
         return 0;
       }
       if (registration.status !== MEDIATED_INPUT_STATUS_ACTIVE) {
@@ -1647,7 +1918,16 @@
     }
 
     stop() {
+      if (this.stopped) {
+        return this.fileCacheStopped;
+      }
       this.stopped = true;
+      for (const [handle, registration] of this.mediatedInputRegistrations) {
+        if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
+          this.#closeFileStream(registration);
+          this.emit({ type: "mediated-input-cancel", handle });
+        }
+      }
       this.input.length = 0;
       this.coreInput.length = 0;
       this.hostFrameRequests = 0;
@@ -1657,6 +1937,13 @@
       this.hostFrameResponseBytes = 0;
       this.mediatedInputRegistrations.clear();
       this.activeMediatedInputHandle = null;
+      this.fileCacheStopped = (async () => {
+        while (this.fileCacheCleanups.size) {
+          await Promise.all([...this.fileCacheCleanups]);
+        }
+        return { cleanupFailed: this.fileCacheCleanupFailed };
+      })();
+      return this.fileCacheStopped;
     }
 
     #resetBudget(hostcalls) {
@@ -2102,10 +2389,7 @@
             this.#setReg(7, BigInt(FILE_INFO_INVALID));
             return false;
           }
-          if (
-            registration.status !== MEDIATED_INPUT_STATUS_READY ||
-            registration.file === null
-          ) {
+          if (registration.file === null) {
             this.#setReg(7, 0n);
             return false;
           }
@@ -2124,6 +2408,31 @@
           this.#setReg(7, BigInt(written ? info.byteLength : FILE_INFO_INVALID));
           return false;
         }
+        case "host_file_read": {
+          this.#setReg(
+            7,
+            BigInt(this.#readFileStream(
+              this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+            )),
+          );
+          return false;
+        }
+        case "host_file_cache_reset":
+          this.#setReg(7, BigInt(this.#resetFileCache(this.#u32(a0), this.#u32(a1))));
+          return false;
+        case "host_file_cache_write":
+          this.#setReg(7, BigInt(this.#writeFileCache(
+            this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+          )));
+          return false;
+        case "host_file_cache_commit":
+          this.#setReg(7, BigInt(this.#commitFileCache(this.#u32(a0))));
+          return false;
+        case "host_file_cache_read":
+          this.#setReg(7, BigInt(this.#readFileCache(
+            this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+          )));
+          return false;
         case "host_input_trigger": {
           this.#setReg(
             7,
@@ -2145,6 +2454,7 @@
           if (
             registration?.status === MEDIATED_INPUT_STATUS_READY &&
             registration.result === null &&
+            registration.descriptor?.delivery === "relaunch" &&
             registration.file !== null
           ) {
             // A mounted relaunch file is an asset; reading acknowledges it.
@@ -2167,10 +2477,19 @@
             return false;
           }
           this.#chargeBytes(required);
-          this.#write(this.#u32(a1), registration.result);
+          if (required !== 0) {
+            try {
+              this.#range(this.#u32(a1), required, true).set(registration.result);
+            } catch {
+              this.#setReg(7, -1n);
+              return false;
+            }
+          }
           registration.result = null;
-          registration.file = null;
-          registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+          if (registration.descriptor?.delivery !== "stream") {
+            registration.file = null;
+            registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+          }
           this.#setReg(7, BigInt(required));
           return false;
         }
@@ -2857,8 +3176,9 @@
  * Creates the bounded PolkaVM endpoint in a Worker or on a host thread.
  *
  * @param {DedicatedWorkerGlobalScope} endpoint - Message endpoint owned by the runtime.
+ * @param {{createFileCache?: Function}} [options] - Trusted Host storage, never guest-controlled.
  */
-globalThis.createPolkaVmRuntime = (endpoint) => {
+globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   const postMessage = (message, transfers) => {
     if (transfers) {
       endpoint.postMessage(message, transfers);
@@ -2879,6 +3199,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   const MAX_MEDIATED_INPUT_KIND_BYTES = 32;
   const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
   const MAX_RELAUNCH_FILE_BYTES = 128 * 1024 * 1024;
+  const MAX_STREAM_FILE_BYTES = 0xffffffff;
+  const MAX_FILE_READ_BYTES = 65536;
+  const MAX_FILE_CACHE_BYTES = 512 * 1024 * 1024;
   const FILE_INPUT_OUTCOMES = ["ready", "error", "", "rejected", "refused", "relaunch"];
   // Safe-area (16) and virtual-keyboard (17) inset records. Both records of one
   // update carry a single axis, so a Host sends them through the dedicated
@@ -2909,6 +3232,20 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let updateCount = 0;
   const updateSamples = [];
   const activeMediatedInputHandles = new Set();
+  const streamFiles = new Map();
+  let lastFileSourceToken = 0;
+  let fileReader;
+  let fileCacheEnabled = false;
+  let termination;
+  let cleanupFailed = false;
+  const pendingSelections = new Map();
+  const pendingCleanups = new Set();
+  const createFileCache = options.createFileCache === undefined
+    ? createOpfsFileCache
+    : options.createFileCache;
+  if (typeof createFileCache !== "function") {
+    throw new TypeError("invalid PolkaVM browser cache factory");
+  }
   // The newest registration snapshot a Host has not received yet. It is
   // flushed on teardown so a Host keeps the registrations of an execution
   // that failed before becoming ready.
@@ -2919,11 +3256,48 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     tick();
   };
 
+  function reportCleanupFailure(error) {
+    cleanupFailed = true;
+    postMessage({
+      type: "error",
+      message: `PolkaVM private cache cleanup failed: ${error?.message ?? error}`,
+    });
+  }
+
+  function trackCleanup(closing) {
+    if (closing?.then) {
+      const pending = Promise.resolve(closing).then((result) => {
+        cleanupFailed ||= result?.cleanupFailed === true;
+      }).catch(reportCleanupFailure);
+      pendingCleanups.add(pending);
+      void pending.then(() => pendingCleanups.delete(pending));
+      return pending;
+    }
+  }
+
+  function closeCache(cache) {
+    try {
+      return trackCleanup(cache.close());
+    } catch (error) {
+      reportCleanupFailure(error);
+    }
+  }
+
+  function invalidateSelection(handle) {
+    const pending = pendingSelections.get(handle);
+    if (pending) {
+      pending.valid = false;
+    }
+  }
+
   function stopRuntime() {
     if (disposed) {
       return;
     }
     disposed = true;
+    for (const pending of pendingSelections.values()) {
+      pending.valid = false;
+    }
     if (unpostedFileRegistrations !== null) {
       postMessage(unpostedFileRegistrations);
       unpostedFileRegistrations = null;
@@ -2934,11 +3308,34 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     activeMediatedInputHandles.clear();
     running = false;
     clearTimeout(timer);
-    translated?.stop();
-    pvm?.polkavm_browser_reset?.();
+    try {
+      trackCleanup(translated?.stop());
+      pvm?.polkavm_browser_reset?.();
+    } catch (error) {
+      reportCleanupFailure(error);
+    }
+    for (const entry of streamFiles.values()) {
+      entry.source?.close();
+      entry.cache?.close();
+    }
     tickChannel.port1.close();
     tickChannel.port2.close();
     endpoint.onmessage = null;
+  }
+
+  function terminate(error) {
+    if (error) {
+      postMessage({ type: "error", message: error.message });
+    }
+    stopRuntime();
+    termination ??= (async () => {
+      await Promise.all([...pendingSelections.values()].map((entry) => entry.promise));
+      while (pendingCleanups.size) {
+        await Promise.all([...pendingCleanups]);
+      }
+      postMessage({ type: "terminated", ...(cleanupFailed ? { cleanupFailed: true } : {}) });
+    })();
+    return termination;
   }
 
   function postRuntimeOutput(output, transfers = []) {
@@ -2949,10 +3346,150 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       activeMediatedInputHandles.add(output.handle);
     } else if (output?.type === "mediated-input-cancel") {
       activeMediatedInputHandles.delete(output.handle);
+      invalidateSelection(output.handle);
     } else if (output?.type === "file-registrations") {
       unpostedFileRegistrations = null;
     }
     postMessage(output, transfers);
+  }
+
+  async function createOpfsFileCache() {
+    const directory = await navigator.storage.getDirectory();
+    const name = `polkavm-cache-${crypto.randomUUID()}`;
+    const file = await directory.getFileHandle(name, { create: true });
+    let access;
+    try {
+      access = await file.createSyncAccessHandle();
+    } catch (error) {
+      try {
+        await directory.removeEntry(name);
+      } catch (cleanupError) {
+        reportCleanupFailure(cleanupError);
+      }
+      throw error;
+    }
+    let staging;
+    return {
+      size: () => access.getSize(),
+      reset(size) {
+        access.truncate(0);
+        access.truncate(size);
+      },
+      write: (offset, bytes) => access.write(bytes, { at: offset }),
+      read(offset, length) {
+        staging ??= new Uint8Array(MAX_FILE_READ_BYTES);
+        const bytes = staging.subarray(0, length);
+        const actual = access.read(bytes, { at: offset });
+        return bytes.subarray(0, actual);
+      },
+      flush: () => access.flush(),
+      async close() {
+        try {
+          access.close();
+        } finally {
+          await directory.removeEntry(name);
+        }
+      },
+    };
+  }
+
+  function createFileSource(file, backendCache = null) {
+    if (lastFileSourceToken === 0xffffffff) {
+      backendCache && closeCache(backendCache);
+      throw new Error("PolkaVM browser file source tokens exhausted");
+    }
+    const token = ++lastFileSourceToken;
+    const entry = { source: null, cache: null };
+    const removeIfClosed = () => {
+      if (entry.source === null && entry.cache === null) {
+        streamFiles.delete(token);
+      }
+    };
+    const source = {
+      read(offset, length) {
+        if (
+          disposed ||
+          file === null ||
+          !Number.isInteger(offset) ||
+          !Number.isInteger(length) ||
+          offset < 0 ||
+          length < 0 ||
+          length > MAX_FILE_READ_BYTES ||
+          offset + length > file.size
+        ) {
+          throw new Error("invalid PolkaVM browser file range");
+        }
+        fileReader ??= new FileReaderSync();
+        const bytes = new Uint8Array(
+          fileReader.readAsArrayBuffer(file.slice(offset, offset + length)),
+        );
+        if (bytes.byteLength !== length) {
+          throw new Error("short PolkaVM browser file read");
+        }
+        return bytes;
+      },
+      close() {
+        file = null;
+        entry.source = null;
+        removeIfClosed();
+      },
+    };
+    entry.source = source;
+    if (backendCache !== null) {
+      const checkRange = (offset, length) => {
+        if (disposed || entry.cache === null || !Number.isInteger(offset) ||
+            !Number.isInteger(length) || offset < 0 || length < 1 ||
+            length > MAX_FILE_READ_BYTES || offset + length > backendCache.size()) {
+          throw new Error("invalid PolkaVM browser cache range");
+        }
+      };
+      entry.cache = {
+        size: () => backendCache.size(),
+        reset(size) {
+          if (disposed || entry.cache === null || !Number.isInteger(size) ||
+              size < 1 || size > MAX_FILE_CACHE_BYTES) {
+            throw new Error("invalid PolkaVM browser cache size");
+          }
+          backendCache.reset(size);
+          if (backendCache.size() !== size) {
+            throw new Error("invalid PolkaVM browser cache size after reset");
+          }
+        },
+        write(offset, bytes) {
+          checkRange(offset, bytes.byteLength);
+          const actual = backendCache.write(offset, bytes);
+          if (actual !== bytes.byteLength) {
+            throw new Error("short PolkaVM browser cache write");
+          }
+          return actual;
+        },
+        read(offset, length) {
+          checkRange(offset, length);
+          const bytes = backendCache.read(offset, length);
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength !== length) {
+            throw new Error("short PolkaVM browser cache read");
+          }
+          return bytes;
+        },
+        flush() {
+          if (disposed || entry.cache === null) {
+            throw new Error("closed PolkaVM browser cache");
+          }
+          backendCache.flush();
+        },
+        close() {
+          if (entry.cache !== null) {
+            entry.cache = null;
+            removeIfClosed();
+            const closing = backendCache;
+            backendCache = null;
+            closeCache(closing);
+          }
+        },
+      };
+    }
+    streamFiles.set(token, entry);
+    return { token, source, cache: entry.cache };
   }
 
   function wasmJson(pointer, length) {
@@ -3244,7 +3781,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
     const delay = translated
       ? translated.updateAfterMilliseconds()
-      : pvm.polkavm_browser_update_after_ms();
+      : pvm.polkavm_browser_update_after_ms() >>> 0;
     return delay === UPDATE_AFTER_IDLE ? null : delay;
   }
 
@@ -3279,9 +3816,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       }
       drainPointerCapture();
     } catch (error) {
-      stopRuntime();
-      postMessage({ type: "error", message: error.message });
-      postMessage({ type: "terminated" });
+      void terminate(error);
       return;
     }
     const elapsed = performance.now() - before;
@@ -3438,10 +3973,27 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       fileInput !== undefined &&
       (typeof fileInput?.inline !== "boolean" ||
         typeof fileInput.relaunch !== "boolean" ||
+        (fileInput.stream !== undefined && typeof fileInput.stream !== "boolean") ||
         typeof fileInput.entrypoint !== "string" ||
-        ((fileInput.inline || fileInput.relaunch) && !fileInput.entrypoint))
+        ((fileInput.inline || fileInput.relaunch || fileInput.stream) && !fileInput.entrypoint))
     ) {
       throw new Error("invalid PolkaVM browser file-input support");
+    }
+    if (fileInput?.stream && typeof globalThis.FileReaderSync !== "function") {
+      throw new Error("PolkaVM streamed files require a worker with FileReaderSync");
+    }
+    if (message.fileCache !== undefined && typeof message.fileCache !== "boolean") {
+      throw new Error("invalid PolkaVM browser file-cache support");
+    }
+    if (message.fileCache === true) {
+      if (!fileInput?.stream) {
+        throw new Error("PolkaVM private file caches require streamed file input");
+      }
+      if (options.createFileCache === undefined &&
+          (typeof globalThis.navigator?.storage?.getDirectory !== "function" ||
+           typeof globalThis.FileSystemFileHandle?.prototype?.createSyncAccessHandle !== "function")) {
+        throw new Error("PolkaVM private file caches require worker OPFS or a trusted cache factory");
+      }
     }
     const relaunch = message.fileRelaunch;
     if (relaunch !== undefined) {
@@ -3495,6 +4047,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       throw new Error("PolkaVM browser worker is already started");
     }
     const program = validateStartMessage(message);
+    fileCacheEnabled = message.fileCache === true;
     motionAvailability = message.motionAvailability ?? 0;
     pointerCaptureSupported = message.pointerCaptureSupported === true;
     pendingGpuCapabilities =
@@ -3513,6 +4066,70 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     const runtimeImports = {
       polkavm_browser: {
         clock_wall_ms: () => Date.now(),
+        file_read: (token, offset, pointer, length) => {
+          const source = streamFiles.get(token >>> 0)?.source;
+          if (disposed || pvm == null || source == null || (length >>> 0) > MAX_FILE_READ_BYTES) {
+            return -4;
+          }
+          try {
+            const destination = new Uint8Array(
+              pvm.memory.buffer,
+              pointer >>> 0,
+              length >>> 0,
+            );
+            destination.set(source.read(offset >>> 0, length >>> 0));
+            return length >>> 0;
+          } catch {
+            return -4;
+          }
+        },
+        file_close: (token) => {
+          streamFiles.get(token >>> 0)?.source?.close();
+        },
+        file_cache_reset: (token, size) => {
+          try {
+            const cache = streamFiles.get(token >>> 0)?.cache;
+            if (!cache) return -4;
+            cache.reset(size >>> 0);
+            return 0;
+          } catch {
+            return -4;
+          }
+        },
+        file_cache_write: (token, offset, pointer, length) => {
+          try {
+            const cache = streamFiles.get(token >>> 0)?.cache;
+            if (!cache || (length >>> 0) > MAX_FILE_READ_BYTES) return -4;
+            const bytes = new Uint8Array(pvm.memory.buffer, pointer >>> 0, length >>> 0);
+            return cache.write(offset >>> 0, bytes);
+          } catch {
+            return -4;
+          }
+        },
+        file_cache_read: (token, offset, pointer, length) => {
+          try {
+            const cache = streamFiles.get(token >>> 0)?.cache;
+            if (!cache || (length >>> 0) > MAX_FILE_READ_BYTES) return -4;
+            const bytes = new Uint8Array(pvm.memory.buffer, pointer >>> 0, length >>> 0);
+            bytes.set(cache.read(offset >>> 0, length >>> 0));
+            return length >>> 0;
+          } catch {
+            return -4;
+          }
+        },
+        file_cache_flush: (token) => {
+          try {
+            const cache = streamFiles.get(token >>> 0)?.cache;
+            if (!cache) return -4;
+            cache.flush();
+            return 0;
+          } catch {
+            return -4;
+          }
+        },
+        file_cache_close: (token) => {
+          streamFiles.get(token >>> 0)?.cache?.close();
+        },
         random_fill: (pointer, length) => {
           if (pvm == null) {
             return CORE_STATUS_DENIED;
@@ -3735,12 +4352,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           "set PolkaVM browser mediated-input kinds",
         );
       }
-      if (message.fileInput?.inline || message.fileInput?.relaunch) {
+      if (message.fileInput?.inline || message.fileInput?.relaunch || message.fileInput?.stream) {
         stage(encoder.encode(message.fileInput.entrypoint));
         check(
           pvm.polkavm_browser_set_file_input_support(
             message.fileInput.inline ? 1 : 0,
             message.fileInput.relaunch ? 1 : 0,
+            message.fileInput.stream ? 1 : 0,
           ),
           "set PolkaVM browser file-input support",
         );
@@ -4038,6 +4656,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     ) {
       throw new Error("invalid PolkaVM browser mediated-input result");
     }
+    invalidateSelection(handle);
     if (translated) {
       translated.sendMediatedInputResult(handle, status, bytes);
       activeMediatedInputHandles.delete(handle);
@@ -4054,7 +4673,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
    * Delivers a file the user selected in Host UI and reports the outcome. A
    * relaunch delivery stops this execution.
    */
-  function sendFileInput(handle, name, mimeType, bytes) {
+  function sendFileInput(handle, name, mimeType, bytes, file, backendCache = null) {
     if (
       !running ||
       !Number.isInteger(handle) ||
@@ -4064,35 +4683,71 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     ) {
       throw new Error("invalid PolkaVM browser file input");
     }
-    let delivery;
-    if (translated) {
-      delivery = translated.deliverFile(handle, name, mimeType, bytes);
-    } else {
-      stage(encoder.encode(JSON.stringify({ name, mimeType })));
-      check(
-        pvm.polkavm_browser_stage_file_metadata(),
-        "stage PolkaVM browser file input",
-      );
-      if (bytes.byteLength) {
-        stage(bytes);
-      }
-      const code = pvm.polkavm_browser_send_file_input(handle);
-      const outcome = FILE_INPUT_OUTCOMES[code];
-      if (!outcome || outcome === "error") {
-        throw new Error(`send PolkaVM browser file input: ${errorText()}`);
-      }
-      delivery = { outcome };
-      if (outcome === "relaunch") {
-        delivery.relaunch = {
-          ...wasmJson(
-            pvm.polkavm_browser_file_relaunch_pointer(),
-            pvm.polkavm_browser_file_relaunch_length(),
-          ),
-          bytes,
-        };
-      }
+    const stream = file !== undefined;
+    if (stream && (!(file instanceof Blob) || bytes !== undefined)) {
+      throw new Error("streamed PolkaVM browser file input requires only a Blob");
     }
-    if (delivery.outcome !== "refused") {
+    let delivery;
+    const selected = stream ? createFileSource(file, backendCache) : null;
+    try {
+      if (translated) {
+        delivery = stream
+          ? translated.sendFileStream(
+              handle, name, mimeType, file.size, selected.source, selected.cache,
+            )
+          : translated.deliverFile(handle, name, mimeType, bytes);
+      } else {
+        stage(encoder.encode(JSON.stringify({ name, mimeType })));
+        check(
+          pvm.polkavm_browser_stage_file_metadata(),
+          "stage PolkaVM browser file input",
+        );
+        let code;
+        if (stream) {
+          const { token, source, cache } = selected;
+          try {
+            // The binding takes u32; oversized files must be rejected, not wrap.
+            code = pvm.polkavm_browser_send_file_stream(
+              handle,
+              file.size > MAX_STREAM_FILE_BYTES ? 0 : file.size,
+              token,
+              cache === null ? 0 : 1,
+            );
+          } finally {
+            if (code !== 0) {
+              source.close();
+              cache?.close();
+            }
+          }
+        } else {
+          if (bytes.byteLength) {
+            stage(bytes);
+          }
+          code = pvm.polkavm_browser_send_file_input(handle);
+        }
+        const outcome = FILE_INPUT_OUTCOMES[code];
+        if (!outcome || outcome === "error") {
+          throw new Error(`send PolkaVM browser file input: ${errorText()}`);
+        }
+        delivery = { outcome };
+        if (outcome === "relaunch") {
+          delivery.relaunch = {
+            ...wasmJson(
+              pvm.polkavm_browser_file_relaunch_pointer(),
+              pvm.polkavm_browser_file_relaunch_length(),
+            ),
+            bytes,
+          };
+        }
+      }
+    } catch (error) {
+      selected?.source.close();
+      selected?.cache?.close();
+      throw error;
+    }
+    if (stream && delivery.outcome === "ready") {
+      activeMediatedInputHandles.add(handle);
+    } else if (delivery.outcome !== "refused") {
       activeMediatedInputHandles.delete(handle);
     }
     if (delivery.outcome !== "relaunch") {
@@ -4107,22 +4762,75 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     return true;
   }
 
+  function receiveFileInput(message) {
+    const { handle, name, mimeType, file } = message;
+    const bytes = file === undefined
+      ? asBytes(message.bytes, "PolkaVM browser file input")
+      : message.bytes;
+    if (!fileCacheEnabled || file === undefined) {
+      if (sendFileInput(handle, name, mimeType, bytes, file)) {
+        void terminate();
+      } else {
+        wake();
+      }
+      return;
+    }
+    if (!running || !Number.isInteger(handle) || handle <= 0 ||
+        typeof name !== "string" || typeof mimeType !== "string" ||
+        !(file instanceof Blob) || bytes !== undefined) {
+      throw new Error("invalid PolkaVM browser cached file input");
+    }
+    // An invalidated open still occupies its slot until its real storage closes.
+    // Do not let repeated picker completions build an unbounded async queue.
+    if (pendingSelections.has(handle) ||
+        pendingSelections.size + pendingCleanups.size >= MAX_MEDIATED_INPUT_REGISTRATIONS) {
+      postMessage({ type: "file-input-delivery", handle, outcome: "refused" });
+      return;
+    }
+    const pending = { valid: true, promise: null };
+    pendingSelections.set(handle, pending);
+    pending.promise = Promise.resolve().then(async () => {
+      if (!pending.valid || disposed) return;
+      let cache;
+      try {
+        cache = await createFileCache();
+        if (["size", "reset", "write", "read", "flush", "close"]
+              .some((method) => typeof cache?.[method] !== "function") ||
+            cache.size() !== 0) {
+          throw new Error("invalid PolkaVM private cache backend");
+        }
+      } catch (error) {
+        if (typeof cache?.close === "function") await closeCache(cache);
+        if (pending.valid && !disposed) {
+          postMessage({ type: "error", message: `PolkaVM private cache creation failed: ${error.message}` });
+          postMessage({ type: "file-input-delivery", handle, outcome: "error" });
+        }
+        return;
+      }
+      if (!pending.valid || disposed) {
+        await closeCache(cache);
+        return;
+      }
+      sendFileInput(handle, name, mimeType, undefined, file, cache);
+      wake();
+      await Promise.all([...pendingCleanups]);
+    }).catch((error) => {
+      void terminate(error);
+    }).finally(() => {
+      pendingSelections.delete(handle);
+    });
+  }
+
   endpoint.onmessage = (event) => {
     const message = event.data;
     if (message?.type === "start") {
-      void start(message).catch((error) => {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
-      });
+      void start(message).catch((error) => terminate(error));
     } else if (message?.type === "input") {
       try {
         sendInput(new Uint8Array(message.bytes));
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "view-insets") {
       try {
@@ -4135,18 +4843,14 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "motion-status") {
       try {
         setMotionAvailability(message.availability);
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "pointer-capture-support") {
       try {
@@ -4156,9 +4860,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         setPointerCaptureSupported(message.supported);
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "pointer-capture-state") {
       try {
@@ -4168,36 +4870,28 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         setPointerCaptureActive(message.active);
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "motion") {
       try {
         sendMotionSample(new Uint8Array(message.bytes));
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "gpu-capabilities") {
       try {
         sendGpuCapabilities(new Uint8Array(message.bytes));
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "gpu-event") {
       try {
         sendGpuEvent(new Uint8Array(message.bytes));
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "host-frame-response") {
       try {
@@ -4225,9 +4919,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           });
         }
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "mediated-input-result") {
       try {
@@ -4238,33 +4930,16 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
         wake();
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "file-input") {
       try {
-        if (
-          sendFileInput(
-            message.handle,
-            message.name,
-            message.mimeType,
-            asBytes(message.bytes, "PolkaVM browser file input"),
-          )
-        ) {
-          stopRuntime();
-          postMessage({ type: "terminated" });
-        } else {
-          wake();
-        }
+        receiveFileInput(message);
       } catch (error) {
-        stopRuntime();
-        postMessage({ type: "error", message: error.message });
-        postMessage({ type: "terminated" });
+        void terminate(error);
       }
     } else if (message?.type === "stop") {
-      stopRuntime();
-      postMessage({ type: "terminated" });
+      void terminate();
     }
   };
 };

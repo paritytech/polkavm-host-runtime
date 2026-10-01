@@ -41,6 +41,9 @@
   const MAX_FILE_NAME_BYTES = 1024;
   const MAX_INLINE_FILE_BYTES = 8 * 1024 * 1024;
   const MAX_RELAUNCH_FILE_BYTES = 128 * 1024 * 1024;
+  const MAX_STREAM_FILE_BYTES = 0xffffffff;
+  const MAX_FILE_READ_BYTES = 65536;
+  const MAX_FILE_CACHE_BYTES = 512 * 1024 * 1024;
   const MAX_ASSET_FILES = 2048;
   const MAX_ASSET_BYTES = 256 * 1024 * 1024;
   const FILE_REGISTER_DELIVERY_UNAVAILABLE = -4;
@@ -413,9 +416,11 @@
         ? MAX_INLINE_FILE_BYTES
         : delivery === "relaunch"
           ? MAX_RELAUNCH_FILE_BYTES
-          : 0;
+          : delivery === "stream"
+            ? MAX_STREAM_FILE_BYTES
+            : 0;
     const mountPathValid =
-      delivery === "inline"
+      delivery === "inline" || delivery === "stream"
         ? !Object.hasOwn(raw, "mountPath")
         : validFileMountPath(mountPath);
     if (
@@ -960,16 +965,23 @@
         fileInput !== null &&
         (typeof fileInput?.inline !== "boolean" ||
           typeof fileInput.relaunch !== "boolean" ||
-          ((fileInput.inline || fileInput.relaunch) &&
+          (fileInput.stream !== undefined && typeof fileInput.stream !== "boolean") ||
+          ((fileInput.inline || fileInput.relaunch || fileInput.stream) &&
             !validFileMountPath(fileInput.entrypoint)))
       ) {
         throw new Error("translated PolkaVM runtime has invalid file-input support");
       }
       this.fileInput =
-        fileInput?.inline || fileInput?.relaunch ? { ...fileInput } : null;
+        fileInput?.inline || fileInput?.relaunch || fileInput?.stream
+          ? { ...fileInput, stream: fileInput.stream ?? false }
+          : null;
       this.mountedFile = null;
       this.initialized = false;
       this.mediatedInputRegistrations = new Map();
+      this.fileCacheBytes = 0;
+      this.fileCacheCleanups = new Set();
+      this.fileCacheCleanupFailed = false;
+      this.fileCacheStopped = null;
       this.nextMediatedInputHandle = 0;
       this.activeMediatedInputHandle = null;
       this.tri2dSubmitted = false;
@@ -1427,6 +1439,8 @@
         status: MEDIATED_INPUT_STATUS_REGISTERED,
         result: null,
         file: null,
+        source: null,
+        cache: null,
       });
       return this.nextMediatedInputHandle;
     }
@@ -1515,6 +1529,9 @@
       if (!registration?.descriptor) {
         throw new Error(`translated handle ${handle} is not a file registration`);
       }
+      if (registration.descriptor.delivery === "stream") {
+        throw new Error("translated streamed files require metadata-only delivery");
+      }
       const accepted =
         this.activeMediatedInputHandle === null
           ? registration.status !== MEDIATED_INPUT_STATUS_READY
@@ -1550,6 +1567,253 @@
           bytes,
         },
       };
+    }
+
+    /** Takes ownership of a Host-retained source without reading its contents. */
+    sendFileStream(handle, name, mimeType, size, source, cache = null) {
+      let installed = false;
+      try {
+        const sanitized = sanitizeFileName(name);
+        validateSelectedMimeType(mimeType);
+        if (
+          this.stopped ||
+          !Number.isSafeInteger(size) ||
+          size < 0 ||
+          typeof source?.read !== "function" ||
+          typeof source.close !== "function" ||
+          (cache !== null && ["size", "reset", "write", "read", "flush", "close"]
+            .some((method) => typeof cache?.[method] !== "function"))
+        ) {
+          throw new Error("invalid translated stream selection");
+        }
+        const registration = this.mediatedInputRegistrations.get(handle);
+        if (registration?.descriptor?.delivery !== "stream") {
+          throw new Error(`translated handle ${handle} is not a stream registration`);
+        }
+        const accepted =
+          this.activeMediatedInputHandle === null
+            ? registration.status !== MEDIATED_INPUT_STATUS_READY
+            : this.activeMediatedInputHandle === handle;
+        if (!accepted) {
+          return { outcome: "refused" };
+        }
+        this.activeMediatedInputHandle = null;
+        registration.result = null;
+        registration.file = null;
+        if (!size || size > registration.maxBytes || size > MAX_STREAM_FILE_BYTES) {
+          registration.status = MEDIATED_INPUT_STATUS_FAILED;
+          return { outcome: "rejected" };
+        }
+        registration.file = { name: sanitized, mimeType, size };
+        registration.source = source;
+        registration.cache = cache === null
+          ? null
+          : { backend: cache, size: 0, cursor: 0, sealed: false };
+        registration.status = MEDIATED_INPUT_STATUS_READY;
+        installed = true;
+        return { outcome: "ready" };
+      } finally {
+        if (!installed) {
+          try {
+            source?.close?.();
+          } finally {
+            if (typeof cache?.close === "function") this.#releaseFileCache(cache);
+          }
+        }
+      }
+    }
+
+    #closeFileStream(registration) {
+      const source = registration.source;
+      registration.source = null;
+      try {
+        source?.close();
+      } finally {
+        this.#closeFileCache(registration);
+      }
+    }
+
+    #closeFileCache(registration) {
+      const cache = registration.cache;
+      registration.cache = null;
+      if (cache !== null) {
+        this.fileCacheBytes -= cache.size;
+        this.#releaseFileCache(cache.backend);
+      }
+    }
+
+    #releaseFileCache(cache) {
+      const failed = (error) => {
+        this.fileCacheCleanupFailed = true;
+        this.emit({
+          type: "error",
+          message: `PolkaVM private cache cleanup failed: ${error?.message ?? error}`,
+        });
+      };
+      try {
+        const closing = cache.close();
+        if (closing?.then) {
+          const pending = Promise.resolve(closing).catch(failed);
+          this.fileCacheCleanups.add(pending);
+          void pending.then(() => this.fileCacheCleanups.delete(pending));
+        }
+      } catch (error) {
+        failed(error);
+      }
+    }
+
+    #fileCache(handle) {
+      const registration = this.mediatedInputRegistrations.get(handle);
+      return registration?.status === MEDIATED_INPUT_STATUS_READY &&
+        registration.source !== null && registration.cache !== null
+        ? registration
+        : null;
+    }
+
+    #resetFileCache(handle, size) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (size < 1 || size > MAX_FILE_CACHE_BYTES ||
+          this.fileCacheBytes - cache.size + size > MAX_FILE_CACHE_BYTES) {
+        return -2;
+      }
+      try {
+        cache.backend.reset(size);
+        if (cache.backend.size() !== size) {
+          throw new Error("invalid translated cache size");
+        }
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      this.fileCacheBytes += size - cache.size;
+      cache.size = size;
+      cache.cursor = 0;
+      cache.sealed = false;
+      return 0;
+    }
+
+    #writeFileCache(handle, offset, pointer, length) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (cache.sealed || length < 1 || length > MAX_FILE_READ_BYTES ||
+          offset !== cache.cursor || offset + length > cache.size) {
+        return -2;
+      }
+      this.#chargeBytes(length);
+      let bytes;
+      try {
+        bytes = this.#range(pointer, length);
+      } catch {
+        return -3;
+      }
+      try {
+        if (cache.backend.write(offset, bytes) !== length) {
+          throw new Error("short translated cache write");
+        }
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      cache.cursor += length;
+      return length;
+    }
+
+    #commitFileCache(handle) {
+      const registration = this.#fileCache(handle);
+      if (registration === null) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (cache.sealed || cache.size === 0 || cache.cursor !== cache.size) {
+        return -2;
+      }
+      try {
+        cache.backend.flush();
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+      cache.sealed = true;
+      return 0;
+    }
+
+    #readFileCache(handle, offset, pointer, length) {
+      const registration = this.#fileCache(handle);
+      if (registration === null || !registration.cache.sealed) {
+        return -1;
+      }
+      const cache = registration.cache;
+      if (length < 1 || length > MAX_FILE_READ_BYTES || offset > cache.size) {
+        return -2;
+      }
+      const actual = Math.min(length, cache.size - offset);
+      this.#chargeBytes(actual);
+      if (actual === 0) {
+        return 0;
+      }
+      let destination;
+      try {
+        destination = this.#range(pointer, actual, true);
+      } catch {
+        return -3;
+      }
+      try {
+        const bytes = cache.backend.read(offset, actual);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== actual) {
+          throw new Error("short translated cache read");
+        }
+        destination.set(bytes);
+        return actual;
+      } catch {
+        this.#closeFileCache(registration);
+        return -4;
+      }
+    }
+
+    #readFileStream(handle, offset, pointer, length) {
+      const registration = this.mediatedInputRegistrations.get(handle);
+      if (
+        registration?.descriptor?.delivery !== "stream" ||
+        registration.file === null ||
+        registration.source === null
+      ) {
+        return -1;
+      }
+      if (length < 1 || length > MAX_FILE_READ_BYTES || offset > registration.file.size) {
+        return -2;
+      }
+      const actual = Math.min(length, registration.file.size - offset);
+      this.#chargeBytes(actual);
+      if (actual === 0) {
+        return 0;
+      }
+      let destination;
+      try {
+        destination = this.#range(pointer, actual, true);
+      } catch {
+        return -3;
+      }
+      try {
+        const bytes = registration.source.read(offset, actual);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== actual) {
+          throw new Error("short translated stream read");
+        }
+        destination.set(bytes);
+        return actual;
+      } catch {
+        registration.file = null;
+        registration.status = MEDIATED_INPUT_STATUS_FAILED;
+        this.#closeFileStream(registration);
+        this.emit({ type: "mediated-input-cancel", handle });
+        return -4;
+      }
     }
 
     /**
@@ -1595,12 +1859,15 @@
     }
 
     #triggerMediatedInput(handle) {
+      const registration = this.mediatedInputRegistrations.get(handle);
       if (this.activeMediatedInputHandle !== null) {
         return 2;
       }
-      const registration = this.mediatedInputRegistrations.get(handle);
       if (!registration) {
         return 1;
+      }
+      if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
+        this.#cancelMediatedInput(handle);
       }
       registration.status = MEDIATED_INPUT_STATUS_ACTIVE;
       this.activeMediatedInputHandle = handle;
@@ -1633,6 +1900,10 @@
         registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
         registration.result = null;
         registration.file = null;
+        if (registration.descriptor?.delivery === "stream") {
+          this.#closeFileStream(registration);
+          this.emit({ type: "mediated-input-cancel", handle });
+        }
         return 0;
       }
       if (registration.status !== MEDIATED_INPUT_STATUS_ACTIVE) {
@@ -1647,7 +1918,16 @@
     }
 
     stop() {
+      if (this.stopped) {
+        return this.fileCacheStopped;
+      }
       this.stopped = true;
+      for (const [handle, registration] of this.mediatedInputRegistrations) {
+        if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
+          this.#closeFileStream(registration);
+          this.emit({ type: "mediated-input-cancel", handle });
+        }
+      }
       this.input.length = 0;
       this.coreInput.length = 0;
       this.hostFrameRequests = 0;
@@ -1657,6 +1937,13 @@
       this.hostFrameResponseBytes = 0;
       this.mediatedInputRegistrations.clear();
       this.activeMediatedInputHandle = null;
+      this.fileCacheStopped = (async () => {
+        while (this.fileCacheCleanups.size) {
+          await Promise.all([...this.fileCacheCleanups]);
+        }
+        return { cleanupFailed: this.fileCacheCleanupFailed };
+      })();
+      return this.fileCacheStopped;
     }
 
     #resetBudget(hostcalls) {
@@ -2102,10 +2389,7 @@
             this.#setReg(7, BigInt(FILE_INFO_INVALID));
             return false;
           }
-          if (
-            registration.status !== MEDIATED_INPUT_STATUS_READY ||
-            registration.file === null
-          ) {
+          if (registration.file === null) {
             this.#setReg(7, 0n);
             return false;
           }
@@ -2124,6 +2408,31 @@
           this.#setReg(7, BigInt(written ? info.byteLength : FILE_INFO_INVALID));
           return false;
         }
+        case "host_file_read": {
+          this.#setReg(
+            7,
+            BigInt(this.#readFileStream(
+              this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+            )),
+          );
+          return false;
+        }
+        case "host_file_cache_reset":
+          this.#setReg(7, BigInt(this.#resetFileCache(this.#u32(a0), this.#u32(a1))));
+          return false;
+        case "host_file_cache_write":
+          this.#setReg(7, BigInt(this.#writeFileCache(
+            this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+          )));
+          return false;
+        case "host_file_cache_commit":
+          this.#setReg(7, BigInt(this.#commitFileCache(this.#u32(a0))));
+          return false;
+        case "host_file_cache_read":
+          this.#setReg(7, BigInt(this.#readFileCache(
+            this.#u32(a0), this.#u32(a1), this.#u32(a2), this.#u32(a3),
+          )));
+          return false;
         case "host_input_trigger": {
           this.#setReg(
             7,
@@ -2145,6 +2454,7 @@
           if (
             registration?.status === MEDIATED_INPUT_STATUS_READY &&
             registration.result === null &&
+            registration.descriptor?.delivery === "relaunch" &&
             registration.file !== null
           ) {
             // A mounted relaunch file is an asset; reading acknowledges it.
@@ -2167,10 +2477,19 @@
             return false;
           }
           this.#chargeBytes(required);
-          this.#write(this.#u32(a1), registration.result);
+          if (required !== 0) {
+            try {
+              this.#range(this.#u32(a1), required, true).set(registration.result);
+            } catch {
+              this.#setReg(7, -1n);
+              return false;
+            }
+          }
           registration.result = null;
-          registration.file = null;
-          registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+          if (registration.descriptor?.delivery !== "stream") {
+            registration.file = null;
+            registration.status = MEDIATED_INPUT_STATUS_REGISTERED;
+          }
           this.#setReg(7, BigInt(required));
           return false;
         }
