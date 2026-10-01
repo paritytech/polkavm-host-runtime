@@ -343,6 +343,19 @@ bit does not grant support.
   255, and is valid only inside a render pass. As in WebGPU, every pass
   starts with reference 0.
 
+#### Blend constant
+
+Wire version 1 has a third additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `2` (value `4`) advertises
+it; an absent bit does not grant support.
+
+`SetBlendConstant` (opcode 31) carries the blend constant as four `f32`
+values, red, green, blue and alpha, in a 16-byte payload. Every value MUST be
+finite. The command is valid only inside a render pass and applies to draws
+recorded after it in that pass. As in WebGPU, every pass starts with constant
+`0, 0, 0, 0`. Blend factors `12` (constant) and `13` (one minus constant) read
+this value; without the extension they always see zero.
+
 ### WebGPU submission
 
 ```text

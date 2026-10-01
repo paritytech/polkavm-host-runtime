@@ -1072,6 +1072,62 @@ test("stencil pass operations need a stencil attachment and one stencil byte", a
   ], /incompatible texture binding/, 3));
 });
 
+function f32s(values) {
+  const bytes = new Uint8Array(values.length * 4);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, index) => view.setFloat32(index * 4, value, true));
+  return bytes;
+}
+
+test("blend constant applies in order inside its render pass only", async t => {
+  const engine = validationEngine();
+  const calls = [];
+  Object.assign(engine, {
+    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      createCommandEncoder: () => ({
+        beginRenderPass() {
+          calls.push(["begin"]);
+          return {
+            setBlendConstant(color) { calls.push(["blend", { ...color }]); },
+            end() { calls.push(["end"]); },
+          };
+        },
+        finish: () => ({}),
+      }),
+      queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+    },
+    emitBatchRejected() {
+      assert.fail("valid blend constant batch was rejected");
+    },
+  });
+  const [begin, end] = renderPass(0);
+  await engine.execute(commands([
+    begin, [31, f32s([0.25, 0.5, 0.75, 1])], [31, f32s([1, 0, 0, 0.5])], end,
+    begin, end,
+  ]));
+  assert.deepEqual(calls, [
+    ["begin"],
+    ["blend", { r: 0.25, g: 0.5, b: 0.75, a: 1 }],
+    ["blend", { r: 1, g: 0, b: 0, a: 0.5 }],
+    ["end"],
+    ["begin"],
+    ["end"],
+  ]);
+
+  for (const [name, items, diagnostic, index] of [
+    ["outside a render pass", [[31, f32s([0, 0, 0, 0])]], /blend constant outside render pass/, 0],
+    ["after the pass ended", [begin, end, [31, f32s([0, 0, 0, 0])]], /blend constant outside render pass/, 2],
+    ["non-finite component", [begin, [31, f32s([0, Number.NaN, 0, 0])], end], /non-finite/],
+    ["infinite component", [begin, [31, f32s([0, 0, 0, Infinity])], end], /non-finite/],
+    ["three components", [begin, [31, f32s([0, 0, 0])], end], /GPU/],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(items, diagnostic, index));
+  }
+});
+
 function stencilPipeline({ depthFormat = 8, topology = 4, compare = 3, bias = 0 } = {}) {
   const payload = new Uint8Array(40 + 16 + 24);
   const view = new DataView(payload.buffer);

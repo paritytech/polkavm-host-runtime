@@ -146,6 +146,7 @@ pub enum GpuOpcode {
     DispatchWorkgroups = 28,
     EndComputePass = 29,
     SetStencilReference = 30,
+    SetBlendConstant = 31,
 }
 
 impl TryFrom<u16> for GpuOpcode {
@@ -183,6 +184,7 @@ impl TryFrom<u16> for GpuOpcode {
             28 => Ok(Self::DispatchWorkgroups),
             29 => Ok(Self::EndComputePass),
             30 => Ok(Self::SetStencilReference),
+            31 => Ok(Self::SetBlendConstant),
             _ => Err(()),
         }
     }
@@ -379,6 +381,7 @@ pub enum GpuTextureAspect {
 pub const GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS: u8 = 1;
 pub const GPU_RASTER_FEATURE_LAYERED_TEXTURES: u64 = 1;
 pub const GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS: u64 = 2;
+pub const GPU_RASTER_FEATURE_BLEND_CONSTANT: u64 = 4;
 
 pub const GPU_BUFFER_USAGE_COPY_SRC: u32 = 4;
 pub const GPU_BUFFER_USAGE_COPY_DST: u32 = 8;
@@ -748,6 +751,7 @@ fn validate_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
         GpuOpcode::SetComputeBindGroup => counted_payload(index, opcode, payload, 12, 8, 4),
         GpuOpcode::DispatchWorkgroups => exact_payload(index, opcode, payload, 12),
         GpuOpcode::SetStencilReference => exact_payload(index, opcode, payload, 4),
+        GpuOpcode::SetBlendConstant => exact_payload(index, opcode, payload, 16),
     }
 }
 
@@ -1149,6 +1153,7 @@ mod tests {
             (GpuOpcode::DispatchWorkgroups, 12),
             (GpuOpcode::EndComputePass, 0),
             (GpuOpcode::SetStencilReference, 4),
+            (GpuOpcode::SetBlendConstant, 16),
         ];
         for (opcode, payload_bytes) in payloads {
             let batch = single_command(opcode, &vec![0; payload_bytes]);
@@ -1164,6 +1169,28 @@ mod tests {
         assert_eq!(GpuBindingKind::StorageBufferReadWrite as u16, 5);
         assert_eq!(GpuCapabilityKey::MaxDispatchesPerBatch as u16, 21);
         assert_eq!(GPU_BUFFER_USAGE_STORAGE, 128);
+    }
+
+    #[test]
+    fn blend_constant_is_opcode_31_with_four_floats() {
+        assert_eq!(GpuOpcode::try_from(31), Ok(GpuOpcode::SetBlendConstant));
+        assert_eq!(GpuOpcode::try_from(32), Err(()));
+        assert_eq!(GPU_RASTER_FEATURE_BLEND_CONSTANT, 4);
+        for actual in [12, 20] {
+            assert_eq!(
+                decode_gpu_batch(&single_command(
+                    GpuOpcode::SetBlendConstant,
+                    &vec![0; actual]
+                ))
+                .unwrap_err(),
+                GpuWireError::InvalidPayloadLength {
+                    index: 0,
+                    opcode: GpuOpcode::SetBlendConstant,
+                    expected: 16,
+                    actual,
+                }
+            );
+        }
     }
 
     #[test]

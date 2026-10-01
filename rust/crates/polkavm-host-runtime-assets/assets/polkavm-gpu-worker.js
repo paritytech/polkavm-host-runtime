@@ -32,6 +32,7 @@ const MAX_TEXTURE_DIMENSION_3D = 256;
 const MAX_TEXTURE_ARRAY_LAYERS = 256;
 const RASTER_FEATURE_LAYERED_TEXTURES = 1;
 const RASTER_FEATURE_STENCIL_DEPTH_BIAS = 2;
+const RASTER_FEATURE_BLEND_CONSTANT = 4;
 const RENDER_PASS_DEPTH_LOAD = 4;
 const RENDER_PASS_DEPTH_STORE = 8;
 const RENDER_PASS_STENCIL_LOAD = 16;
@@ -1108,6 +1109,14 @@ function parseCommand(command) {
     case 30:
       result.reference = reader.u32();
       break;
+    case 31:
+      result.color = {
+        r: reader.f32(),
+        g: reader.f32(),
+        b: reader.f32(),
+        a: reader.f32(),
+      };
+      break;
     default:
       throw new ProtocolError(
         `unsupported GPU opcode ${command.opcode}`,
@@ -1337,7 +1346,9 @@ class GpuEngine {
       requested.maxComputeWorkgroupSizeZ,
       requested.maxComputeWorkgroupsPerDimension,
       MAX_DISPATCHES_PER_BATCH,
-      RASTER_FEATURE_LAYERED_TEXTURES | RASTER_FEATURE_STENCIL_DEPTH_BIAS,
+      RASTER_FEATURE_LAYERED_TEXTURES |
+        RASTER_FEATURE_STENCIL_DEPTH_BIAS |
+        RASTER_FEATURE_BLEND_CONSTANT,
       requested.maxTextureDimension3D,
       requested.maxTextureArrayLayers,
     ];
@@ -1931,6 +1942,11 @@ class GpuEngine {
             throw new ProtocolError("stencil reference exceeds 255", index);
           }
           break;
+        case 31:
+          if (!pass) {
+            throw new ProtocolError("blend constant outside render pass", index);
+          }
+          break;
       }
     }
     if (pass) {
@@ -2332,6 +2348,9 @@ class GpuEngine {
             break;
           case 30:
             pass.setStencilReference(command.reference);
+            break;
+          case 31:
+            pass.setBlendConstant(command.color);
             break;
         }
       }

@@ -87,6 +87,7 @@ enum RenderOperation {
     Scissor([u32; 4]),
     Draw([u32; 4]),
     StencilReference(u32),
+    BlendConstant([f32; 4]),
     DrawIndexed {
         indices: u32,
         instances: u32,
@@ -500,6 +501,13 @@ impl NativeGpuRenderer {
                     pending(&mut pending_pass)?
                         .operations
                         .push(RenderOperation::StencilReference(reference));
+                }
+                GpuOpcode::SetBlendConstant => {
+                    let rgba = reader.f32_array::<4>()?;
+                    reader.finish()?;
+                    pending(&mut pending_pass)?
+                        .operations
+                        .push(RenderOperation::BlendConstant(rgba));
                 }
                 GpuOpcode::DrawIndexed => {
                     let op = RenderOperation::DrawIndexed {
@@ -1208,6 +1216,9 @@ impl NativeGpuRenderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        // WebGPU starts every pass with blend constant 0; wgpu instead rejects
+        // constant-factor draws until a constant is set.
+        pass.set_blend_constant(wgpu::Color::TRANSPARENT);
         for operation in pending.operations {
             match operation {
                 RenderOperation::Pipeline(id) => pass.set_pipeline(self.render_pipeline(id)?),
@@ -1242,6 +1253,14 @@ impl NativeGpuRenderer {
                 ),
                 RenderOperation::StencilReference(reference) => {
                     pass.set_stencil_reference(reference)
+                }
+                RenderOperation::BlendConstant([r, g, b, a]) => {
+                    pass.set_blend_constant(wgpu::Color {
+                        r: r.into(),
+                        g: g.into(),
+                        b: b.into(),
+                        a: a.into(),
+                    })
                 }
                 RenderOperation::DrawIndexed {
                     indices,
@@ -1628,7 +1647,8 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
         (
             22,
             gpu_wire::GPU_RASTER_FEATURE_LAYERED_TEXTURES
-                | gpu_wire::GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS,
+                | gpu_wire::GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS
+                | gpu_wire::GPU_RASTER_FEATURE_BLEND_CONSTANT,
         ),
         (23, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D as u64),
         (24, gpu_wire::MAX_GPU_TEXTURE_ARRAY_LAYERS as u64),
