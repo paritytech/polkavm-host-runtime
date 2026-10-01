@@ -14,6 +14,8 @@ mod manifest;
 mod mediated_input;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_file_input;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
 mod native_gpu;
 mod quake_keys;
@@ -26,6 +28,8 @@ mod wasm_codegen;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 pub use native_ffi::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_file_input::{LocalFileCache, LocalFileSource};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
 pub use native_gpu::*;
 
@@ -43,10 +47,12 @@ pub use computer::{
     MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
 };
 pub use file_input::{
-    FileDelivery, FileDescriptor, FileInputDelivery, FileInputRequest, FileInputSupport,
-    FileRegistration, FileRelaunch, FileSelection, FILE_INFO_INVALID,
-    FILE_REGISTER_DELIVERY_UNAVAILABLE, MAX_FILE_DESCRIPTOR_BYTES, MAX_FILE_NAME_BYTES,
-    MAX_INLINE_FILE_BYTES, MAX_RELAUNCH_FILE_BYTES,
+    FileCache, FileDelivery, FileDescriptor, FileInputDelivery, FileInputRequest, FileInputSupport,
+    FileReadSource, FileRegistration, FileRelaunch, FileSelection, FileStreamSelection,
+    FILE_INFO_INVALID, FILE_READ_INVALID_DESTINATION, FILE_READ_INVALID_HANDLE,
+    FILE_READ_INVALID_RANGE, FILE_READ_IO_ERROR, FILE_REGISTER_DELIVERY_UNAVAILABLE,
+    MAX_FILE_CACHE_BYTES, MAX_FILE_DESCRIPTOR_BYTES, MAX_FILE_NAME_BYTES, MAX_FILE_READ_BYTES,
+    MAX_INLINE_FILE_BYTES, MAX_RELAUNCH_FILE_BYTES, MAX_STREAM_FILE_BYTES,
 };
 pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
 pub use manifest::{AppDescriptor, FileTypeHint};
@@ -566,6 +572,8 @@ struct HostState {
     host_frame_responses: VecDeque<Vec<u8>>,
     host_frame_response_bytes: usize,
     mediated_input: mediated_input::MediatedInputState,
+    file_sources: HashMap<u32, file_input::SelectedFileStream>,
+    file_read_buffer: Option<Box<[u8]>>,
     gpu_last_sequence: u64,
     gpu_submits_remaining: u32,
     gpu_upload_bytes_remaining: usize,
@@ -614,6 +622,8 @@ impl HostState {
             host_frame_responses: VecDeque::new(),
             host_frame_response_bytes: 0,
             mediated_input: mediated_input::MediatedInputState::default(),
+            file_sources: HashMap::new(),
+            file_read_buffer: None,
             gpu_last_sequence: 0,
             gpu_submits_remaining: 0,
             gpu_upload_bytes_remaining: 0,
@@ -1360,7 +1370,11 @@ impl Runtime {
                 "host_input_trigger",
                 |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
                     caller.user_data.charge_hostcall(0)?;
-                    Ok(caller.user_data.mediated_input.trigger(handle))
+                    let result = caller.user_data.mediated_input.trigger(handle);
+                    if result == MEDIATED_INPUT_TRIGGER_ACCEPTED {
+                        caller.user_data.file_sources.remove(&handle);
+                    }
+                    Ok(result)
                 },
             )
             .context("define host_input_trigger")?;
@@ -1468,10 +1482,262 @@ impl Runtime {
 
         linker
             .define_typed(
+                "host_file_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let length = match state
+                        .mediated_input
+                        .file_read_length(handle, offset, length)
+                    {
+                        Ok(length) => length,
+                        Err(error) => return Ok(error),
+                    };
+                    if !caller.instance.is_memory_accessible(
+                        destination,
+                        length as u32,
+                        polkavm::MemoryProtection::ReadWrite,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length)?;
+                    if length == 0 {
+                        return Ok(0);
+                    }
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    let read = match state.file_sources.get_mut(&handle) {
+                        Some(stream) => stream.source.read_exact_at(offset, &mut buffer[..length]),
+                        None => Err(anyhow!("selected file source is unavailable")),
+                    };
+                    if read.is_err() {
+                        state.file_sources.remove(&handle);
+                        state.mediated_input.fail_file_read(handle);
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    if caller
+                        .instance
+                        .write_memory(destination, &buffer[..length])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_read")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_reset",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32, size: u32| -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(previous) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    let reserved: u64 = state
+                        .file_sources
+                        .values()
+                        .filter_map(|stream| stream.cache.as_ref())
+                        .map(|cache| u64::from(cache.size))
+                        .sum();
+                    if size == 0
+                        || size > MAX_FILE_CACHE_BYTES
+                        || reserved - u64::from(previous.size) + u64::from(size)
+                            > u64::from(MAX_FILE_CACHE_BYTES)
+                    {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache.backend.reset(size).is_err() || cache.backend.size() != u64::from(size)
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.size = size;
+                    cache.written = 0;
+                    cache.sealed = false;
+                    Ok(0)
+                },
+            )
+            .context("define host_file_cache_reset")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_write",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(cache) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if cache.sealed
+                        || !(1..=MAX_FILE_READ_BYTES).contains(&length)
+                        || offset != cache.written
+                        || u64::from(offset) + u64::from(length) > u64::from(cache.size)
+                    {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    if !caller.instance.is_memory_accessible(
+                        pointer,
+                        length,
+                        polkavm::MemoryProtection::Read,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length as usize)?;
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    if caller
+                        .instance
+                        .read_memory_into(pointer, &mut buffer[..length as usize])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache
+                        .backend
+                        .write_exact_at(offset, &buffer[..length as usize])
+                        .is_err()
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.written += length;
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_cache_write")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_commit",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(stream) = state.file_sources.get_mut(&handle) else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    let Some(cache) = stream.cache.as_mut() else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if cache.sealed || cache.size == 0 || cache.written != cache.size {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    if cache.backend.flush().is_err() {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.sealed = true;
+                    Ok(0)
+                },
+            )
+            .context("define host_file_cache_commit")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(cache) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if !cache.sealed {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    }
+                    if !(1..=MAX_FILE_READ_BYTES).contains(&length) || offset > cache.size {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    let length = length.min(cache.size - offset) as usize;
+                    if !caller.instance.is_memory_accessible(
+                        destination,
+                        length as u32,
+                        polkavm::MemoryProtection::ReadWrite,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length)?;
+                    if length == 0 {
+                        return Ok(0);
+                    }
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache
+                        .backend
+                        .read_exact_at(offset, &mut buffer[..length])
+                        .is_err()
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    if caller
+                        .instance
+                        .write_memory(destination, &buffer[..length])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_cache_read")?;
+
+        linker
+            .define_typed(
                 "host_input_cancel",
                 |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
                     caller.user_data.charge_hostcall(0)?;
-                    Ok(caller.user_data.mediated_input.cancel(handle))
+                    let result = caller.user_data.mediated_input.cancel(handle);
+                    if result == MEDIATED_INPUT_CANCEL_ACCEPTED {
+                        caller.user_data.file_sources.remove(&handle);
+                    }
+                    Ok(result)
                 },
             )
             .context("define host_input_cancel")?;
@@ -1763,6 +2029,8 @@ impl Runtime {
         }
         self.stopped = true;
         self.state.clear_host_frame_queues();
+        self.state.mediated_input.close_streams();
+        self.state.file_sources.clear();
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
@@ -2018,6 +2286,37 @@ impl Runtime {
         Ok(delivery)
     }
 
+    /// Installs a read-only source and optional private cache only on Ready.
+    /// Cancel, replacement, source I/O failure, and teardown drop both resources.
+    pub fn send_file_stream(
+        &mut self,
+        handle: u32,
+        selection: FileStreamSelection,
+        source: Box<dyn FileReadSource>,
+        cache: Option<Box<dyn FileCache>>,
+    ) -> Result<FileInputDelivery> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
+        if selection.size != source.size() {
+            bail!("file selection size does not match its retained source");
+        }
+        let delivery = self
+            .state
+            .mediated_input
+            .deliver_stream(handle, selection)?;
+        if delivery == FileInputDelivery::Ready {
+            self.state.file_sources.insert(
+                handle,
+                file_input::SelectedFileStream {
+                    source,
+                    cache: cache.map(file_input::SelectedFileCache::new),
+                },
+            );
+        }
+        Ok(delivery)
+    }
+
     /// Mounts a relaunch-delivered file in place of the asset at its mount
     /// path before `init`. The handler that registers the same `id` and mount
     /// path reports status 3 until the guest reads the selection.
@@ -2130,14 +2429,16 @@ fn validate_gpu_capabilities(bytes: &[u8]) -> Result<()> {
         return Err(anyhow!("invalid GPU capabilities scale"));
     }
     let count = gpu_u32(bytes, 44).unwrap() as usize;
-    if count > 21 || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES {
+    if count > gpu_wire::GpuCapabilityKey::MaxTextureArrayLayers as usize
+        || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES
+    {
         return Err(anyhow!("invalid GPU capabilities limit table"));
     }
     let mut previous = 0;
     for entry in bytes[HEADER_BYTES..].as_chunks::<ENTRY_BYTES>().0 {
         let key = gpu_u16(entry, 0).unwrap();
         if key <= previous
-            || key > 21
+            || key > gpu_wire::GpuCapabilityKey::MaxTextureArrayLayers as u16
             || gpu_u16(entry, 2) != Some(0)
             || gpu_u64(entry, 4) == Some(0)
             || gpu_u32(entry, 12) != Some(0)
@@ -2280,6 +2581,98 @@ mod tests {
     use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::{asm, InstructionSetKind};
     use polkavm_common::writer::ProgramBlobBuilder;
+
+    fn resident_stack_program(stack_bytes: u32, touch_guard: bool) -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(stack_bytes);
+        builder.add_import(b"host_log");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        let deep = -(stack_bytes as i32) + 32;
+        let mut code = vec![
+            asm::store_imm_indirect_u32(Reg::SP, -4, i32::from_le_bytes(*b"root")),
+            asm::store_imm_indirect_u32(Reg::SP, deep, i32::from_le_bytes(*b"deep")),
+        ];
+        if touch_guard {
+            code.push(asm::store_imm_indirect_u32(
+                Reg::SP,
+                -(stack_bytes as i32) - 4,
+                1,
+            ));
+        } else {
+            code.extend([
+                asm::add_imm_32(Reg::A0, Reg::SP, -4),
+                asm::load_imm(Reg::A1, 4),
+                asm::ecalli(0),
+                asm::add_imm_32(Reg::A0, Reg::SP, deep),
+                asm::load_imm(Reg::A1, 4),
+                asm::ecalli(0),
+            ]);
+        }
+        code.push(asm::ret());
+        builder.set_code(&code, &[]);
+        builder.into_vec().unwrap()
+    }
+
+    #[test]
+    fn host_reads_preserve_non_power_of_two_stack_contents_after_growth() {
+        for backend in [BackendKind::Compiler, BackendKind::Interpreter] {
+            for stack_bytes in [192 * 1024, 384 * 1024, 768 * 1024] {
+                let mut runtime = Runtime::new_with_backend(
+                    &resident_stack_program(stack_bytes, false),
+                    HashMap::new(),
+                    PresentationProfile::Framebuffer,
+                    false,
+                    100_000,
+                    backend,
+                )
+                .unwrap();
+                runtime.init().unwrap();
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("root"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("deep"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                runtime.update().unwrap();
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("root"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("deep"),
+                    "{backend:?}, {stack_bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_stack_growth_does_not_expose_the_lower_guard() {
+        for backend in [BackendKind::Compiler, BackendKind::Interpreter] {
+            for stack_bytes in [192 * 1024, 384 * 1024, 768 * 1024] {
+                let mut runtime = Runtime::new_with_backend(
+                    &resident_stack_program(stack_bytes, true),
+                    HashMap::new(),
+                    PresentationProfile::Framebuffer,
+                    false,
+                    100_000,
+                    backend,
+                )
+                .unwrap();
+                assert!(
+                    runtime.init().is_err(),
+                    "{backend:?}, {stack_bytes}: guest wrote below stack"
+                );
+            }
+        }
+    }
 
     fn motion_test_program() -> (Vec<u8>, u32) {
         let rw_size = 64 * 1024;

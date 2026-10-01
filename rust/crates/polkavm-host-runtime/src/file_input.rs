@@ -18,6 +18,15 @@ pub const MAX_FILE_MOUNT_PATH_BYTES: usize = 1_024;
 pub const MAX_FILE_NAME_BYTES: usize = 1_024;
 pub const MAX_INLINE_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RELAUNCH_FILE_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_STREAM_FILE_BYTES: u32 = u32::MAX;
+pub const MAX_FILE_READ_BYTES: u32 = 65_536;
+/// Aggregate private working-cache reservation for one execution.
+pub const MAX_FILE_CACHE_BYTES: u32 = 512 * 1024 * 1024;
+
+pub const FILE_READ_INVALID_HANDLE: i32 = -1;
+pub const FILE_READ_INVALID_RANGE: i32 = -2;
+pub const FILE_READ_INVALID_DESTINATION: i32 = -3;
+pub const FILE_READ_IO_ERROR: i32 = -4;
 
 pub const FILE_REGISTER_DELIVERY_UNAVAILABLE: i32 = -4;
 pub const FILE_INFO_INVALID: i32 = -1;
@@ -30,6 +39,8 @@ pub enum FileDelivery {
     Inline,
     /// A fresh execution reads the file as the asset at the mount path.
     Relaunch,
+    /// The Host retains the file and serves bounded range reads.
+    Stream,
 }
 
 /// A validated `host_file_register` descriptor.
@@ -48,12 +59,13 @@ pub struct FileDescriptor {
 
 /// File deliveries this Host can serve for one execution.
 ///
-/// A Host that serves neither leaves file input unavailable, so every
+/// A Host that serves no deliveries leaves file input unavailable, so every
 /// registration returns `-2`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileInputSupport {
     pub inline: bool,
     pub relaunch: bool,
+    pub stream: bool,
     /// The manifest's `runtime.entrypoint`, which no mount path may replace.
     pub entrypoint: String,
 }
@@ -84,10 +96,57 @@ pub struct FileSelection {
     pub bytes: Vec<u8>,
 }
 
+/// Metadata of a selected stream. The Host retains the file, not its bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileStreamSelection {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// A retained read-only selection. Dropping the source releases its resources.
+pub trait FileReadSource: Send {
+    fn size(&self) -> u64;
+    fn read_exact_at(&mut self, offset: u32, destination: &mut [u8]) -> Result<()>;
+}
+
+/// Host-private derived-file storage, independent of the selected source.
+///
+/// The runtime exposes only bounded sequential writes followed by sealed reads.
+/// Dropping the cache must close and delete its temporary backing storage.
+pub trait FileCache: FileReadSource {
+    fn reset(&mut self, size: u32) -> Result<()>;
+    fn write_exact_at(&mut self, offset: u32, bytes: &[u8]) -> Result<()>;
+    fn flush(&mut self) -> Result<()>;
+}
+
+pub(crate) struct SelectedFileCache {
+    pub(crate) backend: Box<dyn FileCache>,
+    pub(crate) size: u32,
+    pub(crate) written: u32,
+    pub(crate) sealed: bool,
+}
+
+impl SelectedFileCache {
+    pub(crate) fn new(backend: Box<dyn FileCache>) -> Self {
+        Self {
+            backend,
+            size: 0,
+            written: 0,
+            sealed: false,
+        }
+    }
+}
+
+pub(crate) struct SelectedFileStream {
+    pub(crate) source: Box<dyn FileReadSource>,
+    pub(crate) cache: Option<SelectedFileCache>,
+}
+
 /// The outcome of delivering a selected file to a registration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileInputDelivery {
-    /// The file is an inline status 3 result.
+    /// The inline bytes or stream selection are ready (status 3).
     Ready,
     /// The file is empty or above `maxBytes`; the registration reports
     /// status 6 and no bytes reach the guest.
@@ -168,9 +227,10 @@ pub(crate) fn parse_descriptor(bytes: &[u8]) -> Option<FileDescriptor> {
     let bound = match raw.delivery {
         FileDelivery::Inline => MAX_INLINE_FILE_BYTES,
         FileDelivery::Relaunch => MAX_RELAUNCH_FILE_BYTES,
+        FileDelivery::Stream => MAX_STREAM_FILE_BYTES as usize,
     };
     let mount_path_valid = match (raw.delivery, &raw.mount_path) {
-        (FileDelivery::Inline, None) => true,
+        (FileDelivery::Inline | FileDelivery::Stream, None) => true,
         (FileDelivery::Relaunch, Some(path)) => valid_mount_path(path),
         _ => false,
     };

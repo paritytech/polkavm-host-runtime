@@ -3,12 +3,12 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk,
-    FileDescriptor, FileInputDelivery, FileInputSupport, FileRegistration, FileRelaunch,
-    FileSelection, Frame, GpuBatch, InputEvent, InputEventType, MediatedInputCommand,
-    MediatedInputStatus, PresentationProfile, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
-    INPUT_EVENT_BYTES, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS, MAX_ASSET_BYTES,
-    MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES, UPDATE_AFTER_IDLE,
+    keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, FileCache,
+    FileDescriptor, FileInputDelivery, FileInputSupport, FileReadSource, FileRegistration,
+    FileRelaunch, FileSelection, FileStreamSelection, Frame, GpuBatch, InputEvent, InputEventType,
+    MediatedInputCommand, MediatedInputStatus, PresentationProfile, Tri2dFrame, UiOutputFrame,
+    UiSemanticsFrame, INPUT_EVENT_BYTES, INPUT_KEYBOARD_INSETS, INPUT_SAFE_AREA_INSETS,
+    MAX_ASSET_BYTES, MAX_ASSET_FILES, MAX_ASSET_FILE_BYTES, MAX_PROGRAM_BYTES, UPDATE_AFTER_IDLE,
 };
 use anyhow::{anyhow, Result};
 use polkavm::BackendKind;
@@ -25,6 +25,20 @@ unsafe extern "C" {
     fn browser_clock_wall_ms() -> f64;
     #[link_name = "random_fill"]
     fn browser_random_fill(pointer: *mut u8, length: usize) -> i32;
+    #[link_name = "file_read"]
+    fn browser_file_read(token: u32, offset: u32, pointer: *mut u8, length: usize) -> i32;
+    #[link_name = "file_close"]
+    fn browser_file_close(token: u32);
+    #[link_name = "file_cache_reset"]
+    fn browser_file_cache_reset(token: u32, size: u32) -> i32;
+    #[link_name = "file_cache_write"]
+    fn browser_file_cache_write(token: u32, offset: u32, pointer: *const u8, length: usize) -> i32;
+    #[link_name = "file_cache_read"]
+    fn browser_file_cache_read(token: u32, offset: u32, pointer: *mut u8, length: usize) -> i32;
+    #[link_name = "file_cache_flush"]
+    fn browser_file_cache_flush(token: u32) -> i32;
+    #[link_name = "file_cache_close"]
+    fn browser_file_cache_close(token: u32);
 }
 
 pub(crate) fn wall_clock_ns() -> u64 {
@@ -132,6 +146,99 @@ struct FileMetadata {
     mount_path: Option<String>,
     name: String,
     mime_type: String,
+}
+
+/// Owns a browser-private source token, never a guest-visible pathname. Tokens
+/// are distinct from registration handles so a refused replacement cannot
+/// release the file already selected on that registration.
+struct BrowserFileSource {
+    token: u32,
+    size: u64,
+}
+
+impl FileReadSource for BrowserFileSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_exact_at(&mut self, offset: u32, destination: &mut [u8]) -> Result<()> {
+        let count = unsafe {
+            browser_file_read(
+                self.token,
+                offset,
+                destination.as_mut_ptr(),
+                destination.len(),
+            )
+        };
+        if count < 0 || count as usize != destination.len() {
+            return Err(anyhow!("browser file range read failed or was short"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BrowserFileSource {
+    fn drop(&mut self) {
+        unsafe { browser_file_close(self.token) }
+    }
+}
+
+struct BrowserFileCache {
+    token: u32,
+    size: u64,
+}
+
+impl FileReadSource for BrowserFileCache {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_exact_at(&mut self, offset: u32, destination: &mut [u8]) -> Result<()> {
+        let count = unsafe {
+            browser_file_cache_read(
+                self.token,
+                offset,
+                destination.as_mut_ptr(),
+                destination.len(),
+            )
+        };
+        if count < 0 || count as usize != destination.len() {
+            return Err(anyhow!("browser cache range read failed or was short"));
+        }
+        Ok(())
+    }
+}
+
+impl FileCache for BrowserFileCache {
+    fn reset(&mut self, size: u32) -> Result<()> {
+        if unsafe { browser_file_cache_reset(self.token, size) } != 0 {
+            return Err(anyhow!("browser cache reset failed"));
+        }
+        self.size = u64::from(size);
+        Ok(())
+    }
+
+    fn write_exact_at(&mut self, offset: u32, bytes: &[u8]) -> Result<()> {
+        let count =
+            unsafe { browser_file_cache_write(self.token, offset, bytes.as_ptr(), bytes.len()) };
+        if count < 0 || count as usize != bytes.len() {
+            return Err(anyhow!("browser cache range write failed or was short"));
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if unsafe { browser_file_cache_flush(self.token) } != 0 {
+            return Err(anyhow!("browser cache flush failed"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BrowserFileCache {
+    fn drop(&mut self) {
+        unsafe { browser_file_cache_close(self.token) }
+    }
 }
 
 #[derive(Serialize)]
@@ -457,13 +564,18 @@ pub extern "C" fn polkavm_browser_send_mediated_input_result(handle: u32, result
 }
 
 #[no_mangle]
-pub extern "C" fn polkavm_browser_set_file_input_support(inline: u32, relaunch: u32) -> u32 {
+pub extern "C" fn polkavm_browser_set_file_input_support(
+    inline: u32,
+    relaunch: u32,
+    stream: u32,
+) -> u32 {
     status(|host| {
         let entrypoint = String::from_utf8(std::mem::take(&mut host.staging))
             .map_err(|_| anyhow!("file-input entrypoint is not UTF-8"))?;
         host.running()?.set_file_input_support(FileInputSupport {
             inline: inline != 0,
             relaunch: relaunch != 0,
+            stream: stream != 0,
             entrypoint,
         })
     })
@@ -505,25 +617,71 @@ pub extern "C" fn polkavm_browser_send_file_input(handle: u32) -> u32 {
                 },
             )
         })();
-        match result {
-            Ok(FileInputDelivery::Ready) => 0,
-            Ok(FileInputDelivery::Rejected) => 3,
-            Ok(FileInputDelivery::Refused) => 4,
-            Ok(FileInputDelivery::Relaunch(relaunch)) => {
-                host.file_relaunch = serde_json::to_vec(&FileMetadata {
-                    id: Some(relaunch.id),
-                    mount_path: Some(relaunch.mount_path),
-                    name: relaunch.name,
-                    mime_type: relaunch.mime_type,
-                })
-                .expect("file metadata serializes");
-                5
-            }
-            Err(error) => {
-                host.error = format!("{error:#}");
-                1
-            }
+        finish_file_delivery(&mut host, result)
+    })
+}
+
+fn finish_file_delivery(host: &mut BrowserHost, result: Result<FileInputDelivery>) -> u32 {
+    match result {
+        Ok(FileInputDelivery::Ready) => 0,
+        Ok(FileInputDelivery::Rejected) => 3,
+        Ok(FileInputDelivery::Refused) => 4,
+        Ok(FileInputDelivery::Relaunch(relaunch)) => {
+            host.file_relaunch = serde_json::to_vec(&FileMetadata {
+                id: Some(relaunch.id),
+                mount_path: Some(relaunch.mount_path),
+                name: relaunch.name,
+                mime_type: relaunch.mime_type,
+            })
+            .expect("file metadata serializes");
+            5
         }
+        Err(error) => {
+            host.error = format!("{error:#}");
+            1
+        }
+    }
+}
+
+/// Delivers metadata for a file retained by the browser worker. No file body
+/// crosses the Wasm boundary until a bounded range is requested by the guest.
+#[no_mangle]
+pub extern "C" fn polkavm_browser_send_file_stream(
+    handle: u32,
+    size: u32,
+    token: u32,
+    has_cache: u32,
+) -> u32 {
+    HOST.with(|host| {
+        let mut host = host.borrow_mut();
+        host.error.clear();
+        let source = Box::new(BrowserFileSource {
+            token,
+            size: u64::from(size),
+        });
+        let cache = (has_cache != 0)
+            .then(|| Box::new(BrowserFileCache { token, size: 0 }) as Box<dyn FileCache>);
+        let result = (|| {
+            if !host.staging.is_empty() {
+                host.staging.clear();
+                return Err(anyhow!("stream selection must not stage file bytes"));
+            }
+            let metadata = host
+                .file_metadata
+                .take()
+                .ok_or_else(|| anyhow!("file metadata was not staged"))?;
+            host.running()?.send_file_stream(
+                handle,
+                FileStreamSelection {
+                    name: metadata.name,
+                    mime_type: metadata.mime_type,
+                    size: u64::from(size),
+                },
+                source,
+                cache,
+            )
+        })();
+        finish_file_delivery(&mut host, result)
     })
 }
 

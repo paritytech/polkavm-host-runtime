@@ -4,8 +4,9 @@
 
 use crate::file_input::{
     self, FileDelivery, FileDescriptor, FileInfo, FileInputDelivery, FileInputRequest,
-    FileInputSupport, FileRegistration, FileRelaunch, FileSelection,
-    FILE_REGISTER_DELIVERY_UNAVAILABLE,
+    FileInputSupport, FileRegistration, FileRelaunch, FileSelection, FileStreamSelection,
+    FILE_READ_INVALID_HANDLE, FILE_READ_INVALID_RANGE, FILE_REGISTER_DELIVERY_UNAVAILABLE,
+    MAX_FILE_READ_BYTES,
 };
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -93,6 +94,11 @@ impl Registration {
         }
     }
 
+    fn is_stream(&self) -> bool {
+        self.file_descriptor()
+            .is_some_and(|descriptor| descriptor.delivery == FileDelivery::Stream)
+    }
+
     fn clear_result(&mut self) {
         self.result = None;
         self.file = None;
@@ -150,7 +156,7 @@ impl MediatedInputState {
 
     /// Selects the deliveries later file registrations may use.
     pub(crate) fn set_file_support(&mut self, support: FileInputSupport) -> Result<()> {
-        let enabled = support.inline || support.relaunch;
+        let enabled = support.inline || support.relaunch || support.stream;
         if enabled && !file_input::valid_mount_path(&support.entrypoint) {
             bail!("invalid file-input entrypoint {}", support.entrypoint);
         }
@@ -199,6 +205,7 @@ impl MediatedInputState {
         let supported = match descriptor.delivery {
             FileDelivery::Inline => support.inline,
             FileDelivery::Relaunch => support.relaunch,
+            FileDelivery::Stream => support.stream,
         };
         if !supported {
             return FILE_REGISTER_DELIVERY_UNAVAILABLE;
@@ -310,6 +317,9 @@ impl MediatedInputState {
         let Some(descriptor) = registration.file_descriptor() else {
             bail!("mediated-input handle {handle} is not a file registration");
         };
+        if descriptor.delivery == FileDelivery::Stream {
+            bail!("stream selections are delivered as metadata, not whole-file bytes");
+        }
         let accepted = match active {
             Some(active) => active == handle,
             None => registration.status != MediatedInputStatus::Ready,
@@ -349,7 +359,76 @@ impl MediatedInputState {
                 registration.status = MediatedInputStatus::Registered;
                 Ok(FileInputDelivery::Relaunch(relaunch))
             }
+            FileDelivery::Stream => unreachable!("stream delivery was rejected above"),
         }
+    }
+
+    pub(crate) fn deliver_stream(
+        &mut self,
+        handle: u32,
+        selection: FileStreamSelection,
+    ) -> Result<FileInputDelivery> {
+        let name = file_input::sanitize_name(&selection.name)?;
+        file_input::validate_selected_mime_type(&selection.mime_type)?;
+        let active = self.active_handle();
+        let registration = self
+            .registrations
+            .get_mut(&handle)
+            .ok_or_else(|| anyhow!("unknown mediated-input handle {handle}"))?;
+        if !registration.is_stream() {
+            bail!("mediated-input handle {handle} is not a stream registration");
+        }
+        let accepted = match active {
+            Some(active) => active == handle,
+            None => registration.status != MediatedInputStatus::Ready,
+        };
+        if !accepted {
+            return Ok(FileInputDelivery::Refused);
+        }
+        if selection.size == 0 || selection.size > registration.max_bytes as u64 {
+            registration.clear_result();
+            registration.status = MediatedInputStatus::Failed;
+            return Ok(FileInputDelivery::Rejected);
+        }
+        registration.result = None;
+        registration.file = Some(FileInfo {
+            name,
+            mime_type: selection.mime_type,
+            size: selection.size,
+        });
+        registration.status = MediatedInputStatus::Ready;
+        Ok(FileInputDelivery::Ready)
+    }
+
+    pub(crate) fn file_read_length(
+        &self,
+        handle: u32,
+        offset: u32,
+        length: u32,
+    ) -> Result<usize, i32> {
+        let registration = self
+            .registrations
+            .get(&handle)
+            .ok_or(FILE_READ_INVALID_HANDLE)?;
+        if !registration.is_stream() || registration.status != MediatedInputStatus::Ready {
+            return Err(FILE_READ_INVALID_HANDLE);
+        }
+        let info = registration.file.as_ref().ok_or(FILE_READ_INVALID_HANDLE)?;
+        if !(1..=MAX_FILE_READ_BYTES).contains(&length) || u64::from(offset) > info.size {
+            return Err(FILE_READ_INVALID_RANGE);
+        }
+        Ok(u64::from(length).min(info.size - u64::from(offset)) as usize)
+    }
+
+    pub(crate) fn fail_file_read(&mut self, handle: u32) {
+        let registration = self
+            .registrations
+            .get_mut(&handle)
+            .expect("selected file registration");
+        registration.clear_result();
+        registration.status = MediatedInputStatus::Failed;
+        self.commands
+            .push_back(MediatedInputCommand::Cancel { handle });
     }
 
     fn active_handle(&self) -> Option<u32> {
@@ -360,16 +439,20 @@ impl MediatedInputState {
     }
 
     pub(crate) fn trigger(&mut self, handle: u32) -> u32 {
-        if self
+        let selected_stream = self
             .registrations
-            .values()
-            .any(|registration| registration.status == MediatedInputStatus::Active)
-        {
+            .get(&handle)
+            .is_some_and(|registration| registration.is_stream() && registration.file.is_some());
+        if self.active_handle().is_some() {
             return MEDIATED_INPUT_TRIGGER_BUSY;
         }
         let Some(registration) = self.registrations.get_mut(&handle) else {
             return MEDIATED_INPUT_TRIGGER_INVALID_HANDLE;
         };
+        if selected_stream {
+            self.commands
+                .push_back(MediatedInputCommand::Cancel { handle });
+        }
         registration.status = MediatedInputStatus::Active;
         registration.clear_result();
         self.commands.push_back(match &registration.source {
@@ -415,6 +498,7 @@ impl MediatedInputState {
             registration.status == MediatedInputStatus::Ready
                 && registration.result.is_none()
                 && registration.file.is_some()
+                && !registration.is_stream()
         }) {
             self.consume_result(handle);
         }
@@ -426,6 +510,18 @@ impl MediatedInputState {
         let Some(registration) = self.registrations.get_mut(&handle) else {
             return MEDIATED_INPUT_CANCEL_INVALID_HANDLE;
         };
+        if registration.is_stream()
+            && matches!(
+                registration.status,
+                MediatedInputStatus::Ready | MediatedInputStatus::Active
+            )
+        {
+            registration.clear_result();
+            registration.status = MediatedInputStatus::Registered;
+            self.commands
+                .push_back(MediatedInputCommand::Cancel { handle });
+            return MEDIATED_INPUT_CANCEL_ACCEPTED;
+        }
         if registration.status == MediatedInputStatus::Ready {
             registration.clear_result();
             registration.status = MediatedInputStatus::Registered;
@@ -445,6 +541,20 @@ impl MediatedInputState {
         self.commands.pop_front()
     }
 
+    /// Clears stream metadata and emits release notifications on teardown.
+    pub(crate) fn close_streams(&mut self) {
+        for (&handle, registration) in &mut self.registrations {
+            if registration.is_stream()
+                && (registration.file.is_some()
+                    || registration.status == MediatedInputStatus::Active)
+            {
+                registration.clear_result();
+                registration.status = MediatedInputStatus::Registered;
+                self.commands
+                    .push_back(MediatedInputCommand::Cancel { handle });
+            }
+        }
+    }
     pub(crate) fn complete(
         &mut self,
         handle: u32,
@@ -517,6 +627,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stream_only_support_obeys_shared_registration_quota() {
+        let descriptor = |id: usize| {
+            format!(
+                r#"{{"id":"stream-{id}","label":"Stream","extensions":[".bin"],"delivery":"stream","maxBytes":4294967295}}"#
+            )
+        };
+        let mut state = MediatedInputState::default();
+        assert_eq!(
+            state.register_file(descriptor(0).as_bytes()),
+            MEDIATED_INPUT_REGISTER_UNAVAILABLE
+        );
+        state
+            .set_file_support(FileInputSupport {
+                stream: true,
+                entrypoint: "app.polkavm".into(),
+                ..FileInputSupport::default()
+            })
+            .unwrap();
+        for id in 0..MAX_MEDIATED_INPUT_REGISTRATIONS {
+            assert_eq!(
+                state.register_file(descriptor(id).as_bytes()),
+                id as i32 + 1
+            );
+        }
+        assert_eq!(state.register_file(descriptor(0).as_bytes()), 1);
+        assert_eq!(
+            state.register_file(descriptor(MAX_MEDIATED_INPUT_REGISTRATIONS).as_bytes()),
+            MEDIATED_INPUT_REGISTER_QUOTA_EXCEEDED
+        );
+        assert_eq!(
+            state.register_file(
+                br#"{"id":"inline","label":"Inline","extensions":[".bin"],"delivery":"inline","maxBytes":1}"#
+            ),
+            FILE_REGISTER_DELIVERY_UNAVAILABLE
+        );
+    }
+
+    #[test]
     fn registration_trigger_completion_and_read_are_bounded() {
         let mut state = MediatedInputState::default();
         state
@@ -587,6 +735,7 @@ mod tests {
             .set_file_support(FileInputSupport {
                 inline: true,
                 relaunch: false,
+                stream: false,
                 entrypoint: "app.polkavm".into(),
             })
             .unwrap();

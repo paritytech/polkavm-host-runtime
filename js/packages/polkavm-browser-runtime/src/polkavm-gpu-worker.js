@@ -28,6 +28,20 @@ const MAX_DISPATCHES_PER_BATCH = 8_192;
 const GPU_SHADER_STAGE_VERTEX = 1;
 const MAX_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_TEXTURE_BYTES = 256 * 1024 * 1024;
+const MAX_TEXTURE_DIMENSION_3D = 256;
+const MAX_TEXTURE_ARRAY_LAYERS = 256;
+const RASTER_FEATURE_LAYERED_TEXTURES = 1;
+const RASTER_FEATURE_STENCIL_DEPTH_BIAS = 2;
+const RENDER_PASS_DEPTH_LOAD = 4;
+const RENDER_PASS_DEPTH_STORE = 8;
+const RENDER_PASS_STENCIL_LOAD = 16;
+const RENDER_PASS_STENCIL_STORE = 32;
+const RENDER_PASS_HAS_STENCIL_CLEAR = 64;
+const RENDER_PASS_FLAGS = 127;
+const PIPELINE_DEPTH_WRITE = 1;
+const PIPELINE_STENCIL_DEPTH_BIAS = 2;
+const PIPELINE_FLAGS = 3;
+const MAX_STENCIL_VALUE = 255;
 const resourceLimits = new Map([
   ["buffer", 4_096],
   ["texture", 512],
@@ -58,6 +72,7 @@ const formats = new Map([
   [5, "depth24plus"],
   [6, "depth32float"],
   [7, "r8unorm"],
+  [8, "depth24plus-stencil8"],
 ]);
 const formatIds = new Map([...formats].map(([id, format]) => [format, id]));
 const vertexFormats = new Map([
@@ -95,6 +110,16 @@ const compareFunctions = new Map([
   [6, "not-equal"],
   [7, "greater-equal"],
   [8, "always"],
+]);
+const stencilOperations = new Map([
+  [1, "keep"],
+  [2, "zero"],
+  [3, "replace"],
+  [4, "invert"],
+  [5, "increment-clamp"],
+  [6, "decrement-clamp"],
+  [7, "increment-wrap"],
+  [8, "decrement-wrap"],
 ]);
 const blendOperations = new Map([
   [1, "add"],
@@ -145,6 +170,17 @@ const textureSampleTypes = new Map([
   [3, "depth"],
   [4, "sint"],
   [5, "uint"],
+]);
+const textureDimensions = new Map([
+  [1, "2d"],
+  [2, "3d"],
+]);
+const textureViewDimensions = new Map([
+  [1, "2d"],
+  [2, "2d-array"],
+  [3, "cube"],
+  [4, "cube-array"],
+  [5, "3d"],
 ]);
 const vertexStepModes = new Map([
   [1, "vertex"],
@@ -286,12 +322,230 @@ function createResource(catalog, slots, id, kind, descriptor, commandIndex) {
   return entry;
 }
 
+function depthFormat(format) {
+  return (
+    format === "depth24plus" ||
+    format === "depth32float" ||
+    format === "depth24plus-stencil8"
+  );
+}
+
+function stencilFormat(format) {
+  return format === "depth24plus-stencil8";
+}
+
+function defaultStencilFace(face) {
+  return (
+    face.compare === "always" &&
+    face.failOp === "keep" &&
+    face.depthFailOp === "keep" &&
+    face.passOp === "keep"
+  );
+}
+
+function textureMipSize(texture, level) {
+  const divisor = 2 ** level;
+  return {
+    width: Math.max(1, Math.floor(texture.width / divisor)),
+    height: Math.max(1, Math.floor(texture.height / divisor)),
+    depthOrArrayLayers:
+      texture.dimension === "3d"
+        ? Math.max(1, Math.floor(texture.depthOrArrayLayers / divisor))
+        : texture.depthOrArrayLayers,
+  };
+}
+
+function validateTexture(command, limits) {
+  const volume = command.dimension === "3d";
+  const dimensionLimit = volume ? limits[22] : limits[0];
+  const depthLimit = volume ? limits[22] : limits[23];
+  const maxMipLevels = 1 + Math.floor(Math.log2(Math.max(
+    command.width,
+    command.height,
+    volume ? command.depthOrArrayLayers : 1
+  )));
+  if (
+    !command.width ||
+    !command.height ||
+    !command.depthOrArrayLayers ||
+    command.width > dimensionLimit ||
+    command.height > dimensionLimit ||
+    command.depthOrArrayLayers > depthLimit ||
+    !command.mipLevelCount ||
+    command.mipLevelCount > maxMipLevels ||
+    command.sampleCount !== 1 ||
+    !command.usage ||
+    (command.usage & ~0x17) ||
+    (volume && (depthFormat(command.format) || (command.usage & 0x10)))
+  ) {
+    throw new ProtocolError("invalid texture descriptor", command.index);
+  }
+}
+
+function validateTextureUpload(command, texture) {
+  const { width, height, depthOrArrayLayers } = command.size;
+  const bytesPerTexel = texture.format === "r8unorm" ? 1 : 4;
+  if (
+    !(texture.usage & 2) ||
+    depthFormat(texture.format) ||
+    command.mipLevel >= texture.mipLevelCount ||
+    !width ||
+    !height ||
+    !depthOrArrayLayers
+  ) {
+    throw new ProtocolError("invalid texture upload", command.index);
+  }
+  const mip = textureMipSize(texture, command.mipLevel);
+  if (
+    command.origin.x + width > mip.width ||
+    command.origin.y + height > mip.height ||
+    command.origin.z + depthOrArrayLayers > mip.depthOrArrayLayers ||
+    command.bytesPerRow < width * bytesPerTexel ||
+    command.bytesPerRow % bytesPerTexel ||
+    command.rowsPerImage < height
+  ) {
+    throw new ProtocolError("invalid texture upload range or layout", command.index);
+  }
+  const imageStride = command.bytesPerRow * command.rowsPerImage;
+  const precedingImages = imageStride * (depthOrArrayLayers - 1);
+  const requiredBytes = precedingImages +
+    command.bytesPerRow * (height - 1) + width * bytesPerTexel;
+  if (
+    !Number.isSafeInteger(imageStride) ||
+    !Number.isSafeInteger(precedingImages) ||
+    !Number.isSafeInteger(requiredBytes) ||
+    requiredBytes > command.data.byteLength
+  ) {
+    throw new ProtocolError("texture upload data is too short", command.index);
+  }
+}
+
+function validateTextureView(command, texture) {
+  const volume = command.dimension === "3d";
+  const cube = command.dimension === "cube" || command.dimension === "cube-array";
+  if (
+    command.format !== texture.format ||
+    (command.aspect === "depth-only" && !depthFormat(texture.format)) ||
+    volume !== (texture.dimension === "3d") ||
+    !command.mipLevelCount ||
+    command.baseMipLevel + command.mipLevelCount > texture.mipLevelCount ||
+    (volume
+      ? command.baseArrayLayer !== 0 || command.arrayLayerCount !== 0
+      : !command.arrayLayerCount ||
+        command.baseArrayLayer + command.arrayLayerCount > texture.depthOrArrayLayers) ||
+    (command.dimension === "2d" && command.arrayLayerCount !== 1) ||
+    (command.dimension === "cube" && command.arrayLayerCount !== 6) ||
+    (command.dimension === "cube-array" && command.arrayLayerCount % 6)
+  ) {
+    throw new ProtocolError("invalid texture view descriptor", command.index);
+  }
+  if (cube && texture.width !== texture.height) {
+    throw new ProtocolError("cube texture view requires square texture", command.index);
+  }
+}
+
+function validateTextureBindings(command, catalog) {
+  const layout = resource(catalog, command.layout, "bindGroupLayout", command.index)
+    .descriptor;
+  const seen = new Set();
+  if (layout.entries.length !== command.entries.length) {
+    throw new ProtocolError("bind group does not match layout", command.index);
+  }
+  for (const entry of command.entries) {
+    const binding = layout.entries.find(item => item.binding === entry.binding);
+    if (!binding || seen.has(entry.binding)) {
+      throw new ProtocolError("invalid bind group binding", command.index);
+    }
+    seen.add(entry.binding);
+    if (!binding.texture && entry.kind !== 3) {
+      continue;
+    }
+    if (!binding.texture || entry.kind !== 3 || entry.offset || entry.size) {
+      throw new ProtocolError("invalid texture binding", command.index);
+    }
+    const view = resource(catalog, entry.resourceId, "textureView", command.index)
+      .descriptor;
+    const texture = resource(catalog, view.texture, "texture", command.index)
+      .descriptor;
+    const sampleType = binding.texture.sampleType;
+    if (
+      !(texture.usage & 4) ||
+      view.dimension !== binding.texture.viewDimension ||
+      (stencilFormat(view.format) && view.aspect !== "depth-only") ||
+      (depthFormat(view.format)
+        ? sampleType !== "depth" && sampleType !== "unfilterable-float"
+        : sampleType !== "float" && sampleType !== "unfilterable-float")
+    ) {
+      throw new ProtocolError("incompatible texture binding", command.index);
+    }
+  }
+}
+
+function validateTextureAttachment(catalog, id, depth, commandIndex) {
+  const view = resource(catalog, id, "textureView", commandIndex).descriptor;
+  const texture = resource(catalog, view.texture, "texture", commandIndex).descriptor;
+  if (
+    !(texture.usage & 0x10) ||
+    view.dimension !== "2d" ||
+    view.mipLevelCount !== 1 ||
+    depthFormat(view.format) !== depth ||
+    (stencilFormat(view.format) && view.aspect !== "all")
+  ) {
+    throw new ProtocolError("invalid texture render attachment", commandIndex);
+  }
+}
+
+// Stencil flags describe a stencil attachment only; a pass either loads the
+// stencil aspect or clears it to one byte.
+function validateStencilPass(command, catalog, commandIndex) {
+  const stencilFlags =
+    RENDER_PASS_STENCIL_LOAD | RENDER_PASS_STENCIL_STORE | RENDER_PASS_HAS_STENCIL_CLEAR;
+  const hasStencil =
+    command.depthView !== 0 &&
+    stencilFormat(resource(catalog, command.depthView, "textureView", commandIndex)
+      .descriptor.format);
+  if (
+    (command.flags & stencilFlags && !hasStencil) ||
+    (command.flags & RENDER_PASS_STENCIL_LOAD &&
+      command.flags & RENDER_PASS_HAS_STENCIL_CLEAR) ||
+    command.clearStencil > MAX_STENCIL_VALUE
+  ) {
+    throw new ProtocolError("invalid stencil pass operations", commandIndex);
+  }
+}
+
+// Mirrors WebGPU's depth-stencil rules so they fail before any GPU mutation.
+function validatePipelineDepthStencil(command, commandIndex) {
+  if (!(command.flags & PIPELINE_STENCIL_DEPTH_BIAS)) {
+    return;
+  }
+  const format = command.depthFormatId
+    ? mapped(formats, command.depthFormatId, "depth format")
+    : null;
+  const lineOrPoint = command.topology !== "triangle-list" &&
+    command.topology !== "triangle-strip";
+  if (
+    !format ||
+    !depthFormat(format) ||
+    (!stencilFormat(format) &&
+      !(defaultStencilFace(command.stencilFront) &&
+        defaultStencilFace(command.stencilBack))) ||
+    (lineOrPoint &&
+      (command.depthBias !== 0 ||
+        command.depthBiasSlopeScale !== 0 ||
+        command.depthBiasClamp !== 0))
+  ) {
+    throw new ProtocolError("invalid pipeline stencil or depth bias state", commandIndex);
+  }
+}
+
 function textureByteLength(descriptor) {
   let width = descriptor.width;
   let height = descriptor.height;
+  let depth = descriptor.depthOrArrayLayers;
   let total = 0;
   for (let level = 0; level < descriptor.mipLevelCount; level++) {
-    const bytes = width * height * 4;
+    const bytes = width * height * depth * 4;
     if (
       !Number.isSafeInteger(bytes) ||
       total > MAX_TOTAL_TEXTURE_BYTES - bytes
@@ -301,6 +555,9 @@ function textureByteLength(descriptor) {
     total += bytes;
     width = Math.max(1, Math.floor(width / 2));
     height = Math.max(1, Math.floor(height / 2));
+    if (descriptor.dimension === "3d") {
+      depth = Math.max(1, Math.floor(depth / 2));
+    }
   }
   return total;
 }
@@ -462,7 +719,7 @@ function parseCommand(command) {
       reader.zero(reader.bytes.byteLength - reader.offset);
       break;
     }
-    case 3:
+    case 3: {
       Object.assign(result, {
         id: reader.u32(),
         width: reader.u32(),
@@ -471,12 +728,19 @@ function parseCommand(command) {
         sampleCount: reader.u16(),
         format: mapped(formats, reader.u16(), "texture format"),
       });
-      if (reader.u8() !== 1) {
-        throw new ProtocolError("unsupported texture dimension", command.index);
+      result.dimension = mapped(
+        textureDimensions,
+        reader.u8(),
+        "texture dimension"
+      );
+      const flags = reader.u8();
+      if ((flags & ~1) || (result.dimension === "3d" && !(flags & 1))) {
+        throw new ProtocolError("invalid texture flags", command.index);
       }
-      reader.zero(1);
       result.usage = reader.u32();
+      result.depthOrArrayLayers = flags & 1 ? reader.u32() : 1;
       break;
+    }
     case 4: {
       Object.assign(result, {
         id: reader.u32(),
@@ -598,15 +862,11 @@ function parseCommand(command) {
                 parameter0,
                 "texture sample type"
               ),
-              viewDimension:
-                parameter1 === 1
-                  ? "2d"
-                  : (() => {
-                      throw new ProtocolError(
-                        "unsupported texture view dimension",
-                        command.index
-                      );
-                    })(),
+              viewDimension: mapped(
+                textureViewDimensions,
+                parameter1,
+                "texture view dimension"
+              ),
               multisampled: false,
             },
           };
@@ -659,6 +919,9 @@ function parseCommand(command) {
       const attributeCount = reader.u16();
       const targetCount = reader.u16();
       result.flags = reader.u16();
+      if (result.flags & ~PIPELINE_FLAGS) {
+        throw new ProtocolError("reserved render pipeline flags", command.index);
+      }
       result.depthFormatId = reader.u16();
       result.sampleCount = reader.u16();
       result.topology = mapped(topologies, reader.u8(), "primitive topology");
@@ -708,6 +971,22 @@ function parseCommand(command) {
         reader.zero(6);
         result.targets.push({ format, writeMask, blend: { color, alpha } });
       }
+      if (result.flags & PIPELINE_STENCIL_DEPTH_BIAS) {
+        const face = () => ({
+          compare: mapped(compareFunctions, reader.u8(), "stencil compare"),
+          failOp: mapped(stencilOperations, reader.u8(), "stencil operation"),
+          depthFailOp: mapped(stencilOperations, reader.u8(), "stencil operation"),
+          passOp: mapped(stencilOperations, reader.u8(), "stencil operation"),
+        });
+        result.stencilFront = face();
+        result.stencilBack = face();
+        result.stencilReadMask = reader.u8();
+        result.stencilWriteMask = reader.u8();
+        reader.zero(2);
+        result.depthBias = reader.i32();
+        result.depthBiasSlopeScale = reader.f32();
+        result.depthBiasClamp = reader.f32();
+      }
       break;
     }
     case 11:
@@ -728,6 +1007,11 @@ function parseCommand(command) {
         },
         clearDepth: reader.f32(),
       });
+      if (result.flags & ~RENDER_PASS_FLAGS) {
+        throw new ProtocolError("reserved render pass flags", command.index);
+      }
+      result.clearStencil =
+        result.flags & RENDER_PASS_HAS_STENCIL_CLEAR ? reader.u32() : 0;
       break;
     case 14:
       Object.assign(result, {
@@ -785,12 +1069,11 @@ function parseCommand(command) {
         texture: reader.u32(),
         format: mapped(formats, reader.u16(), "texture view format"),
       });
-      if (reader.u8() !== 1) {
-        throw new ProtocolError(
-          "unsupported texture view dimension",
-          command.index
-        );
-      }
+      result.dimension = mapped(
+        textureViewDimensions,
+        reader.u8(),
+        "texture view dimension"
+      );
       result.aspect = mapped(textureAspects, reader.u8(), "texture aspect");
       result.baseMipLevel = reader.u16();
       result.mipLevelCount = reader.u16();
@@ -821,6 +1104,9 @@ function parseCommand(command) {
       result.values = [reader.u32(), reader.u32(), reader.u32()];
       break;
     case 29:
+      break;
+    case 30:
+      result.reference = reader.u32();
       break;
     default:
       throw new ProtocolError(
@@ -964,6 +1250,8 @@ class GpuEngine {
     }
     const ceilings = {
       maxTextureDimension2D: 4096,
+      maxTextureDimension3D: MAX_TEXTURE_DIMENSION_3D,
+      maxTextureArrayLayers: MAX_TEXTURE_ARRAY_LAYERS,
       maxBufferSize: 16 * 1024 * 1024,
       maxBindingsPerBindGroup: 16,
       maxBindGroups: 4,
@@ -1041,6 +1329,9 @@ class GpuEngine {
       requested.maxComputeWorkgroupSizeZ,
       requested.maxComputeWorkgroupsPerDimension,
       MAX_DISPATCHES_PER_BATCH,
+      RASTER_FEATURE_LAYERED_TEXTURES | RASTER_FEATURE_STENCIL_DEPTH_BIAS,
+      requested.maxTextureDimension3D,
+      requested.maxTextureArrayLayers,
     ];
     return { device, context, format, limits };
   }
@@ -1209,9 +1500,16 @@ class GpuEngine {
     let draws = 0;
     let computePasses = 0;
     let dispatches = 0;
+    let uploadBytes = 0;
     const commands = batch.commands.map(parseCommand);
     for (const command of commands) {
       const index = command.index;
+      if (command.opcode === 2 || command.opcode === 4) {
+        uploadBytes += command.data.byteLength;
+        if (uploadBytes > this.limits[11]) {
+          throw new ProtocolError("GPU upload budget exceeded", index);
+        }
+      }
       switch (command.opcode) {
         case 1:
           if (!command.size || command.size > this.limits[1]) {
@@ -1232,17 +1530,7 @@ class GpuEngine {
           resource(shadow, command.id, "buffer", index);
           break;
         case 3:
-          if (
-            !command.width ||
-            !command.height ||
-            command.width > this.limits[0] ||
-            command.height > this.limits[0] ||
-            !command.mipLevelCount ||
-            command.mipLevelCount > 13 ||
-            command.sampleCount !== 1
-          ) {
-            throw new ProtocolError("invalid texture descriptor", index);
-          }
+          validateTexture(command, this.limits);
           command.resourceEntry = createBoundedResource(
             shadow,
             slots,
@@ -1255,7 +1543,10 @@ class GpuEngine {
           );
           break;
         case 4:
-          resource(shadow, command.id, "texture", index);
+          validateTextureUpload(
+            command,
+            resource(shadow, command.id, "texture", index).descriptor
+          );
           break;
         case 5:
           command.resourceEntry = createBoundedResource(
@@ -1330,6 +1621,7 @@ class GpuEngine {
               index
             );
           }
+          validateTextureBindings(command, shadow);
           command.resourceEntry = createBoundedResource(
             shadow,
             slots,
@@ -1354,6 +1646,7 @@ class GpuEngine {
               index
             );
           }
+          validatePipelineDepthStencil(command, index);
           command.resourceEntry = createBoundedResource(
             shadow,
             slots,
@@ -1385,15 +1678,16 @@ class GpuEngine {
             );
           }
           if (command.colorView !== 0) {
-            resource(shadow, command.colorView, "textureView", index);
+            validateTextureAttachment(shadow, command.colorView, false, index);
           }
           renderPasses++;
           if (renderPasses > MAX_RENDER_PASSES_PER_BATCH) {
             throw new ProtocolError("too many render passes", index);
           }
           if (command.depthView) {
-            resource(shadow, command.depthView, "textureView", index);
+            validateTextureAttachment(shadow, command.depthView, true, index);
           }
+          validateStencilPass(command, shadow, index);
           pass = true;
           break;
         case 13:
@@ -1477,7 +1771,10 @@ class GpuEngine {
           resource(shadow, command.destination, "buffer", index);
           break;
         case 23:
-          resource(shadow, command.texture, "texture", index);
+          validateTextureView(
+            command,
+            resource(shadow, command.texture, "texture", index).descriptor
+          );
           command.resourceEntry = createBoundedResource(
             shadow,
             slots,
@@ -1549,6 +1846,14 @@ class GpuEngine {
           }
           computePass = false;
           break;
+        case 30:
+          if (!pass) {
+            throw new ProtocolError("stencil reference outside render pass", index);
+          }
+          if (command.reference > MAX_STENCIL_VALUE) {
+            throw new ProtocolError("stencil reference exceeds 255", index);
+          }
+          break;
       }
     }
     if (pass) {
@@ -1616,10 +1921,14 @@ class GpuEngine {
             break;
           case 3:
             entry.value = this.device.createTexture({
-              size: [command.width, command.height, 1],
+              size: [
+                command.width,
+                command.height,
+                command.depthOrArrayLayers,
+              ],
               mipLevelCount: command.mipLevelCount,
               sampleCount: command.sampleCount,
-              dimension: "2d",
+              dimension: command.dimension,
               format: command.format,
               usage: command.usage,
             });
@@ -1744,9 +2053,20 @@ class GpuEngine {
             if (command.depthFormatId) {
               descriptor.depthStencil = {
                 format: mapped(formats, command.depthFormatId, "depth format"),
-                depthWriteEnabled: Boolean(command.flags & 1),
+                depthWriteEnabled: Boolean(command.flags & PIPELINE_DEPTH_WRITE),
                 depthCompare: command.depthCompare,
               };
+              if (command.flags & PIPELINE_STENCIL_DEPTH_BIAS) {
+                Object.assign(descriptor.depthStencil, {
+                  stencilFront: command.stencilFront,
+                  stencilBack: command.stencilBack,
+                  stencilReadMask: command.stencilReadMask,
+                  stencilWriteMask: command.stencilWriteMask,
+                  depthBias: command.depthBias,
+                  depthBiasSlopeScale: command.depthBiasSlopeScale,
+                  depthBiasClamp: command.depthBiasClamp,
+                });
+              }
             }
             entry.value = this.device.createRenderPipeline(descriptor);
             next.set(command.id, entry);
@@ -1782,17 +2102,28 @@ class GpuEngine {
             };
             const descriptor = { colorAttachments: [colorAttachment] };
             if (command.depthView) {
+              const depthView = resource(
+                next,
+                command.depthView,
+                "textureView",
+                command.index
+              );
               descriptor.depthStencilAttachment = {
-                view: resource(
-                  next,
-                  command.depthView,
-                  "textureView",
-                  command.index
-                ).value,
-                depthLoadOp: command.flags & 4 ? "load" : "clear",
-                depthStoreOp: command.flags & 8 ? "store" : "discard",
+                view: depthView.value,
+                depthLoadOp: command.flags & RENDER_PASS_DEPTH_LOAD ? "load" : "clear",
+                depthStoreOp:
+                  command.flags & RENDER_PASS_DEPTH_STORE ? "store" : "discard",
                 depthClearValue: command.clearDepth,
               };
+              if (stencilFormat(depthView.descriptor.format)) {
+                Object.assign(descriptor.depthStencilAttachment, {
+                  stencilLoadOp:
+                    command.flags & RENDER_PASS_STENCIL_LOAD ? "load" : "clear",
+                  stencilStoreOp:
+                    command.flags & RENDER_PASS_STENCIL_STORE ? "store" : "discard",
+                  stencilClearValue: command.clearStencil,
+                });
+              }
             }
             pass = encoder.beginRenderPass(descriptor);
             break;
@@ -1861,12 +2192,14 @@ class GpuEngine {
               command.index
             ).value.createView({
               format: command.format,
-              dimension: "2d",
+              dimension: command.dimension,
               aspect: command.aspect,
               baseMipLevel: command.baseMipLevel,
               mipLevelCount: command.mipLevelCount,
               baseArrayLayer: command.baseArrayLayer,
-              arrayLayerCount: command.arrayLayerCount,
+              ...(command.dimension === "3d"
+                ? {}
+                : { arrayLayerCount: command.arrayLayerCount }),
             });
             next.set(command.id, entry);
             created.push(entry);
@@ -1911,6 +2244,9 @@ class GpuEngine {
           case 29:
             pass.end();
             pass = null;
+            break;
+          case 30:
+            pass.setStencilReference(command.reference);
             break;
         }
       }

@@ -24,16 +24,34 @@ pub struct NativeGpuOutput {
 }
 
 enum Resource {
-    Buffer { value: wgpu::Buffer, size: u64 },
-    Texture(wgpu::Texture),
-    TextureView(wgpu::TextureView),
+    Buffer {
+        value: wgpu::Buffer,
+        size: u64,
+    },
+    Texture {
+        value: wgpu::Texture,
+        bytes: usize,
+    },
+    TextureView(NativeTextureView),
     Sampler(wgpu::Sampler),
     Shader(wgpu::ShaderModule),
-    BindGroupLayout(wgpu::BindGroupLayout),
+    BindGroupLayout {
+        value: wgpu::BindGroupLayout,
+        entries: Vec<wgpu::BindGroupLayoutEntry>,
+    },
     PipelineLayout(wgpu::PipelineLayout),
     BindGroup(wgpu::BindGroup),
     RenderPipeline(wgpu::RenderPipeline),
     ComputePipeline(wgpu::ComputePipeline),
+}
+
+struct NativeTextureView {
+    value: wgpu::TextureView,
+    dimension: wgpu::TextureViewDimension,
+    format: wgpu::TextureFormat,
+    aspect: wgpu::TextureAspect,
+    usage: wgpu::TextureUsages,
+    mip_level_count: u32,
 }
 
 struct PendingPass {
@@ -42,6 +60,7 @@ struct PendingPass {
     flags: u32,
     clear_color: wgpu::Color,
     clear_depth: f32,
+    clear_stencil: u32,
     operations: Vec<RenderOperation>,
 }
 
@@ -67,6 +86,7 @@ enum RenderOperation {
     Viewport([f32; 6]),
     Scissor([u32; 4]),
     Draw([u32; 4]),
+    StencilReference(u32),
     DrawIndexed {
         indices: u32,
         instances: u32,
@@ -94,6 +114,8 @@ pub struct NativeGpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     resources: HashMap<u32, Resource>,
+    texture_bytes: usize,
+    texture_count: usize,
     surface: wgpu::Texture,
     readback: wgpu::Buffer,
     width: u32,
@@ -129,6 +151,8 @@ impl NativeGpuRenderer {
             device,
             queue,
             resources: HashMap::new(),
+            texture_bytes: 0,
+            texture_count: 0,
             surface,
             readback,
             width,
@@ -185,6 +209,7 @@ impl NativeGpuRenderer {
         let mut pending_compute_pass: Option<PendingComputePass> = None;
         let mut presented = false;
         let mut compute_dispatches = 0usize;
+        let mut created_texture_bytes = 0usize;
         for (index, command) in batch.commands().enumerate() {
             let mut reader = Reader::new(command.payload);
             match command.opcode {
@@ -221,35 +246,27 @@ impl NativeGpuRenderer {
                     self.queue.write_buffer(buffer, offset, data);
                 }
                 GpuOpcode::CreateTexture => {
-                    let id = reader.u32()?;
+                    let (id, descriptor, bytes) = read_texture_descriptor(&mut reader)?;
                     self.require_new(id)?;
-                    let width = reader.u32()?;
-                    let height = reader.u32()?;
-                    let mip_level_count = reader.u16()? as u32;
-                    let sample_count = reader.u16()? as u32;
-                    let format = texture_format(reader.u16()?)?;
-                    if reader.u8()? != 1 {
-                        bail!("unsupported texture dimension");
+                    let total = self
+                        .texture_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| anyhow!("texture memory quota overflow"))?;
+                    let created = created_texture_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| anyhow!("texture allocation budget overflow"))?;
+                    if self.texture_count >= gpu_wire::MAX_GPU_TEXTURES
+                        || total > gpu_wire::MAX_GPU_TOTAL_TEXTURE_BYTES
+                        || created > gpu_wire::MAX_GPU_TOTAL_TEXTURE_BYTES
+                    {
+                        bail!("texture allocation quota exceeded");
                     }
-                    reader.zero(1)?;
-                    let usage = wgpu::TextureUsages::from_bits(reader.u32()?)
-                        .ok_or_else(|| anyhow!("invalid texture usage"))?;
-                    reader.finish()?;
-                    let value = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: None,
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count,
-                        sample_count,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage,
-                        view_formats: &[],
-                    });
-                    self.resources.insert(id, Resource::Texture(value));
+                    let value = self.device.create_texture(&descriptor);
+                    self.resources
+                        .insert(id, Resource::Texture { value, bytes });
+                    self.texture_bytes = total;
+                    self.texture_count += 1;
+                    created_texture_bytes = created;
                 }
                 GpuOpcode::WriteTexture => {
                     let id = reader.u32()?;
@@ -269,9 +286,19 @@ impl NativeGpuRenderer {
                     let length = reader.u32()? as usize;
                     let data = reader.take(length)?;
                     reader.zero_remaining()?;
+                    let texture = self.texture(id)?;
+                    validate_texture_write(
+                        texture,
+                        mip_level,
+                        origin,
+                        size,
+                        bytes_per_row,
+                        rows_per_image,
+                        data.len(),
+                    )?;
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo {
-                            texture: self.texture(id)?,
+                            texture,
                             mip_level,
                             origin,
                             aspect: wgpu::TextureAspect::All,
@@ -348,7 +375,11 @@ impl NativeGpuRenderer {
                         .ok_or_else(|| anyhow!("unknown resource {id}"))?;
                     match resource {
                         Resource::Buffer { value, .. } => value.destroy(),
-                        Resource::Texture(value) => value.destroy(),
+                        Resource::Texture { value, bytes } => {
+                            value.destroy();
+                            self.texture_bytes -= bytes;
+                            self.texture_count -= 1;
+                        }
                         _ => {}
                     }
                 }
@@ -367,6 +398,12 @@ impl NativeGpuRenderer {
                         a: reader.f32()? as f64,
                     };
                     let clear_depth = reader.f32()?;
+                    let clear_stencil = if flags & gpu_wire::GPU_RENDER_PASS_HAS_STENCIL_CLEAR != 0
+                    {
+                        reader.u32()?
+                    } else {
+                        0
+                    };
                     reader.finish()?;
                     if generation != self.generation {
                         bail!("stale render attachment");
@@ -374,15 +411,19 @@ impl NativeGpuRenderer {
                     if color_view != 0 {
                         self.texture_view(color_view)?;
                     }
-                    if depth_view != 0 {
-                        self.texture_view(depth_view)?;
-                    }
+                    let has_stencil = if depth_view != 0 {
+                        has_stencil_aspect(self.texture_view(depth_view)?.format)
+                    } else {
+                        false
+                    };
+                    validate_stencil_pass(flags, clear_stencil, has_stencil)?;
                     pending_pass = Some(PendingPass {
                         color_view,
                         depth_view,
                         flags,
                         clear_color,
                         clear_depth,
+                        clear_stencil,
                         operations: Vec::new(),
                     });
                 }
@@ -450,6 +491,15 @@ impl NativeGpuRenderer {
                     pending(&mut pending_pass)?
                         .operations
                         .push(RenderOperation::Draw(values));
+                }
+                GpuOpcode::SetStencilReference => {
+                    let reference = reader.one_u32()?;
+                    if reference > gpu_wire::MAX_GPU_STENCIL_VALUE {
+                        bail!("stencil reference exceeds 255");
+                    }
+                    pending(&mut pending_pass)?
+                        .operations
+                        .push(RenderOperation::StencilReference(reference));
                 }
                 GpuOpcode::DrawIndexed => {
                     let op = RenderOperation::DrawIndexed {
@@ -619,15 +669,67 @@ impl NativeGpuRenderer {
     }
     fn texture(&self, id: u32) -> Result<&wgpu::Texture> {
         match self.resources.get(&id) {
-            Some(Resource::Texture(value)) => Ok(value),
+            Some(Resource::Texture { value, .. }) => Ok(value),
             _ => bail!("invalid texture {id}"),
         }
     }
-    fn texture_view(&self, id: u32) -> Result<&wgpu::TextureView> {
+    fn texture_view(&self, id: u32) -> Result<&NativeTextureView> {
         match self.resources.get(&id) {
             Some(Resource::TextureView(value)) => Ok(value),
             _ => bail!("invalid texture view {id}"),
         }
+    }
+
+    fn validate_texture_binding(
+        &self,
+        layout_id: u32,
+        binding: u32,
+        view: &NativeTextureView,
+    ) -> Result<()> {
+        let Some(Resource::BindGroupLayout { entries, .. }) = self.resources.get(&layout_id) else {
+            bail!("invalid bind group layout {layout_id}");
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.binding == binding)
+            .ok_or_else(|| anyhow!("texture binding is absent from layout"))?;
+        let wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension,
+            multisampled,
+        } = &entry.ty
+        else {
+            bail!("texture binding kind does not match layout");
+        };
+        let sample_matches = match sample_type {
+            wgpu::TextureSampleType::Depth => is_depth_format(view.format),
+            wgpu::TextureSampleType::Float { filterable } => {
+                !is_depth_format(view.format) || !*filterable
+            }
+            _ => false,
+        };
+        if *view_dimension != view.dimension
+            || *multisampled
+            || !sample_matches
+            || (has_stencil_aspect(view.format) && view.aspect != wgpu::TextureAspect::DepthOnly)
+            || !view.usage.contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        {
+            bail!("texture view does not match binding layout");
+        }
+        Ok(())
+    }
+
+    fn render_texture_view(&self, id: u32, depth: bool) -> Result<&wgpu::TextureView> {
+        let view = self.texture_view(id)?;
+        if view.dimension != wgpu::TextureViewDimension::D2
+            || view.mip_level_count != 1
+            || is_depth_format(view.format) != depth
+            || (has_stencil_aspect(view.format) && view.aspect != wgpu::TextureAspect::All)
+            || !view.usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            bail!("texture view is not a compatible render attachment");
+        }
+        Ok(&view.value)
     }
     fn sampler(&self, id: u32) -> Result<&wgpu::Sampler> {
         match self.resources.get(&id) {
@@ -643,7 +745,7 @@ impl NativeGpuRenderer {
     }
     fn bind_group_layout(&self, id: u32) -> Result<&wgpu::BindGroupLayout> {
         match self.resources.get(&id) {
-            Some(Resource::BindGroupLayout(value)) => Ok(value),
+            Some(Resource::BindGroupLayout { value, .. }) => Ok(value),
             _ => bail!("invalid bind group layout {id}"),
         }
     }
@@ -710,11 +812,7 @@ impl NativeGpuRenderer {
                         5 => wgpu::TextureSampleType::Uint,
                         _ => bail!("invalid texture sample type"),
                     },
-                    view_dimension: if p1 == 1 {
-                        wgpu::TextureViewDimension::D2
-                    } else {
-                        bail!("invalid texture view dimension")
-                    },
+                    view_dimension: texture_view_dimension(p1)?,
                     multisampled: false,
                 },
                 _ => bail!("invalid bind group layout kind"),
@@ -733,7 +831,8 @@ impl NativeGpuRenderer {
                 label: None,
                 entries: &entries,
             });
-        self.resources.insert(id, Resource::BindGroupLayout(value));
+        self.resources
+            .insert(id, Resource::BindGroupLayout { value, entries });
         Ok(())
     }
 
@@ -829,10 +928,14 @@ impl NativeGpuRenderer {
                     binding,
                     resource: wgpu::BindingResource::Sampler(self.sampler(id)?),
                 },
-                EntrySpec::Texture { binding, id } => wgpu::BindGroupEntry {
-                    binding,
-                    resource: wgpu::BindingResource::TextureView(self.texture_view(id)?),
-                },
+                EntrySpec::Texture { binding, id } => {
+                    let view = self.texture_view(id)?;
+                    self.validate_texture_binding(layout_id, binding, view)?;
+                    wgpu::BindGroupEntry {
+                        binding,
+                        resource: wgpu::BindingResource::TextureView(&view.value),
+                    }
+                }
             });
         }
         let value = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -901,6 +1004,14 @@ impl NativeGpuRenderer {
                 write_mask,
             }));
         }
+        let (stencil, bias) = if flags & gpu_wire::GPU_PIPELINE_STENCIL_DEPTH_BIAS != 0 {
+            read_stencil_depth_bias(reader, topology)?
+        } else {
+            (
+                wgpu::StencilState::default(),
+                wgpu::DepthBiasState::default(),
+            )
+        };
         reader.finish()?;
         let buffers = layout_specs
             .iter()
@@ -919,14 +1030,24 @@ impl NativeGpuRenderer {
             })
             .collect::<Result<Vec<_>>>()?;
         let depth_stencil = if depth_format_id == 0 {
+            if flags & gpu_wire::GPU_PIPELINE_STENCIL_DEPTH_BIAS != 0 {
+                bail!("depth, stencil or bias state without a depth format");
+            }
             None
         } else {
+            let format = texture_format(depth_format_id)?;
+            if !is_depth_format(format) {
+                bail!("pipeline depth format is not a depth format");
+            }
+            if !stencil_is_default(&stencil) && !has_stencil_aspect(format) {
+                bail!("pipeline stencil state needs a stencil format");
+            }
             Some(wgpu::DepthStencilState {
-                format: texture_format(depth_format_id)?,
-                depth_write_enabled: flags & 1 != 0,
+                format,
+                depth_write_enabled: flags & gpu_wire::GPU_PIPELINE_DEPTH_WRITE != 0,
                 depth_compare: compare(depth_compare_id)?,
-                stencil: Default::default(),
-                bias: Default::default(),
+                stencil,
+                bias,
             })
         };
         let value = self
@@ -974,29 +1095,43 @@ impl NativeGpuRenderer {
         self.require_new(id)?;
         let texture_id = reader.u32()?;
         let format = texture_format(reader.u16()?)?;
-        if reader.u8()? != 1 {
-            bail!("unsupported texture view dimension");
-        }
+        let dimension = texture_view_dimension(reader.u8()? as u32)?;
         let aspect = texture_aspect(reader.u8()?)?;
         let base_mip_level = reader.u16()? as u32;
         let mip_level_count = reader.u16()? as u32;
         let base_array_layer = reader.u16()? as u32;
         let array_layer_count = reader.u16()? as u32;
         reader.finish()?;
-        let value = self
-            .texture(texture_id)?
-            .create_view(&wgpu::TextureViewDescriptor {
-                label: None,
-                format: Some(format),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                usage: None,
-                aspect,
-                base_mip_level,
-                mip_level_count: Some(mip_level_count),
-                base_array_layer,
-                array_layer_count: Some(array_layer_count),
-            });
-        self.resources.insert(id, Resource::TextureView(value));
+        let texture = self.texture(texture_id)?;
+        validate_texture_view(
+            texture,
+            format,
+            dimension,
+            aspect,
+            (base_mip_level, mip_level_count),
+            (base_array_layer, array_layer_count),
+        )?;
+        let value = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: None,
+            format: Some(format),
+            dimension: Some(dimension),
+            usage: None,
+            aspect,
+            base_mip_level,
+            mip_level_count: Some(mip_level_count),
+            base_array_layer,
+            array_layer_count: (dimension != wgpu::TextureViewDimension::D3)
+                .then_some(array_layer_count),
+        });
+        let view = NativeTextureView {
+            value,
+            dimension,
+            aspect,
+            format,
+            usage: texture.usage(),
+            mip_level_count,
+        };
+        self.resources.insert(id, Resource::TextureView(view));
         Ok(())
     }
 
@@ -1010,12 +1145,15 @@ impl NativeGpuRenderer {
             surface_view = self.surface.create_view(&Default::default());
             &surface_view
         } else {
-            self.texture_view(pending.color_view)?
+            self.render_texture_view(pending.color_view, false)?
         };
         let depth_view = if pending.depth_view == 0 {
             None
         } else {
-            Some(self.texture_view(pending.depth_view)?)
+            Some((
+                self.render_texture_view(pending.depth_view, true)?,
+                has_stencil_aspect(self.texture_view(pending.depth_view)?.format),
+            ))
         };
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: color_view,
@@ -1033,22 +1171,36 @@ impl NativeGpuRenderer {
                 },
             },
         });
-        let depth_attachment = depth_view.map(|view| wgpu::RenderPassDepthStencilAttachment {
-            view,
-            depth_ops: Some(wgpu::Operations {
-                load: if pending.flags & 4 != 0 {
-                    wgpu::LoadOp::Load
-                } else {
-                    wgpu::LoadOp::Clear(pending.clear_depth)
+        let depth_attachment =
+            depth_view.map(
+                |(view, has_stencil)| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: if pending.flags & gpu_wire::GPU_RENDER_PASS_DEPTH_LOAD != 0 {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(pending.clear_depth)
+                        },
+                        store: if pending.flags & gpu_wire::GPU_RENDER_PASS_DEPTH_STORE != 0 {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
+                    stencil_ops: has_stencil.then_some(wgpu::Operations {
+                        load: if pending.flags & gpu_wire::GPU_RENDER_PASS_STENCIL_LOAD != 0 {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(pending.clear_stencil)
+                        },
+                        store: if pending.flags & gpu_wire::GPU_RENDER_PASS_STENCIL_STORE != 0 {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
                 },
-                store: if pending.flags & 8 != 0 {
-                    wgpu::StoreOp::Store
-                } else {
-                    wgpu::StoreOp::Discard
-                },
-            }),
-            stencil_ops: None,
-        });
+            );
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[color_attachment],
@@ -1088,6 +1240,9 @@ impl NativeGpuRenderer {
                     values[2]..values[2] + values[0],
                     values[3]..values[3] + values[1],
                 ),
+                RenderOperation::StencilReference(reference) => {
+                    pass.set_stencil_reference(reference)
+                }
                 RenderOperation::DrawIndexed {
                     indices,
                     instances,
@@ -1156,6 +1311,297 @@ impl NativeGpuRenderer {
     }
 }
 
+fn is_depth_format(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Depth24Plus
+            | wgpu::TextureFormat::Depth32Float
+            | wgpu::TextureFormat::Depth24PlusStencil8
+    )
+}
+
+fn has_stencil_aspect(format: wgpu::TextureFormat) -> bool {
+    format == wgpu::TextureFormat::Depth24PlusStencil8
+}
+
+/// Stencil flags only describe a stencil attachment; the clear value is one
+/// stencil byte and replaces, never accompanies, a load.
+fn validate_stencil_pass(flags: u32, clear_stencil: u32, has_stencil: bool) -> Result<()> {
+    let stencil_flags = gpu_wire::GPU_RENDER_PASS_STENCIL_LOAD
+        | gpu_wire::GPU_RENDER_PASS_STENCIL_STORE
+        | gpu_wire::GPU_RENDER_PASS_HAS_STENCIL_CLEAR;
+    if flags & stencil_flags != 0 && !has_stencil {
+        bail!("stencil pass operations without a stencil attachment");
+    }
+    if flags & gpu_wire::GPU_RENDER_PASS_STENCIL_LOAD != 0
+        && flags & gpu_wire::GPU_RENDER_PASS_HAS_STENCIL_CLEAR != 0
+    {
+        bail!("stencil attachment both loads and clears");
+    }
+    if clear_stencil > gpu_wire::MAX_GPU_STENCIL_VALUE {
+        bail!("stencil clear value exceeds 255");
+    }
+    Ok(())
+}
+
+fn stencil_is_default(state: &wgpu::StencilState) -> bool {
+    state.front == wgpu::StencilFaceState::IGNORE && state.back == wgpu::StencilFaceState::IGNORE
+}
+
+/// The CreateRenderPipeline trailer selected by
+/// `GPU_PIPELINE_STENCIL_DEPTH_BIAS`: front and back faces as (compare, fail,
+/// depth-fail, pass), read/write masks, then constant/slope/clamp depth bias.
+fn read_stencil_depth_bias(
+    reader: &mut Reader<'_>,
+    topology: wgpu::PrimitiveTopology,
+) -> Result<(wgpu::StencilState, wgpu::DepthBiasState)> {
+    let mut faces = [wgpu::StencilFaceState::IGNORE; 2];
+    for face in &mut faces {
+        *face = wgpu::StencilFaceState {
+            compare: compare(reader.u8()?)?,
+            fail_op: stencil_operation(reader.u8()?)?,
+            depth_fail_op: stencil_operation(reader.u8()?)?,
+            pass_op: stencil_operation(reader.u8()?)?,
+        };
+    }
+    let read_mask = reader.u8()? as u32;
+    let write_mask = reader.u8()? as u32;
+    reader.zero(2)?;
+    let bias = wgpu::DepthBiasState {
+        constant: reader.i32()?,
+        slope_scale: reader.f32()?,
+        clamp: reader.f32()?,
+    };
+    if (bias.constant != 0 || bias.slope_scale != 0.0 || bias.clamp != 0.0)
+        && !matches!(
+            topology,
+            wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+        )
+    {
+        bail!("depth bias applies to triangle topologies only");
+    }
+    Ok((
+        wgpu::StencilState {
+            front: faces[0],
+            back: faces[1],
+            read_mask,
+            write_mask,
+        },
+        bias,
+    ))
+}
+
+fn texture_view_dimension(value: u32) -> Result<wgpu::TextureViewDimension> {
+    Ok(match value {
+        1 => wgpu::TextureViewDimension::D2,
+        2 => wgpu::TextureViewDimension::D2Array,
+        3 => wgpu::TextureViewDimension::Cube,
+        4 => wgpu::TextureViewDimension::CubeArray,
+        5 => wgpu::TextureViewDimension::D3,
+        _ => bail!("invalid texture view dimension"),
+    })
+}
+
+fn read_texture_descriptor(
+    reader: &mut Reader<'_>,
+) -> Result<(u32, wgpu::TextureDescriptor<'static>, usize)> {
+    let id = reader.u32()?;
+    let width = reader.u32()?;
+    let height = reader.u32()?;
+    let mip_level_count = reader.u16()? as u32;
+    let sample_count = reader.u16()? as u32;
+    let format = texture_format(reader.u16()?)?;
+    let dimension = match reader.u8()? {
+        1 => wgpu::TextureDimension::D2,
+        2 => wgpu::TextureDimension::D3,
+        _ => bail!("invalid texture dimension"),
+    };
+    let flags = reader.u8()?;
+    if flags & !gpu_wire::GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS != 0
+        || (dimension == wgpu::TextureDimension::D3 && flags == 0)
+    {
+        bail!("invalid texture dimension flags");
+    }
+    let usage_bits = reader.u32()?;
+    if usage_bits == 0 || usage_bits & !0x17 != 0 {
+        bail!("invalid texture usage");
+    }
+    let usage = wgpu::TextureUsages::from_bits_retain(usage_bits);
+    let depth_or_array_layers = if flags != 0 { reader.u32()? } else { 1 };
+    reader.finish()?;
+    let (max_xy, max_depth) = if dimension == wgpu::TextureDimension::D3 {
+        (
+            gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D,
+            gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D,
+        )
+    } else {
+        (
+            gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D,
+            gpu_wire::MAX_GPU_TEXTURE_ARRAY_LAYERS,
+        )
+    };
+    if width == 0
+        || height == 0
+        || depth_or_array_layers == 0
+        || width > max_xy
+        || height > max_xy
+        || depth_or_array_layers > max_depth
+        || sample_count != 1
+    {
+        bail!("texture size or samples exceed negotiated limits");
+    }
+    if dimension == wgpu::TextureDimension::D3
+        && (is_depth_format(format) || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT))
+    {
+        bail!("3D textures support color sampling, not depth or render attachments");
+    }
+    let max_axis = width
+        .max(height)
+        .max(if dimension == wgpu::TextureDimension::D3 {
+            depth_or_array_layers
+        } else {
+            1
+        });
+    if mip_level_count == 0
+        || mip_level_count > gpu_wire::MAX_GPU_TEXTURE_MIP_LEVELS
+        || mip_level_count > u32::BITS - max_axis.leading_zeros()
+    {
+        bail!("texture mip count exceeds dimensions");
+    }
+    // Match browser accounting: reserve four bytes per texel, including R8.
+    let mut bytes = 0u64;
+    for mip in 0..mip_level_count {
+        let depth = if dimension == wgpu::TextureDimension::D3 {
+            (depth_or_array_layers >> mip).max(1)
+        } else {
+            depth_or_array_layers
+        };
+        bytes += (width >> mip).max(1) as u64 * (height >> mip).max(1) as u64 * depth as u64 * 4;
+    }
+    if bytes > gpu_wire::MAX_GPU_TOTAL_TEXTURE_BYTES as u64 {
+        bail!("texture exceeds memory quota");
+    }
+    Ok((
+        id,
+        wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers,
+            },
+            mip_level_count,
+            sample_count,
+            dimension,
+            format,
+            usage,
+            view_formats: &[],
+        },
+        bytes as usize,
+    ))
+}
+
+fn validate_texture_view(
+    texture: &wgpu::Texture,
+    format: wgpu::TextureFormat,
+    dimension: wgpu::TextureViewDimension,
+    aspect: wgpu::TextureAspect,
+    (base_mip, mip_count): (u32, u32),
+    (base_layer, layer_count): (u32, u32),
+) -> Result<()> {
+    if format != texture.format()
+        || (aspect == wgpu::TextureAspect::DepthOnly && !is_depth_format(format))
+        || mip_count == 0
+        || base_mip
+            .checked_add(mip_count)
+            .is_none_or(|end| end > texture.mip_level_count())
+    {
+        bail!("invalid texture view format, aspect or mip range");
+    }
+    if dimension == wgpu::TextureViewDimension::D3 {
+        if texture.dimension() != wgpu::TextureDimension::D3 || base_layer != 0 || layer_count != 0
+        {
+            bail!("3D texture view cannot select array layers");
+        }
+        return Ok(());
+    }
+    if texture.dimension() != wgpu::TextureDimension::D2
+        || layer_count == 0
+        || base_layer
+            .checked_add(layer_count)
+            .is_none_or(|end| end > texture.depth_or_array_layers())
+    {
+        bail!("invalid texture view array range");
+    }
+    match dimension {
+        wgpu::TextureViewDimension::D2 if layer_count != 1 => {
+            bail!("2D texture view requires one layer");
+        }
+        wgpu::TextureViewDimension::Cube | wgpu::TextureViewDimension::CubeArray
+            if (dimension == wgpu::TextureViewDimension::Cube && layer_count != 6)
+                || !layer_count.is_multiple_of(6)
+                || texture.width() != texture.height() =>
+        {
+            bail!("cube texture view requires a square texture and complete six-face cubes");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_texture_write(
+    texture: &wgpu::Texture,
+    mip: u32,
+    origin: wgpu::Origin3d,
+    size: wgpu::Extent3d,
+    bytes_per_row: u32,
+    rows_per_image: u32,
+    data_length: usize,
+) -> Result<()> {
+    if mip >= texture.mip_level_count()
+        || is_depth_format(texture.format())
+        || !texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+    {
+        bail!("texture does not permit this mip upload");
+    }
+    let depth = if texture.dimension() == wgpu::TextureDimension::D3 {
+        (texture.depth_or_array_layers() >> mip).max(1)
+    } else {
+        texture.depth_or_array_layers()
+    };
+    for (offset, length, limit) in [
+        (origin.x, size.width, (texture.width() >> mip).max(1)),
+        (origin.y, size.height, (texture.height() >> mip).max(1)),
+        (origin.z, size.depth_or_array_layers, depth),
+    ] {
+        if length == 0 || offset.checked_add(length).is_none_or(|end| end > limit) {
+            bail!("texture upload exceeds subresource");
+        }
+    }
+    let texel_bytes = if texture.format() == wgpu::TextureFormat::R8Unorm {
+        1
+    } else {
+        4
+    };
+    let last_row = size.width as u64 * texel_bytes;
+    if (bytes_per_row as u64) < last_row
+        || !(bytes_per_row as u64).is_multiple_of(texel_bytes)
+        || rows_per_image < size.height
+    {
+        bail!("texture upload strides do not cover its extent");
+    }
+    let required = (size.depth_or_array_layers as u64 - 1)
+        .checked_mul(rows_per_image as u64)
+        .and_then(|rows| rows.checked_add(size.height as u64 - 1))
+        .and_then(|rows| rows.checked_mul(bytes_per_row as u64))
+        .and_then(|bytes| bytes.checked_add(last_row))
+        .ok_or_else(|| anyhow!("texture upload byte range overflow"))?;
+    if required > data_length as u64 {
+        bail!("texture upload data is shorter than its image strides");
+    }
+    Ok(())
+}
+
 fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
     let limits = [
         (1u16, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D as u64),
@@ -1179,6 +1625,13 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
         (19, 64),
         (20, MAX_COMPUTE_WORKGROUPS_PER_DIMENSION as u64),
         (21, gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64),
+        (
+            22,
+            gpu_wire::GPU_RASTER_FEATURE_LAYERED_TEXTURES
+                | gpu_wire::GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS,
+        ),
+        (23, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D as u64),
+        (24, gpu_wire::MAX_GPU_TEXTURE_ARRAY_LAYERS as u64),
     ];
     let mut bytes = vec![0; 56 + limits.len() * 16];
     bytes[..4].copy_from_slice(&gpu_wire::GPU_CAPABILITIES_MAGIC);
@@ -1209,6 +1662,8 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
 fn native_required_limits() -> wgpu::Limits {
     wgpu::Limits {
         max_texture_dimension_2d: gpu_wire::MAX_GPU_TEXTURE_DIMENSION_2D,
+        max_texture_dimension_3d: gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D,
+        max_texture_array_layers: gpu_wire::MAX_GPU_TEXTURE_ARRAY_LAYERS,
         max_storage_buffers_per_shader_stage: MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
         max_compute_workgroup_storage_size: MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
         ..wgpu::Limits::downlevel_defaults()
@@ -1365,6 +1820,7 @@ fn texture_format(id: u16) -> Result<wgpu::TextureFormat> {
         5 => wgpu::TextureFormat::Depth24Plus,
         6 => wgpu::TextureFormat::Depth32Float,
         7 => wgpu::TextureFormat::R8Unorm,
+        8 => wgpu::TextureFormat::Depth24PlusStencil8,
         _ => bail!("invalid texture format"),
     })
 }
@@ -1397,6 +1853,19 @@ fn filter_mode(id: u8) -> Result<wgpu::FilterMode> {
         1 => wgpu::FilterMode::Nearest,
         2 => wgpu::FilterMode::Linear,
         _ => bail!("invalid filter mode"),
+    })
+}
+fn stencil_operation(id: u8) -> Result<wgpu::StencilOperation> {
+    Ok(match id {
+        1 => wgpu::StencilOperation::Keep,
+        2 => wgpu::StencilOperation::Zero,
+        3 => wgpu::StencilOperation::Replace,
+        4 => wgpu::StencilOperation::Invert,
+        5 => wgpu::StencilOperation::IncrementClamp,
+        6 => wgpu::StencilOperation::DecrementClamp,
+        7 => wgpu::StencilOperation::IncrementWrap,
+        8 => wgpu::StencilOperation::DecrementWrap,
+        _ => bail!("invalid stencil operation"),
     })
 }
 fn compare(id: u8) -> Result<wgpu::CompareFunction> {
@@ -1536,24 +2005,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_record_matches_runtime_contract() {
-        let bytes = encode_capabilities(800, 600, 7);
-
-        crate::validate_gpu_capabilities(&bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 21);
-        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 1);
-        assert_eq!(u64::from_le_bytes(bytes[60..68].try_into().unwrap()), 4096);
-        assert_eq!(
-            u16::from_le_bytes(bytes[376..378].try_into().unwrap()),
-            gpu_wire::GpuCapabilityKey::MaxDispatchesPerBatch as u16
-        );
-        assert_eq!(
-            u64::from_le_bytes(bytes[380..388].try_into().unwrap()),
-            gpu_wire::MAX_GPU_DISPATCHES_PER_BATCH as u64
-        );
-    }
-
-    #[test]
     fn native_required_limits_cover_advertised_contract() {
         let limits = native_required_limits();
 
@@ -1608,5 +2059,37 @@ mod tests {
             buffer_binding_type(4, 2, 0, 0).unwrap_err().to_string(),
             "invalid buffer binding layout"
         );
+    }
+
+    #[test]
+    fn enforces_stencil_pass_and_depth_bias_rules() {
+        use gpu_wire::{
+            GPU_RENDER_PASS_HAS_STENCIL_CLEAR as CLEAR, GPU_RENDER_PASS_STENCIL_LOAD as LOAD,
+            GPU_RENDER_PASS_STENCIL_STORE as STORE,
+        };
+        validate_stencil_pass(LOAD | STORE, 0, true).unwrap();
+        validate_stencil_pass(CLEAR | STORE, 255, true).unwrap();
+        assert!(validate_stencil_pass(STORE, 0, false).is_err());
+        assert!(validate_stencil_pass(LOAD | CLEAR, 1, true).is_err());
+        assert!(validate_stencil_pass(CLEAR, 256, true).is_err());
+
+        let mut trailer = vec![3, 1, 1, 3, 3, 1, 1, 3, 0xff, 0x0f, 0, 0];
+        trailer.extend_from_slice(&(-8i32).to_le_bytes());
+        trailer.extend_from_slice(&(-2.0f32).to_le_bytes());
+        trailer.extend_from_slice(&0.0f32.to_le_bytes());
+        let (stencil, bias) = read_stencil_depth_bias(
+            &mut Reader::new(&trailer),
+            wgpu::PrimitiveTopology::TriangleStrip,
+        )
+        .unwrap();
+        assert_eq!(stencil.front.compare, wgpu::CompareFunction::Equal);
+        assert_eq!(stencil.back.pass_op, wgpu::StencilOperation::Replace);
+        assert_eq!((stencil.read_mask, stencil.write_mask), (0xff, 0x0f));
+        assert_eq!((bias.constant, bias.slope_scale), (-8, -2.0));
+        assert!(read_stencil_depth_bias(
+            &mut Reader::new(&trailer),
+            wgpu::PrimitiveTopology::LineList
+        )
+        .is_err());
     }
 }

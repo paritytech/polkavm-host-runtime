@@ -4,10 +4,11 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, ComputerContext, FileInputDelivery, FileInputSupport, FileRegistration,
-    FileRelaunch, FileSelection, Frame, GpuBatch, HostFrameResponseError, InputEvent,
-    InputEventType, MediatedInputCommand, MediatedInputStatus, PresentationProfile, Runtime,
-    TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
+    AudioChunk, ComputerContext, FileCache, FileInputDelivery, FileInputSupport, FileReadSource,
+    FileRegistration, FileRelaunch, FileSelection, FileStreamSelection, Frame, GpuBatch,
+    HostFrameResponseError, InputEvent, InputEventType, MediatedInputCommand, MediatedInputStatus,
+    PresentationProfile, Runtime, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
+    INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -374,6 +375,21 @@ impl ApplicationRuntime {
     ) -> Result<FileInputDelivery> {
         match self {
             Self::Cooperative(runtime) => runtime.send_file_input(handle, selection),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
+        }
+    }
+
+    pub fn send_file_stream(
+        &mut self,
+        handle: u32,
+        selection: FileStreamSelection,
+        source: Box<dyn FileReadSource>,
+        cache: Option<Box<dyn FileCache>>,
+    ) -> Result<FileInputDelivery> {
+        match self {
+            Self::Cooperative(runtime) => {
+                runtime.send_file_stream(handle, selection, source, cache)
+            }
             Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
         }
     }

@@ -198,6 +198,111 @@ Return values:
      GPU error defined by the selected WebGPU contract
 ```
 
+#### Layered and volume textures
+
+Wire version 1 has an additive texture extension, available in both WebGPU
+profiles. Capability key `22` (`RasterFeatures`) bit `0` advertises 2D arrays,
+cube/cube-array views, and 3D color sampling. Keys `23` and `24` report
+`MaxTextureDimension3d` and `MaxTextureArrayLayers`, each capped at 256.
+Guests MUST check this feature bit and the advertised limits before using the
+extension. An absent feature entry does not grant support.
+
+`CreateTexture` (opcode 3) retains its compact 24-byte 2D payload. Its layout is:
+
+```text
+offset  type   meaning
+0       u32    resource handle
+4       u32    width
+8       u32    height
+12      u16    mip-level count
+14      u16    sample count (1)
+16      u16    texture format
+18      u8     dimension: 1 = 2D, 2 = 3D
+19      u8     flags: bit 0 = explicit depth or array-layer count
+20      u32    texture usage
+24      u32    depth or array-layer count, present only when flag bit 0 is set
+```
+
+The payload is exactly 28 bytes with the flag, otherwise exactly 24 bytes.
+Unknown flags are invalid. A 3D texture requires the flag. For 2D textures the
+extra count is the number of array layers; without it the count is one.
+All dimensions and counts are nonzero. The 4096 limit for 2D width/height is
+unchanged; 3D width, height and depth obey key 23. Mip counts cannot exceed
+the dimensions. Depth formats and render-attachment usage are not supported
+for 3D textures by this extension.
+
+`CreateTextureView` (opcode 23) keeps its 20-byte payload. View dimension at
+offset 10, and the texture-binding layout's view-dimension field, use the
+same values: `1` = 2D, `2` = 2D array, `3` = cube, `4` = cube array,
+`5` = 3D. Its existing base-array-layer/count fields at offsets 16/18 select
+layers of a 2D texture. A 2D view selects one layer; a cube selects six;
+a cube array selects a nonzero multiple of six. Cube views require a square
+base texture, even if a nonsquare texture's last mip is square. A 3D view
+requires a 3D source and both array fields zero. Views retain their source
+format, and mip/layer ranges must fit. Texture bindings must match the view
+dimension, sample type and texture-binding usage.
+
+`WriteTexture` (opcode 4) already carries origin Z and copy depth/layer count.
+Array-layer counts stay constant across mips; 3D depth shrinks with each mip.
+Upload strides must cover every row/image, including intermediate padding;
+the byte range may end at the last texel of the final row. R8 copies use one
+byte per texel, color RGBA/BGRA copies four. Depth uploads are not supported.
+The 16 MiB per-tick inline-upload budget is unchanged.
+
+Texture quota accounting conservatively reserves four bytes per texel,
+including R8, across every layer and mip. The 256 MiB live texture limit
+and per-batch allocation budget, and the 512-texture limit, apply to the
+expanded dimensions. A selected array layer or cube face may be rendered
+through a single-mip 2D view with render-attachment usage; cube/array/3D views
+are not themselves render attachments.
+
+#### Stencil and depth bias
+
+Wire version 1 has a second additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `1` (value `2`) advertises
+it. Guests MUST check the bit before using any of the following; an absent
+bit does not grant support.
+
+- Texture format `8` is `Depth24PlusStencil8`. It follows every depth-format
+  rule: no uploads, no 3D textures, four quota bytes per texel. A render
+  attachment view of it uses aspect `1` (all); a sampled view uses aspect `2`
+  (depth only) and binds as depth or unfilterable float.
+- `BeginRenderPass` (opcode 12) keeps its 36-byte payload: color view,
+  depth view, surface generation, flags, clear RGBA and clear depth. Flags
+  `16` (stencil load), `32` (stencil store) and `64` (stencil clear value)
+  join color load `1`, color store `2`, depth load `4` and depth store `8`.
+  Flag `64` appends a `u32` stencil clear value at offset 36 (payload 40
+  bytes), at most 255. Without flag `16` the stencil aspect is cleared to
+  that value, or to 0 without flag `64`; flags `16` and `64` together are
+  invalid. Stencil flags require a depth attachment with a stencil aspect.
+  Other flag bits are invalid.
+- `CreateRenderPipeline` (opcode 10) flag `2` appends a 24-byte trailer
+  after the color targets. Other flag bits besides depth write `1` are
+  invalid.
+
+  ```text
+  offset  type   meaning
+  0       4 u8   front face: compare, fail op, depth-fail op, pass op
+  4       4 u8   back face: compare, fail op, depth-fail op, pass op
+  8       u8     stencil read mask
+  9       u8     stencil write mask
+  10      u16    zero
+  12      i32    constant depth bias
+  16      f32    depth bias slope scale
+  20      f32    depth bias clamp
+  ```
+
+  Compare functions use the depth-compare values. Stencil operations are
+  `1` keep, `2` zero, `3` replace, `4` invert, `5` increment-clamp,
+  `6` decrement-clamp, `7` increment-wrap, `8` decrement-wrap. The trailer
+  requires a depth format. A face other than compare always with keep
+  operations requires a stencil format. Point and line topologies require
+  all three bias values to be zero. Without the trailer the pipeline keeps
+  the WebGPU defaults: stencil always/keep, masks 0xFF, no bias.
+- `SetStencilReference` (opcode 30) carries one `u32` reference, at most
+  255, and is valid only inside a render pass. As in WebGPU, every pass
+  starts with reference 0.
+
 ### WebGPU submission
 
 ```text
@@ -477,6 +582,11 @@ structurally incompatible.
 ```text
 host_file_register(pointer: u32, length: u32) -> i32
 host_file_info(handle: u32, pointer: u32, capacity: u32) -> i32
+host_file_read(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
+host_file_cache_reset(handle: u32, size: u32) -> i32
+host_file_cache_write(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
+host_file_cache_commit(handle: u32) -> i32
+host_file_cache_read(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
 ```
 
 `host_file_register` registers one file handler described by a UTF-8 JSON
@@ -502,9 +612,9 @@ object of at most 4 KiB:
   most 127 bytes, each part using letters, digits, and `!#$&^_.+-`. Wildcards
   and parameters are invalid.
 - At least one of `extensions` or `mimeTypes` is non-empty.
-- `delivery` is `inline` or `relaunch`.
-- `maxBytes` is an integer in `1..=8388608` for `inline` and
-  `1..=134217728` for `relaunch`.
+- `delivery` is `inline`, `relaunch`, or `stream`.
+- `maxBytes` is an integer in `1..=8388608` for `inline`,
+  `1..=134217728` for `relaunch`, and `1..=4294967295` for `stream`.
 - `mountPath` is present only for `relaunch`. It is an archive-relative UTF-8
   path of at most 1,024 bytes with no empty, `.`, or `..` segment, no leading
   `/`, no `\`, and no control character. It differs from `runtime.entrypoint`
@@ -562,6 +672,72 @@ unknown handle or invalid guest range.
 For `inline` delivery, the selected file becomes a status 3 result read with
 `host_input_read`. The read counts against the per-update Host-call byte
 budget.
+
+For `stream` delivery, the Host retains a disk-backed source rather than copying
+the file into guest memory or the asset archive. `host_file_read` synchronously
+copies at most 65,536 bytes from the selected file, starting at `offset`, into
+writable guest memory at `pointer`. `length` MUST be in `1..=65536`. The result
+is the number of bytes copied, limited by the remaining file length; at EOF it
+is zero. The call returns:
+
+```text
+-1  unknown handle, non-stream handler, or no selected source
+-2  invalid length or offset beyond the selected file size
+-3  destination is not a writable guest range
+-4  source I/O failure or short read
+```
+
+The Host validates the destination before performing I/O and charges the
+existing Host-call and byte budgets. Invalid requests leave the selection
+unchanged. Successful reads retain status 3 and metadata; `host_input_read`
+returns zero without acknowledging a stream. `host_input_cancel` releases the
+source, clears metadata, and returns the registration to status 1. Opening a
+new picker also releases the old source. An I/O failure releases the source,
+clears metadata, and reports status 6. Stopping the execution releases all
+selected sources. A refused replacement MUST NOT release the existing source.
+
+Native Hosts can supply `LocalFileSource` around an already user-selected file.
+Browser Hosts advertise stream support only from workers with `FileReaderSync`,
+retain the selected `File`/`Blob`, and read bounded slices there. File paths,
+private source tokens, and arbitrary filesystem access are not guest APIs.
+
+A Host MAY attach a private, disk-backed working cache to a selected stream.
+This stores derived bytes without changing the original selection, its metadata,
+or the asset archive. It is session scratch, not a persistent save or arbitrary
+filesystem API. No guest-chosen path or manifest capability is involved.
+
+- `host_file_cache_reset` reserves `size` bytes, truncates previous contents,
+  and starts an unsealed cache with write cursor zero. Size MUST be nonzero;
+  aggregate reservations across the execution MUST NOT exceed 536,870,912 bytes.
+  Invalid size or quota requests preserve the previous cache.
+- `host_file_cache_write` copies `1..=65536` guest bytes to the exact current
+  write cursor, advancing it by the returned byte count. Sparse, out-of-order,
+  over-length, and sealed writes are rejected.
+- `host_file_cache_commit` requires every declared byte to have been written.
+  It flushes and seals the cache. Reset and commit return zero on success.
+- `host_file_cache_read` reads only sealed caches, with the same bounded reads,
+  EOF clamping, guest-memory validation, and budget charging as `host_file_read`.
+
+Cache calls return `-1` for an unavailable cache (including unsealed reads),
+`-2` for invalid state, range, size, or quota, `-3` for invalid guest memory,
+and `-4` for backend I/O or short transfers. Backend failure drops the derived
+cache and its reservation without changing the Ready original source. Guest
+memory is validated before disk I/O. Cancel, picker reopen, replacement after
+release, and execution stop close both source and cache; refused candidates
+MUST NOT disturb the existing selection.
+
+Native `send_file_stream` accepts an optional `Box<dyn FileCache>`;
+`LocalFileCache::new` creates private scratch in a Host-selected directory,
+immediately unlinked on Unix and removed on drop elsewhere. Browser start
+messages opt in with `fileCache: true`, requiring streamed-file support.
+Workers use OPFS synchronous access handles by default; trusted embedders may
+supply `createPolkaVmRuntime(endpoint, { createFileCache })`. The asynchronous,
+zero-argument factory returns a backend implementing `size`, `reset`, `write`,
+`read`, `flush`, and `close`. Guest calls remain synchronous. Cache opening is
+bounded and completed before Ready delivery; stale candidates are closed.
+Normal browser termination waits for queued close/deletion operations and
+reports failures with an error and `terminated.cleanupFailed: true`. A hard
+worker or browser-process kill can leave origin-private scratch behind.
 
 For `relaunch` delivery, the Host stops the execution and starts a fresh
 execution of the same App. A Host MUST obtain confirmation before stopping an

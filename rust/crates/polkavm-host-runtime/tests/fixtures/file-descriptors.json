@@ -97,6 +97,30 @@
   },
   {
     "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"stream\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Large file\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":4294967295}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Large file\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":4294967296}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1.0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1,\"mountPath\":\"data.bin\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1,\"mountPath\":null}",
     "valid": false
   },
   {

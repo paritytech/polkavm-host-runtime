@@ -47,9 +47,11 @@ and `host_input_cancel` lifecycle. The contract lives in
 - **A handler selects one delivery.** `inline` delivers the selected bytes to
   the running execution through `host_input_read`, up to 8 MiB. `relaunch`
   stops the execution and starts a fresh one in which the file replaces the
-  asset at the handler's mount path, up to 128 MiB.
+  asset at the handler's mount path, up to 128 MiB. `stream` retains a selected
+  disk-backed source up to 4 GiB minus one byte and exposes synchronous random
+  reads of at most 64 KiB through `host_file_read`.
 - **The guest learns what it received.** `host_file_info` returns the file's
-  base name, resolved MIME type, and size for both deliveries, so an editor can
+  base name, resolved MIME type, and size for all deliveries, so an editor can
   title and save a document and an emulator can key save data by cartridge.
 - **The Host owns selection and consent.** A file reaches the guest only
   through Host UI: a picker the guest triggered, a Host menu entry, a drop, a
@@ -82,8 +84,21 @@ and `host_input_cancel` lifecycle. The contract lives in
   `relaunch` registrations and can still serve `inline` ones.
 - Inline reads count against the per-update Host-call byte budget, which the
   8 MiB bound keeps within reach of a single update.
-- One file per selection. Multi-file inputs and files above 128 MiB, such as
-  disc images, need a later decision.
+- Stream delivery keeps large map and disc files outside guest memory. Native
+  Hosts read the selected file directly; browser workers use bounded
+  `FileReaderSync` slices. A Host without that facility returns `-4` for stream
+  registrations rather than buffering the whole file.
+- A selected stream can have a Host-private working cache for derived bytes,
+  such as locally decompressed maps. Sequential writes, explicit sealing,
+  bounded reads, and a 512 MiB aggregate reservation keep it separate from
+  arbitrary filesystem access. The original source and metadata stay unchanged.
+  Native Hosts supply `FileCache`; browser Hosts opt into OPFS or a trusted
+  cache factory. Cancel, picker reopen, and normal stop release the scratch
+  cache. Browser termination waits for deletion and reports cleanup failures;
+  hard worker/process termination may leave origin-private scratch. This is
+  session-local preparation, not cross-launch persistence or redistribution.
+- One file per selection. Multi-file inputs and files above 4 GiB minus one
+  byte need a later decision.
 - Picker and chooser UI, confirmation wording, remembering and clearing the
   last file, error wording, and store presentation of `fileTypes` are Host
   policy.

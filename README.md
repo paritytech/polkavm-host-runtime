@@ -16,6 +16,17 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 - `docs/runtime/polkavm-app-abi-v1.md`: application ABI contract.
 - `docs/runtime/tri2d-v1.md`: Tri2D frame, command, retained-resource, and limit contract.
 
+The engine crate in `rust/vendor/polkavm` derives from immutable upstream
+revision `c160c13c3c29bf3219ce1404ec95976000235a94` (0.37.0).
+Its local interpreter patch bounds resident stack length by the declared stack
+size, independently of allocation capacity. Without this bound, growth of a
+non-power-of-two stack could corrupt Host reads and expose the lower stack
+guard. Native and browser builds use the same patched crate. The vendored
+manifest expands upstream workspace dependencies while retaining their exact
+PolkaVM revision; its metadata records provenance. Upstream license files are
+retained alongside the source. This is a local dependency patch, not an upstream
+release or a change to the application ABI.
+
 ## Host boundary
 
 Hosts integrate through the `truapi-polkavm-host` bridge in [`paritytech/host-rust-core`](https://github.com/paritytech/host-rust-core). The bridge pins one immutable release of this repository and exposes the supported Rust API plus browser asset identity. Host applications do not pin this repository independently.
@@ -84,4 +95,6 @@ Release tags use `v<version>`. Moving branch references are not release inputs.
 
 ## License
 
-MPL-2.0. See `LICENSE`.
+Runtime code: MPL-2.0. See `LICENSE`. Vendored PolkaVM engine:
+MIT OR Apache-2.0; see `rust/vendor/polkavm/LICENSE-MIT` and
+`rust/vendor/polkavm/LICENSE-APACHE`.
