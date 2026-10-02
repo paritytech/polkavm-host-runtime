@@ -1579,7 +1579,7 @@
             address = this.#readU64(this.#u32(a2 + index * 16n));
             length = this.#readU64(this.#u32(a2 + index * 16n + 8n));
           } catch {
-            this.#setReg(7, errno(EFAULT));
+            this.#setReg(7, total || errno(EFAULT));
             return false;
           }
           const result =
@@ -1587,10 +1587,11 @@
               ? this.#readFile(a1, address, length)
               : this.#writeFile(a1, address, length);
           if (BigInt.asIntN(64, result) < 0n) {
-            this.#setReg(7, result);
+            this.#setReg(7, total || result);
             return false;
           }
-          total += length;
+          total += result;
+          if (result < length) break;
         }
         this.#setReg(7, total);
       } else if (syscall === SYS_EXIT) {
@@ -2151,7 +2152,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     let cacheHit = false;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
     const instantiated = await WebAssembly.instantiate(message.runtime, {});
-    pvm = instantiated.instance.exports;
+    if (disposed) return;
+    pvm = (instantiated instanceof WebAssembly.Instance
+      ? instantiated
+      : instantiated.instance).exports;
     if (pvm.pvm_browser_abi_version() !== 1) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
@@ -2192,6 +2196,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         translatedWasmBytes = bytes.byteLength;
         const compilationStarted = performance.now();
         module = await WebAssembly.compile(bytes);
+        if (disposed) return;
         compilationMs = performance.now() - compilationStarted;
         try {
           postMessage({ type: "compiled", cacheKey: message.cacheKey, module });
@@ -2221,6 +2226,7 @@ globalThis.createPvmRuntime = (endpoint) => {
       pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
+      if (disposed) return;
       translated = null;
       pendingOutputs.length = 0;
       if (error !== FORCE_INTERPRETER) {
@@ -2440,6 +2446,7 @@ globalThis.createPvmRuntime = (endpoint) => {
     const message = event.data;
     if (message?.type === "start") {
       void start(message).catch((error) => {
+        if (disposed) return;
         stopRuntime();
         postMessage({ type: "error", message: error.message });
         postMessage({ type: "terminated" });

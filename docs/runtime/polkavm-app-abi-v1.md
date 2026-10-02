@@ -74,10 +74,11 @@ a returned status for that condition.
 
 ## Capability gating
 
-The App manifest selects exactly one graphics profile and may enable device
-input and audio. A Host call made outside its declared capability MUST fail
-with that call's unavailable or invalid-state result. The Host MUST NOT
-silently reinterpret a submission as another graphics profile.
+The App manifest selects exactly one graphics profile, may enable device input
+and audio, and may register consented file-input handlers. A Host call made
+outside its declared capability MUST fail with that call's unavailable or
+invalid-state result. The Host MUST NOT silently reinterpret a submission as
+another graphics profile.
 
 ## Host imports
 
@@ -504,6 +505,47 @@ number written.
 Zero means the name was invalid, the asset was absent, or the offset was at or
 past the end of the asset. Assets are immutable for the lifetime of one
 execution.
+
+#### Consented file-input launch assets
+
+An App can register file types that it can consume at startup:
+
+```json
+{
+  "capabilities": {
+    "fileInput": {
+      "abiVersion": 1,
+      "handlers": [
+        {
+          "id": "snes-rom",
+          "label": "SNES cartridge image",
+          "extensions": [".sfc", ".smc", ".swc", ".fig"],
+          "maxBytes": 16777216,
+          "mountPath": "game/cartridge.sfc"
+        }
+      ]
+    }
+  }
+}
+```
+
+`extensions` and `mediaTypes` are optional routing hints, but a handler MUST
+declare at least one. Extensions include a leading dot. A handler also declares
+a positive `maxBytes` no larger than the one-asset runtime limit and a unique,
+valid archive-relative `mountPath` distinct from `runtime.entrypoint`. Handler
+IDs and mount paths MUST be unique within the App.
+
+The Host uses the selected file's name, media type, and size only to find
+candidate handlers. It MUST ask the user before reading the file bytes. If
+several installed Products match, the user MUST explicitly select the target.
+Picker and drag-and-drop entry points MUST use the same routing, consent, and
+delivery path.
+
+After consent, the Host starts a fresh execution whose asset at `mountPath` is
+the selected file rather than the packaged default. Declining MUST NOT read or
+deliver the bytes. A registration is a routing hint, not proof that the
+contents are valid: the App MUST validate the bytes and may reject
+initialization. Assets remain immutable for the lifetime of that execution.
 
 ### Save data
 

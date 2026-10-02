@@ -12,11 +12,16 @@ use crate::{NativeGpuFrame, NativeGpuRenderer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Foreign-language presentation profile matching the manifest contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePvmPresentationProfile {
+    /// CPU-rendered packed framebuffer pixels.
     Framebuffer,
+    /// Validated textured-triangle command streams.
     Tri2d,
+    /// WebGPU raster commands without compute.
     WebGpuRaster,
+    /// WebGPU raster and compute commands.
     WebGpu,
 }
 
@@ -31,14 +36,22 @@ impl From<NativePvmPresentationProfile> for PresentationProfile {
     }
 }
 
+/// Fixed input event kind accepted by the native binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePvmInputEventType {
+    /// Press a USB HID keyboard usage code.
     KeyDown,
+    /// Release a USB HID keyboard usage code.
     KeyUp,
+    /// Press a pointer button.
     ButtonDown,
+    /// Release a pointer button.
     ButtonUp,
+    /// Set absolute surface pointer coordinates.
     PointerMove,
+    /// Report signed i16 pointer displacement encoded in u16 fields.
     PointerDelta,
+    /// Report surface width and height through the coordinate fields.
     SurfaceMetrics,
 }
 
@@ -56,10 +69,14 @@ impl From<NativePvmInputEventType> for InputEventType {
     }
 }
 
+/// Text operation accepted by the native binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePvmTextInputKind {
+    /// Insert committed text outside IME composition.
     Text,
+    /// Replace the current uncommitted IME composition.
     ImePreedit,
+    /// Commit the current IME composition.
     ImeCommit,
 }
 
@@ -73,10 +90,14 @@ impl From<NativePvmTextInputKind> for TextInputKind {
     }
 }
 
+/// Host permission and availability state for motion input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePvmMotionAvailability {
+    /// No sensor or fallback source exists.
     Unavailable,
+    /// Motion is supported, though a new sample may not yet exist.
     Available,
+    /// Platform or user denied motion access.
     PermissionDenied,
 }
 
@@ -90,16 +111,23 @@ impl From<NativePvmMotionAvailability> for crate::motion_wire::MotionAvailabilit
     }
 }
 
+/// Immutable launch asset transferred into the runtime.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmAsset {
+    /// Validated relative path visible to the guest.
     pub path: String,
+    /// Complete file contents, subject to launch asset quotas.
     pub bytes: Vec<u8>,
 }
 
+/// CPU framebuffer returned across the foreign-language boundary.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmFrame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
+    /// Packed 0xAARRGGBB pixels, represented as BGRA bytes on little-endian guests.
     pub argb: Vec<u8>,
 }
 
@@ -113,8 +141,10 @@ impl From<Frame> for NativePvmFrame {
     }
 }
 
+/// Accessibility snapshot returned across the foreign-language boundary.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmUiSemanticsFrame {
+    /// Complete validated UTF-8 semantic JSON.
     pub bytes: Vec<u8>,
 }
 
@@ -124,8 +154,10 @@ impl From<UiSemanticsFrame> for NativePvmUiSemanticsFrame {
     }
 }
 
+/// Guest UI platform requests returned to the native host.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmUiOutputFrame {
+    /// Complete validated UI output wire stream.
     pub bytes: Vec<u8>,
 }
 
@@ -135,13 +167,20 @@ impl From<UiOutputFrame> for NativePvmUiOutputFrame {
     }
 }
 
+/// Validated Tri2D stream with aggregate frame metadata.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmTri2dFrame {
+    /// Target surface width in pixels.
     pub width: u32,
+    /// Target surface height in pixels.
     pub height: u32,
+    /// Number of draw commands.
     pub draw_count: u32,
+    /// Total vertices across all draws.
     pub vertex_count: u32,
+    /// Total indices across all draws.
     pub index_count: u32,
+    /// Complete encoded stream, including texture updates and presentation.
     pub bytes: Vec<u8>,
 }
 
@@ -158,10 +197,14 @@ impl From<Tri2dFrame> for NativePvmTri2dFrame {
     }
 }
 
+/// Interleaved PCM audio awaiting native playback.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmAudioChunk {
+    /// Signed 16-bit sample values interleaved by channel.
     pub samples: Vec<i16>,
+    /// Samples per second per channel.
     pub sample_rate: u32,
+    /// Number of interleaved channels.
     pub channels: u32,
 }
 
@@ -175,8 +218,10 @@ impl From<AudioChunk> for NativePvmAudioChunk {
     }
 }
 
+/// GPU commands awaiting execution by the native host.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmGpuBatch {
+    /// Complete validated batch encoding.
     pub bytes: Vec<u8>,
 }
 
@@ -186,10 +231,14 @@ impl From<GpuBatch> for NativePvmGpuBatch {
     }
 }
 
+/// Read-back pixels from the native GPU renderer.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePvmGpuFrame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
+    /// Tightly packed 8-bit RGBA pixels in row order.
     pub rgba: Vec<u8>,
 }
 
@@ -204,12 +253,22 @@ impl From<NativeGpuFrame> for NativePvmGpuFrame {
     }
 }
 
+/// Native runtime construction, execution, or synchronization failure.
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum NativePvmError {
+    /// Runtime validation or execution rejected an operation.
     #[error("{detail}")]
-    Runtime { detail: String },
+    Runtime {
+        /// Human-readable failure reason.
+        detail: String,
+    },
+    /// Launch assets contained the same path more than once.
     #[error("asset path appears more than once: {path}")]
-    DuplicateAsset { path: String },
+    DuplicateAsset {
+        /// Duplicate guest-visible asset path.
+        path: String,
+    },
+    /// An earlier panic poisoned the runtime or renderer mutex.
     #[error("PVM runtime mutex was poisoned")]
     RuntimePoisoned,
 }
@@ -222,6 +281,7 @@ impl NativePvmError {
     }
 }
 
+/// Synchronized application runtime exposed through UniFFI.
 #[derive(uniffi::Object)]
 pub struct NativePvmRuntime {
     runtime: Mutex<ApplicationRuntime>,
@@ -246,6 +306,9 @@ impl NativePvmRuntime {
 
 #[uniffi::export]
 impl NativePvmRuntime {
+    /// Validate launch inputs and construct a runtime with a nonzero gas budget.
+    ///
+    /// Assets must have unique relative paths. Call `init` before updating.
     #[uniffi::constructor]
     pub fn new(
         program: Vec<u8>,
@@ -277,26 +340,32 @@ impl NativePvmRuntime {
         }))
     }
 
+    /// Initialize the guest under its execution and host-call quotas.
     pub fn init(&self) -> Result<(), NativePvmError> {
         self.lock()?.init().map_err(NativePvmError::runtime)
     }
 
+    /// Execute one bounded guest update.
     pub fn update(&self) -> Result<(), NativePvmError> {
         self.lock()?.update().map_err(NativePvmError::runtime)
     }
 
+    /// Return the selected backend's lowercase debug name.
     pub fn backend(&self) -> Result<String, NativePvmError> {
         Ok(format!("{:?}", self.lock()?.backend()).to_ascii_lowercase())
     }
 
+    /// Whether the guest imports motion input.
     pub fn uses_motion(&self) -> Result<bool, NativePvmError> {
         Ok(self.lock()?.uses_motion())
     }
 
+    /// Gas consumed from the latest guest execution budget.
     pub fn last_gas_used(&self) -> Result<u64, NativePvmError> {
         Ok(self.lock()?.last_gas_used())
     }
 
+    /// Queue a fixed input event; coordinates follow the selected event's contract.
     pub fn send_input(
         &self,
         event_type: NativePvmInputEventType,
@@ -313,6 +382,7 @@ impl NativePvmRuntime {
         Ok(())
     }
 
+    /// Validate and queue exactly eight encoded input bytes; unsupported for CoreVM.
     pub fn send_input_record(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
         let record: [u8; INPUT_EVENT_BYTES] = bytes.try_into().map_err(|_| {
             NativePvmError::runtime(format!(
@@ -324,6 +394,7 @@ impl NativePvmRuntime {
             .map_err(NativePvmError::runtime)
     }
 
+    /// Encode and queue a bounded UTF-8 text operation; unsupported for CoreVM.
     pub fn send_text_input(
         &self,
         kind: NativePvmTextInputKind,
@@ -334,6 +405,7 @@ impl NativePvmRuntime {
             .map_err(NativePvmError::runtime)
     }
 
+    /// Update motion availability, clearing pending samples if access is lost.
     pub fn set_motion_availability(
         &self,
         availability: NativePvmMotionAvailability,
@@ -342,28 +414,35 @@ impl NativePvmRuntime {
         Ok(())
     }
 
+    /// Validate and replace the latest encoded motion sample.
     pub fn send_motion_sample(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
         self.lock()?
             .send_motion_sample(&bytes)
             .map_err(NativePvmError::runtime)
     }
 
+    /// Whether no GPU capabilities prerequisite remains before execution.
     pub fn gpu_ready(&self) -> Result<bool, NativePvmError> {
         Ok(self.lock()?.gpu_ready())
     }
 
+    /// Validate and install encoded host capabilities for a GPU guest.
     pub fn set_gpu_capabilities(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
         self.lock()?
             .set_gpu_capabilities(bytes)
             .map_err(NativePvmError::runtime)
     }
 
+    /// Validate and queue an encoded host GPU event.
     pub fn send_gpu_event(&self, bytes: Vec<u8>) -> Result<(), NativePvmError> {
         self.lock()?
             .send_gpu_event(bytes)
             .map_err(NativePvmError::runtime)
     }
 
+    /// Create a native GPU surface of the requested pixel dimensions and install capabilities.
+    ///
+    /// Fails when this build lacks the `native-gpu` feature.
     pub fn configure_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePvmError> {
         #[cfg(feature = "native-gpu")]
         {
@@ -386,6 +465,7 @@ impl NativePvmRuntime {
         }
     }
 
+    /// Resize the configured GPU surface in pixels and refresh guest capabilities.
     pub fn resize_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePvmError> {
         #[cfg(feature = "native-gpu")]
         {
@@ -410,6 +490,9 @@ impl NativePvmRuntime {
         }
     }
 
+    /// Drain pending GPU batches and return the newest rendered frame, if any.
+    ///
+    /// Execution events are queued back to the guest; requires a configured renderer.
     pub fn render_native_gpu(&self) -> Result<Option<NativePvmGpuFrame>, NativePvmError> {
         #[cfg(feature = "native-gpu")]
         {
@@ -440,38 +523,47 @@ impl NativePvmRuntime {
         }
     }
 
+    /// Take the newest CPU framebuffer.
     pub fn take_frame(&self) -> Result<Option<NativePvmFrame>, NativePvmError> {
         Ok(self.lock()?.take_frame().map(Into::into))
     }
 
+    /// Take the pending Tri2D frame.
     pub fn take_tri2d(&self) -> Result<Option<NativePvmTri2dFrame>, NativePvmError> {
         Ok(self.lock()?.take_tri2d().map(Into::into))
     }
 
+    /// Remove the oldest audio chunk.
     pub fn take_audio(&self) -> Result<Option<NativePvmAudioChunk>, NativePvmError> {
         Ok(self.lock()?.take_audio().map(Into::into))
     }
 
+    /// Remove the oldest GPU batch for execution by an external renderer.
     pub fn take_gpu_batch(&self) -> Result<Option<NativePvmGpuBatch>, NativePvmError> {
         Ok(self.lock()?.take_gpu_batch().map(Into::into))
     }
 
+    /// Take the newest accessibility snapshot.
     pub fn take_ui_semantics(&self) -> Result<Option<NativePvmUiSemanticsFrame>, NativePvmError> {
         Ok(self.lock()?.take_ui_semantics().map(Into::into))
     }
 
+    /// Take the newest UI platform-output snapshot.
     pub fn take_ui_output(&self) -> Result<Option<NativePvmUiOutputFrame>, NativePvmError> {
         Ok(self.lock()?.take_ui_output().map(Into::into))
     }
 
+    /// Remove the oldest queued guest log.
     pub fn take_log(&self) -> Result<Option<String>, NativePvmError> {
         Ok(self.lock()?.take_log())
     }
 
+    /// Whether a CoreVM guest completed with exit status zero.
     pub fn is_exited(&self) -> Result<bool, NativePvmError> {
         Ok(self.lock()?.is_exited())
     }
 
+    /// Take the latest guest save payload.
     pub fn take_save(&self) -> Result<Option<Vec<u8>>, NativePvmError> {
         Ok(self.lock()?.take_save())
     }

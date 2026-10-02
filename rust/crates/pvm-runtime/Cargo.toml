@@ -7,6 +7,9 @@ license = "MPL-2.0"
 repository = "https://github.com/paritytech/pvm-host-runtime"
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]
 

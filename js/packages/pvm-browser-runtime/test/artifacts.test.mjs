@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -18,14 +18,12 @@ test("browser runtime artifacts match their published checksums", async () => {
         return [file, digest];
       }),
   );
-  for (const file of [
-    "pvm-browser-runtime.wasm",
-    "pvm-worker.js",
-    "pvm-gpu-worker.js",
-    "pvm-wasm-translated.js",
-    "pvm-runtime-core.js",
-    "pvm-wasm-worker-entry.js",
-  ]) {
+  assert.deepEqual(
+    [...expected.keys(), "SHA256SUMS"].sort(),
+    (await readdir(dist)).sort(),
+    "every packaged artifact must have a checksum",
+  );
+  for (const file of expected.keys()) {
     const bytes = await readFile(resolve(dist, file));
     assert.equal(
       createHash("sha256").update(bytes).digest("hex"),

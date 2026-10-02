@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Bounded PolkaVM application execution and host-neutral presentation/input APIs.
+
 #[cfg(target_arch = "wasm32")]
 extern crate polkavm_wasm as polkavm;
 
@@ -42,7 +44,7 @@ pub use computer::{
     MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES,
     TTY_MODE_ECHO, TTY_MODE_RAW,
 };
-pub use manifest::AppDescriptor;
+pub use manifest::{AppDescriptor, FileInputHandler};
 
 use anyhow::{anyhow, bail, Context, Result};
 pub use polkavm::BackendKind;
@@ -64,17 +66,24 @@ pub use ui::{
     MAX_UI_SEMANTIC_STRING_BYTES, MAX_UI_TEXT_BYTES,
 };
 
+/// Version of the cooperative guest host-call ABI.
 pub const ABI_VERSION: u32 = 1;
 
+/// Presentation contract selected by the verified application manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
+    /// Guest submits packed CPU-rendered pixels.
     Framebuffer,
+    /// Guest submits validated textured-triangle command streams.
     Tri2d,
+    /// Guest submits WebGPU raster commands without compute.
     WebGpuRaster,
+    /// Guest submits WebGPU raster and compute commands.
     WebGpu,
 }
 
 impl PresentationProfile {
+    /// Parse an exact manifest profile name, rejecting unsupported values.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "framebuffer" => Ok(Self::Framebuffer),
@@ -85,6 +94,7 @@ impl PresentationProfile {
         }
     }
 
+    /// Return the canonical manifest profile name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Framebuffer => "framebuffer",
@@ -102,19 +112,33 @@ impl PresentationProfile {
         matches!(self, Self::WebGpu)
     }
 }
+/// Bytes per packed framebuffer pixel.
 pub const BYTES_PER_PIXEL: usize = 4;
+/// Maximum encoded PolkaVM program size in bytes.
 pub const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum framebuffer payload in bytes.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum bytes read from guest memory by one bounded host operation.
 pub const MAX_GUEST_READ: usize = MAX_FRAME_BYTES;
+/// Maximum initial writable guest data size in bytes.
 pub const MAX_GUEST_RW_DATA_BYTES: u32 = 64 * 1024 * 1024;
+/// Maximum declared guest stack size in bytes.
 pub const MAX_GUEST_STACK_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum guest heap size in bytes.
 pub const MAX_GUEST_HEAP_BYTES: u32 = 128 * 1024 * 1024;
+/// Maximum launch asset count.
 pub const MAX_ASSET_FILES: usize = 2_048;
+/// Maximum bytes in one launch asset.
 pub const MAX_ASSET_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum aggregate launch asset bytes.
 pub const MAX_ASSET_BYTES: usize = 128 * 1024 * 1024;
+/// Encoded size of each fixed or extended input record in bytes.
 pub const INPUT_EVENT_BYTES: usize = 8;
+/// PCM playback sample rate in samples per second per channel.
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+/// Number of interleaved PCM channels.
 pub const AUDIO_CHANNELS: u32 = 2;
+/// Maximum interleaved sample values accepted in one audio host call.
 pub const MAX_AUDIO_SAMPLES_PER_CALL: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS as usize;
 const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_ASSET_READ_BYTES: usize = 16 * 1024 * 1024;
@@ -132,6 +156,7 @@ const MAX_QUEUED_GPU_BATCHES: usize = 4;
 const MAX_QUEUED_GPU_EVENTS: usize = 256;
 const MAX_GPU_SUBMITS_PER_TICK: u32 = 8;
 const MAX_GPU_UPLOAD_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+/// Maximum bytes in one TrUAPI request or response frame.
 pub const MAX_TRUAPI_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_TRUAPI_FRAMES: usize = 32;
 const MAX_QUEUED_TRUAPI_BYTES: usize = 4 * 1024 * 1024;
@@ -204,23 +229,36 @@ pub(crate) fn validate_blob(blob: &ProgramBlob) -> Result<()> {
     Ok(())
 }
 
+/// Fixed input record discriminants in the guest ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum InputEventType {
+    /// Press a USB HID keyboard usage code.
     KeyDown = 1,
+    /// Release a USB HID keyboard usage code.
     KeyUp = 2,
+    /// Press a pointer button.
     ButtonDown = 3,
+    /// Release a pointer button.
     ButtonUp = 4,
+    /// Set absolute pointer coordinates on the surface.
     PointerMove = 5,
+    /// Report relative pointer displacement using signed i16 bit patterns.
     PointerDelta = 6,
+    /// Report surface width and height through the coordinate fields.
     SurfaceMetrics = 7,
 }
 
+/// One fixed-size input event queued for the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputEvent {
+    /// Interpretation of the code and coordinate fields.
     pub event_type: InputEventType,
+    /// HID key usage, pointer button, or event-specific code.
     pub code: u8,
+    /// Horizontal position/size in surface units, or signed i16 delta bits.
     pub x: u16,
+    /// Vertical position/size in surface units, or signed i16 delta bits.
     pub y: u16,
 }
 
@@ -241,24 +279,32 @@ impl InputEvent {
     }
 }
 
+/// Latest CPU-rendered framebuffer awaiting host presentation.
 #[derive(Debug)]
 pub struct Frame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
     /// Packed 0xAARRGGBB pixels. On little-endian guests these bytes are BGRA.
     pub argb: Vec<u8>,
 }
 
+/// One queued block of interleaved signed 16-bit PCM audio.
 #[derive(Debug)]
 pub struct AudioChunk {
     /// Interleaved little-endian signed 16-bit samples.
     pub samples: Vec<i16>,
+    /// Samples per second per channel.
     pub sample_rate: u32,
+    /// Number of interleaved channels.
     pub channels: u32,
 }
 
+/// Structurally validated GPU commands awaiting host execution.
 #[derive(Debug)]
 pub struct GpuBatch {
+    /// Complete encoded batch, including the wire header.
     pub bytes: Vec<u8>,
 }
 
@@ -584,6 +630,7 @@ impl HostState {
     }
 }
 
+/// Cooperative guest exposing `init` and `update` entry points.
 pub struct Runtime {
     instance: Instance<HostState, anyhow::Error>,
     state: HostState,
@@ -593,6 +640,10 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Validate launch inputs and instantiate with the platform-preferred backend.
+    ///
+    /// `max_gas_per_update` must be nonzero and also bounds `init`; call `init`
+    /// before the first update. Assets are owned immutable guest-visible files.
     pub fn new(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -610,6 +661,9 @@ impl Runtime {
         )
     }
 
+    /// Instantiate with an explicit sandboxed backend and nonzero per-call gas limit.
+    ///
+    /// Rejects invalid programs, asset paths, and resource quotas before execution.
     pub fn new_with_backend(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -1181,6 +1235,7 @@ impl Runtime {
         })
     }
 
+    /// Invoke guest `init` with fresh gas and initialization host-call quotas.
     pub fn init(&mut self) -> Result<()> {
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
@@ -1205,6 +1260,7 @@ impl Runtime {
         })
     }
 
+    /// Invoke guest `update` with fresh gas and per-update host-call quotas.
     pub fn update(&mut self) -> Result<()> {
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
@@ -1233,43 +1289,55 @@ impl Runtime {
         self.last_gas_used = (budget - remaining.min(budget)) as u64;
     }
 
+    /// Gas consumed by the most recent `init` or `update`, including failed calls.
     pub fn last_gas_used(&self) -> u64 {
         self.last_gas_used
     }
 
+    /// Backend actually selected by the PolkaVM engine.
     pub fn backend(&self) -> polkavm::BackendKind {
         self.backend
     }
 
+    /// Whether the guest imports the motion-sample host call.
     pub fn uses_motion(&self) -> bool {
         self.state.uses_motion
     }
 
+    /// Queue a fixed event, coalescing pointer/metrics updates where possible.
+    ///
+    /// Drops the new event if the full queue contains no discardable movement.
     pub fn send_input(&mut self, event: InputEvent) {
         self.state.queue_input(event);
     }
 
+    /// Validate and queue one extended record; reject malformed or overflowing input.
     pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
         self.state.queue_input_record(record)
     }
 
+    /// Encode and atomically queue a bounded UTF-8 text operation.
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         self.state
             .queue_input_records(ui::encode_text_input(kind, text)?)
     }
 
+    /// Update sensor availability, clearing pending samples when unavailable or denied.
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
         self.state.motion.set_availability(availability);
     }
 
+    /// Validate and replace the latest motion sample, marking motion available.
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
         self.state.motion.set_sample(bytes)
     }
 
+    /// Whether execution has no outstanding GPU capabilities prerequisite.
     pub fn gpu_ready(&self) -> bool {
         !self.state.presentation.supports_gpu() || self.state.gpu_capabilities.is_some()
     }
 
+    /// Validate and install host capabilities; reject non-GPU applications.
     pub fn set_gpu_capabilities(&mut self, bytes: Vec<u8>) -> Result<()> {
         if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU capabilities sent to a non-GPU application"));
@@ -1279,6 +1347,7 @@ impl Runtime {
         Ok(())
     }
 
+    /// Validate and queue a host GPU event; reject a full queue or non-GPU profile.
     pub fn send_gpu_event(&mut self, bytes: Vec<u8>) -> Result<()> {
         if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU event sent to a non-GPU application"));
@@ -1291,31 +1360,38 @@ impl Runtime {
         Ok(())
     }
 
+    /// Remove the oldest pending GPU batch for host execution.
     pub fn take_gpu_batch(&mut self) -> Option<GpuBatch> {
         self.state.gpu_batches.pop_front()
     }
 
+    /// Remove the oldest pending guest TrUAPI request.
     pub fn take_truapi_request(&mut self) -> Option<Vec<u8>> {
         self.state.take_truapi_request()
     }
 
+    /// Queue a bounded nonempty TrUAPI response, rejecting queue overflow.
     pub fn send_truapi_response(&mut self, bytes: Vec<u8>) -> Result<()> {
         self.state.queue_truapi_response(bytes)
     }
 
+    /// Advance the browser clock in monotonic milliseconds; earlier times are ignored.
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
         self.state.clock.set_time_ms(time_ms);
     }
 
+    /// Take the newest framebuffer, clearing the pending presentation.
     pub fn take_frame(&mut self) -> Option<Frame> {
         self.state.frame.take()
     }
 
+    /// Take the pending validated Tri2D frame.
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         self.state.tri2d.take()
     }
 
+    /// Take the newest accessibility snapshot.
     pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
         self.state.ui_semantics.take()
     }
@@ -1325,16 +1401,19 @@ impl Runtime {
         self.state.ui_output.take()
     }
 
+    /// Remove the oldest queued audio chunk.
     pub fn take_audio(&mut self) -> Option<AudioChunk> {
         let chunk = self.state.audio.pop_front()?;
         self.state.audio_samples -= chunk.samples.len();
         Some(chunk)
     }
 
+    /// Remove the oldest queued guest log message.
     pub fn take_log(&mut self) -> Option<String> {
         self.state.logs.pop_front()
     }
 
+    /// Take the latest guest save payload, clearing the pending save.
     pub fn take_save(&mut self) -> Option<Vec<u8>> {
         self.state.save.take()
     }

@@ -79,6 +79,7 @@ await mkdir(dist, { recursive: true });
 const translated = await readFile(resolve(source, "pvm-wasm-translated.js"));
 const runtimeCore = await readFile(resolve(source, "pvm-runtime-core.js"));
 const workerEntry = await readFile(resolve(source, "pvm-wasm-worker-entry.js"));
+const fileInputRouter = resolve(source, "file-input-router.js");
 await copyFile(wasm, resolve(dist, "pvm-browser-runtime.wasm"));
 await copyFile(
   resolve(source, "pvm-gpu-worker.js"),
@@ -96,6 +97,7 @@ await copyFile(
   resolve(source, "pvm-wasm-worker-entry.js"),
   resolve(dist, "pvm-wasm-worker-entry.js"),
 );
+await copyFile(fileInputRouter, resolve(dist, "file-input-router.js"));
 await writeFile(
   resolve(dist, "pvm-worker.js"),
   Buffer.concat([
@@ -114,6 +116,7 @@ const files = [
   "pvm-wasm-translated.js",
   "pvm-runtime-core.js",
   "pvm-wasm-worker-entry.js",
+  "file-input-router.js",
 ];
 const sums = [];
 for (const file of files) {

@@ -19,6 +19,7 @@
     "./worker-entry": "./dist/pvm-wasm-worker-entry.js",
     "./translator": "./dist/pvm-wasm-translated.js",
     "./runtime-core": "./dist/pvm-runtime-core.js",
+    "./file-input-router": "./dist/file-input-router.js",
     "./gpu-worker": "./dist/pvm-gpu-worker.js",
     "./checksums": "./dist/SHA256SUMS"
   },

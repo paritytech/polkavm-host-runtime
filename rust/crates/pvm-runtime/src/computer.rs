@@ -555,23 +555,37 @@ fn validate_computer_path(path: &str) -> Option<&str> {
 /// A spawn/wait/pipe operation awaiting supervisor resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildProcessRequest {
+    /// Starts a registered package without transferring terminal ownership.
     Spawn {
+        /// Host-authorized package name.
         package: String,
+        /// Arguments supplied after the child's package-name argument.
         arguments: Vec<String>,
     },
+    /// Polls an owned background process for its exit status.
     Wait {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
     },
+    /// Reads bytes produced by an owned background process.
     PipeRead {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
+        /// Guest memory address receiving the bytes.
         destination: u32,
+        /// Maximum number of bytes to copy.
         capacity: usize,
     },
+    /// Queues input bytes for an owned background process.
     PipeWrite {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
+        /// Bytes to queue, subject to available input capacity.
         bytes: Vec<u8>,
     },
+    /// Closes the input stream of an owned background process.
     PipeClose {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
     },
 }
@@ -938,29 +952,27 @@ impl ComputerSupervisor {
     /// Exit status reported for a child that faulted (trap, gas, segfault).
     const FAULTED_CHILD_STATUS: i32 = 139;
 
-    /// Maximum contained child faults per `run()` before erroring out.
-    const MAX_FAULT_POPS_PER_RUN: usize = 32;
+    /// Maximum guest resumptions shared by foreground and background work.
+    const MAX_INTERRUPTS_PER_RUN: usize = 8_192;
 
     /// Runs the foreground process until the system yields or the root exits.
     ///
     /// A fault in a child process (trap, out of gas) fails only that child:
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
+    ///
+    /// Each call permits at most 8,192 guest resumptions, including work
+    /// performed for pipe and wait requests. Exhausting this budget yields
+    /// control to the Host; the next call continues without replaying requests.
     pub fn run(&mut self) -> Result<ComputerStatus> {
-        // Bound the fault-containment path so a root that spawns
-        // immediately-faulting children in a loop cannot keep run() from
-        // returning control to the Host.
-        let mut fault_pops = 0usize;
-        loop {
+        let mut interrupts_remaining = Self::MAX_INTERRUPTS_PER_RUN;
+        while interrupts_remaining > 0 {
+            interrupts_remaining -= 1;
             let status = match self.foreground().run() {
                 Ok(status) => status,
                 Err(error) => {
                     if self.stack.len() == 1 {
                         return Err(error);
-                    }
-                    fault_pops += 1;
-                    if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
-                        return Err(error.context("children faulted repeatedly"));
                     }
                     self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
                     continue;
@@ -984,7 +996,7 @@ impl ComputerSupervisor {
                     let Some(request) = request else {
                         bail!("child-request status without a pending request");
                     };
-                    self.handle_child_request(request)?;
+                    self.handle_child_request(request, &mut interrupts_remaining)?;
                 }
                 ComputerStatus::Exited(code) => {
                     // The exited root stays resident so terminal accessors
@@ -999,6 +1011,7 @@ impl ComputerSupervisor {
                 }
             }
         }
+        Ok(ComputerStatus::Yielded)
     }
 
     /// Discards the foreground child: forwards its remaining terminal
@@ -1069,7 +1082,11 @@ impl ComputerSupervisor {
     }
 
     /// Executes one spawn/wait/pipe request and resolves it into the caller.
-    fn handle_child_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+    fn handle_child_request(
+        &mut self,
+        request: ChildProcessRequest,
+        interrupts_remaining: &mut usize,
+    ) -> Result<()> {
         match request {
             ChildProcessRequest::Spawn { package, arguments } => {
                 if self.background.len() >= MAX_BACKGROUND_PROCESSES {
@@ -1086,7 +1103,7 @@ impl ComputerSupervisor {
                     self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
                     return Ok(());
                 };
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 match self.background[index].exit {
                     Some(status) => {
                         self.reap_background(index)?;
@@ -1110,7 +1127,7 @@ impl ComputerSupervisor {
                 if written > 0 {
                     child.runtime.send_terminal_input(&bytes[..written])?;
                 }
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 self.foreground().resolve_spawn(written as i32);
             }
             ChildProcessRequest::PipeRead {
@@ -1123,7 +1140,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 if self.background[index].output.is_empty() {
-                    self.drive_background(index)?;
+                    self.drive_background(index, interrupts_remaining)?;
                 }
                 let child = &mut self.background[index];
                 if !child.output.is_empty() {
@@ -1142,7 +1159,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 self.background[index].runtime.close_terminal_input();
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 self.foreground().resolve_spawn(0);
             }
         }
@@ -1162,16 +1179,17 @@ impl ComputerSupervisor {
     ///
     /// Cooperative scheduling: background children only execute while the
     /// foreground process is suspended inside a pipe or wait hostcall.
-    fn drive_background(&mut self, index: usize) -> Result<()> {
+    fn drive_background(&mut self, index: usize, interrupts_remaining: &mut usize) -> Result<()> {
         const MAX_DRIVE_STEPS: usize = 1_024;
         for _ in 0..MAX_DRIVE_STEPS {
             let child = &mut self.background[index];
-            if child.exit.is_some() {
+            if child.exit.is_some() || *interrupts_remaining == 0 {
                 return Ok(());
             }
             // A faulted piped child fails alone; the parent observes the
             // fault status through wait. Its final output and file writes
             // are still collected below.
+            *interrupts_remaining -= 1;
             let outcome = child.runtime.run().ok();
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());

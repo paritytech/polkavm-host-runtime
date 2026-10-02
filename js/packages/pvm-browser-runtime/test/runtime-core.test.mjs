@@ -261,7 +261,7 @@ test("compiler startup keeps the newest GPU capabilities", async () => {
   }
 });
 
-test("native-Wasm and translated backends round-trip opaque TrUAPI frames", async () => {
+test("byte and Module startup round-trip TrUAPI frames on both backends", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
   );
@@ -278,13 +278,19 @@ test("native-Wasm and translated backends round-trip opaque TrUAPI frames", asyn
     "truapi-conformance-response-v1",
   );
   const successBytes = new TextEncoder().encode("truapi-roundtrip-ok");
+  const runtimeInputs = [bytesBuffer(runtime), await WebAssembly.compile(runtime)];
 
-  for (const forceInterpreter of [false, true]) {
+  for (const { runtimeInput, forceInterpreter } of runtimeInputs.flatMap(
+    (runtimeInput) => [false, true].map((forceInterpreter) => ({
+      runtimeInput,
+      forceInterpreter,
+    })),
+  )) {
     const { messages, receiver } = endpoint();
     receiver.onmessage({
       data: {
         type: "start",
-        runtime: bytesBuffer(runtime),
+        runtime: runtimeInput,
         program: bytesBuffer(program),
         assets: [],
         graphicsProfile: "framebuffer",
@@ -636,4 +642,59 @@ test("browser runtime can select the interpreter without attempting translation"
 
   receiver.onmessage({ data: { type: "stop" } });
   await waitForMessage(messages, "terminated");
+});
+
+test("stop remains terminal while runtime instantiation or guest compilation is pending", { timeout: 20_000 }, async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/pvm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/pvm-runtime/tests/fixtures/framebuffer-test.polkavm",
+    ),
+  );
+  for (const method of ["instantiate", "compile"]) {
+    for (const reject of [false, true]) {
+      const original = WebAssembly[method];
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      WebAssembly[method] = async (...args) => {
+        const result = await original(...args);
+        entered.resolve();
+        await resume.promise;
+        if (reject) throw new Error("startup failed after cancellation");
+        return result;
+      };
+      const { messages, receiver } = endpoint();
+      try {
+        receiver.onmessage({
+          data: {
+            type: "start",
+            runtime: bytesBuffer(runtime),
+            program: bytesBuffer(program),
+            assets: [],
+            graphicsProfile: "framebuffer",
+            audioEnabled: false,
+            cacheKey: `cancel-${method}-${reject}`,
+          },
+        });
+        await entered.promise;
+        receiver.onmessage({ data: { type: "stop" } });
+        const terminalMessages = messages.slice();
+        assert.equal(messages.at(-1).type, "terminated");
+        resume.resolve();
+        await settle();
+        assert.equal(receiver.onmessage, null);
+        assert.deepEqual(messages, terminalMessages);
+        assert.equal(messages.filter((message) => message.type === "terminated").length, 1);
+        assert.equal(messages.some((message) => message.type === "ready"), false);
+      } finally {
+        resume.resolve();
+        await settle();
+        receiver.onmessage?.({ data: { type: "stop" } });
+        WebAssembly[method] = original;
+      }
+    }
+  }
 });

@@ -2,6 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Browser-only wasm ABI. Status operations return zero on success and one on
+//! failure; the error accessors expose the last diagnostic as UTF-8 bytes.
+//!
+//! Output pointers are read-only offsets into this module's linear memory, valid
+//! until the corresponding output is replaced, cleared, or reset. Staging is the
+//! only writable region exposed to the caller and must be filled before consuming
+//! it. JavaScript must refresh memory views after calls that can grow memory.
+//!
+//! SAFETY: the `pvm_browser_*` export names are unique within this wasm module.
+//! Individual export allowances below permit their required unmangled symbols;
+//! the rest of the module remains subject to the workspace unsafe-code policy.
+
 use crate::{
     ApplicationRuntime, AudioChunk, Frame, GpuBatch, InputEvent, InputEventType,
     PresentationProfile, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES,
@@ -103,16 +115,22 @@ fn status(operation: impl FnOnce(&mut BrowserHost) -> Result<()>) -> u32 {
     })
 }
 
+/// Return the browser ABI version.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_abi_version() -> u32 {
     1
 }
 
+/// Drop the runtime and all buffers, invalidating every previously returned pointer.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_reset() {
     HOST.with(|host| *host.borrow_mut() = BrowserHost::new());
 }
 
+/// Allocate a bounded writable staging region; return its offset, or zero on error.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_staging_reserve(length: u32) -> u32 {
     HOST.with(|host| {
@@ -129,6 +147,8 @@ pub extern "C" fn pvm_browser_staging_reserve(length: u32) -> u32 {
     })
 }
 
+/// Translate the staged PolkaVM program, returning a status code.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_translate_staged() -> u32 {
     status(|host| {
@@ -137,11 +157,15 @@ pub extern "C" fn pvm_browser_translate_staged() -> u32 {
     })
 }
 
+/// Return the translated module's read-only memory offset.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_translation_pointer() -> u32 {
     HOST.with(|host| host.borrow().translation.as_ptr() as usize as u32)
 }
 
+/// Return the translated module length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_translation_length() -> u32 {
     HOST.with(|host| host.borrow().translation.len() as u32)
@@ -183,11 +207,15 @@ fn launch_begin(max_gas_per_update: u32, audio_enabled: u32, presentation: u32) 
     })
 }
 
+/// Consume the staged program and begin a framebuffer launch; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_launch_begin(max_gas_per_update: u32, audio_enabled: u32) -> u32 {
     launch_begin(max_gas_per_update, audio_enabled, 0)
 }
 
+/// Begin launch with profile 0=framebuffer, 1=Tri2D, 2=raster GPU, or 3=full GPU.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_launch_begin_v2(
     max_gas_per_update: u32,
@@ -197,6 +225,8 @@ pub extern "C" fn pvm_browser_launch_begin_v2(
     launch_begin(max_gas_per_update, audio_enabled, presentation)
 }
 
+/// Consume staged UTF-8 path bytes followed by asset bytes; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_launch_add_asset(path_length: u32) -> u32 {
     status(|host| {
@@ -236,6 +266,8 @@ pub extern "C" fn pvm_browser_launch_add_asset(path_length: u32) -> u32 {
     })
 }
 
+/// Finish asset collection and instantiate the guest; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_launch_start() -> u32 {
     status(|host| {
@@ -257,6 +289,8 @@ pub extern "C" fn pvm_browser_launch_start() -> u32 {
     })
 }
 
+/// Return one if the running guest imports motion input, otherwise zero.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_uses_motion() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -265,6 +299,8 @@ pub extern "C" fn pvm_browser_uses_motion() -> u32 {
     })
 }
 
+/// Set motion state (0=unavailable, 1=available, 2=denied); return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 {
     status(|host| {
@@ -275,6 +311,8 @@ pub extern "C" fn pvm_browser_set_motion_availability(availability: u32) -> u32 
     })
 }
 
+/// Consume one staged motion sample; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_motion_sample() -> u32 {
     status(|host| {
@@ -283,6 +321,8 @@ pub extern "C" fn pvm_browser_send_motion_sample() -> u32 {
     })
 }
 
+/// Consume staged GPU capabilities; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_set_gpu_capabilities() -> u32 {
     status(|host| {
@@ -291,6 +331,8 @@ pub extern "C" fn pvm_browser_set_gpu_capabilities() -> u32 {
     })
 }
 
+/// Consume one staged host GPU event; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_gpu_event() -> u32 {
     status(|host| {
@@ -299,6 +341,8 @@ pub extern "C" fn pvm_browser_send_gpu_event() -> u32 {
     })
 }
 
+/// Consume one staged TrUAPI response frame; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_truapi_response() -> u32 {
     status(|host| {
@@ -307,11 +351,15 @@ pub extern "C" fn pvm_browser_send_truapi_response() -> u32 {
     })
 }
 
+/// Initialize the running guest; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_init() -> u32 {
     status(|host| host.running()?.init())
 }
 
+/// Advance monotonic time in milliseconds and execute one update; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_update(time_ms: f64) -> u32 {
     status(|host| {
@@ -324,6 +372,8 @@ pub extern "C" fn pvm_browser_update(time_ms: f64) -> u32 {
     })
 }
 
+/// Queue a fixed event after range validation; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: u32) -> u32 {
     status(|host| {
@@ -350,6 +400,8 @@ pub extern "C" fn pvm_browser_send_input(event_type: u32, code: u32, x: u32, y: 
     })
 }
 
+/// Consume one staged eight-byte extended input record; return status.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_send_input_record() -> u32 {
     status(|host| {
@@ -361,6 +413,8 @@ pub extern "C" fn pvm_browser_send_input_record() -> u32 {
     })
 }
 
+/// Replace the exposed framebuffer with the newest pending one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_frame() -> u32 {
     HOST.with(|host| {
@@ -373,16 +427,22 @@ pub extern "C" fn pvm_browser_take_frame() -> u32 {
     })
 }
 
+/// Return exposed framebuffer width in pixels, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_frame_width() -> u32 {
     HOST.with(|host| host.borrow().frame.as_ref().map_or(0, |frame| frame.width))
 }
 
+/// Return exposed framebuffer height in pixels, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_frame_height() -> u32 {
     HOST.with(|host| host.borrow().frame.as_ref().map_or(0, |frame| frame.height))
 }
 
+/// Return the exposed packed framebuffer's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_frame_pointer() -> u32 {
     HOST.with(|host| {
@@ -393,6 +453,8 @@ pub extern "C" fn pvm_browser_frame_pointer() -> u32 {
     })
 }
 
+/// Return exposed framebuffer length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_frame_length() -> u32 {
     HOST.with(|host| {
@@ -403,6 +465,8 @@ pub extern "C" fn pvm_browser_frame_length() -> u32 {
     })
 }
 
+/// Replace the exposed Tri2D frame with the pending one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_tri2d() -> u32 {
     HOST.with(|host| {
@@ -415,6 +479,8 @@ pub extern "C" fn pvm_browser_take_tri2d() -> u32 {
     })
 }
 
+/// Return the exposed Tri2D stream's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_tri2d_pointer() -> u32 {
     HOST.with(|host| {
@@ -425,6 +491,8 @@ pub extern "C" fn pvm_browser_tri2d_pointer() -> u32 {
     })
 }
 
+/// Return the exposed Tri2D stream length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_tri2d_length() -> u32 {
     HOST.with(|host| {
@@ -435,6 +503,8 @@ pub extern "C" fn pvm_browser_tri2d_length() -> u32 {
     })
 }
 
+/// Replace the exposed accessibility snapshot with the latest one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_ui_semantics() -> u32 {
     HOST.with(|host| {
@@ -447,6 +517,8 @@ pub extern "C" fn pvm_browser_take_ui_semantics() -> u32 {
     })
 }
 
+/// Return the semantic JSON's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_ui_semantics_pointer() -> u32 {
     HOST.with(|host| {
@@ -457,6 +529,8 @@ pub extern "C" fn pvm_browser_ui_semantics_pointer() -> u32 {
     })
 }
 
+/// Return semantic JSON length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_ui_semantics_length() -> u32 {
     HOST.with(|host| {
@@ -467,6 +541,8 @@ pub extern "C" fn pvm_browser_ui_semantics_length() -> u32 {
     })
 }
 
+/// Replace the exposed UI output with the latest snapshot; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_ui_output() -> u32 {
     HOST.with(|host| {
@@ -479,6 +555,8 @@ pub extern "C" fn pvm_browser_take_ui_output() -> u32 {
     })
 }
 
+/// Return the UI output stream's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_ui_output_pointer() -> u32 {
     HOST.with(|host| {
@@ -489,6 +567,8 @@ pub extern "C" fn pvm_browser_ui_output_pointer() -> u32 {
     })
 }
 
+/// Return the exposed UI output length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_ui_output_length() -> u32 {
     HOST.with(|host| {
@@ -499,6 +579,8 @@ pub extern "C" fn pvm_browser_ui_output_length() -> u32 {
     })
 }
 
+/// Expose the oldest pending GPU batch, replacing the prior one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_gpu_batch() -> u32 {
     HOST.with(|host| {
@@ -511,6 +593,8 @@ pub extern "C" fn pvm_browser_take_gpu_batch() -> u32 {
     })
 }
 
+/// Return the exposed GPU batch's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_gpu_batch_pointer() -> u32 {
     HOST.with(|host| {
@@ -521,6 +605,8 @@ pub extern "C" fn pvm_browser_gpu_batch_pointer() -> u32 {
     })
 }
 
+/// Return the exposed GPU batch length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_gpu_batch_length() -> u32 {
     HOST.with(|host| {
@@ -531,6 +617,8 @@ pub extern "C" fn pvm_browser_gpu_batch_length() -> u32 {
     })
 }
 
+/// Expose the oldest TrUAPI request, replacing the prior one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_truapi_request() -> u32 {
     HOST.with(|host| {
@@ -543,6 +631,8 @@ pub extern "C" fn pvm_browser_take_truapi_request() -> u32 {
     })
 }
 
+/// Return the exposed TrUAPI request's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_truapi_request_pointer() -> u32 {
     HOST.with(|host| {
@@ -553,10 +643,14 @@ pub extern "C" fn pvm_browser_truapi_request_pointer() -> u32 {
     })
 }
 
+/// Return the exposed TrUAPI request length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_truapi_request_length() -> u32 {
     HOST.with(|host| host.borrow().truapi_request.as_ref().map_or(0, Vec::len) as u32)
 }
+/// Expose the oldest audio chunk, replacing the prior one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_audio() -> u32 {
     HOST.with(|host| {
@@ -569,6 +663,8 @@ pub extern "C" fn pvm_browser_take_audio() -> u32 {
     })
 }
 
+/// Return the PCM sample buffer's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_audio_pointer() -> u32 {
     HOST.with(|host| {
@@ -579,6 +675,8 @@ pub extern "C" fn pvm_browser_audio_pointer() -> u32 {
     })
 }
 
+/// Return interleaved i16 sample count, not byte length.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_audio_length() -> u32 {
     HOST.with(|host| {
@@ -589,6 +687,8 @@ pub extern "C" fn pvm_browser_audio_length() -> u32 {
     })
 }
 
+/// Return PCM samples per second per channel, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_audio_sample_rate() -> u32 {
     HOST.with(|host| {
@@ -599,6 +699,8 @@ pub extern "C" fn pvm_browser_audio_sample_rate() -> u32 {
     })
 }
 
+/// Return interleaved PCM channel count, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_audio_channels() -> u32 {
     HOST.with(|host| {
@@ -609,6 +711,8 @@ pub extern "C" fn pvm_browser_audio_channels() -> u32 {
     })
 }
 
+/// Expose the oldest guest log, replacing the prior one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_log() -> u32 {
     HOST.with(|host| {
@@ -621,6 +725,8 @@ pub extern "C" fn pvm_browser_take_log() -> u32 {
     })
 }
 
+/// Return the UTF-8 log's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_log_pointer() -> u32 {
     HOST.with(|host| {
@@ -631,11 +737,15 @@ pub extern "C" fn pvm_browser_log_pointer() -> u32 {
     })
 }
 
+/// Return the exposed log length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_log_length() -> u32 {
     HOST.with(|host| host.borrow().log.as_ref().map_or(0, |log| log.len() as u32))
 }
 
+/// Expose the newest save payload, replacing the prior one; return presence.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_take_save() -> u32 {
     HOST.with(|host| {
@@ -648,6 +758,8 @@ pub extern "C" fn pvm_browser_take_save() -> u32 {
     })
 }
 
+/// Return the exposed save payload's read-only offset, or zero if absent.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_save_pointer() -> u32 {
     HOST.with(|host| {
@@ -658,6 +770,8 @@ pub extern "C" fn pvm_browser_save_pointer() -> u32 {
     })
 }
 
+/// Return the exposed save length in bytes.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_save_length() -> u32 {
     HOST.with(|host| {
@@ -668,16 +782,22 @@ pub extern "C" fn pvm_browser_save_length() -> u32 {
     })
 }
 
+/// Return the last diagnostic's UTF-8 read-only offset; read only its reported length.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_error_pointer() -> u32 {
     HOST.with(|host| host.borrow().error.as_ptr() as usize as u32)
 }
 
+/// Return last diagnostic length in bytes; zero means no diagnostic.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_error_length() -> u32 {
     HOST.with(|host| host.borrow().error.len() as u32)
 }
 
+/// Release all exposed output buffers, invalidating their pointers.
+#[allow(unsafe_code)] // Unique wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn pvm_browser_clear_outputs() {
     HOST.with(|host| host.borrow_mut().clear_outputs());

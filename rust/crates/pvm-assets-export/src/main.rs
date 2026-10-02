@@ -1,3 +1,5 @@
+//! Export the embedded browser runtime asset set to a host-selected directory.
+
 use std::path::PathBuf;
 
 use pvm_runtime_assets::browser_assets;

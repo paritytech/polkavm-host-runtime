@@ -416,7 +416,10 @@ globalThis.createPvmRuntime = (endpoint) => {
     let cacheHit = false;
     postMessage({ type: "startup", stage: "runtime-instantiating" });
     const instantiated = await WebAssembly.instantiate(message.runtime, {});
-    pvm = instantiated.instance.exports;
+    if (disposed) return;
+    pvm = (instantiated instanceof WebAssembly.Instance
+      ? instantiated
+      : instantiated.instance).exports;
     if (pvm.pvm_browser_abi_version() !== 1) {
       throw new Error("PolkaVM browser runtime has an incompatible ABI");
     }
@@ -457,6 +460,7 @@ globalThis.createPvmRuntime = (endpoint) => {
         translatedWasmBytes = bytes.byteLength;
         const compilationStarted = performance.now();
         module = await WebAssembly.compile(bytes);
+        if (disposed) return;
         compilationMs = performance.now() - compilationStarted;
         try {
           postMessage({ type: "compiled", cacheKey: message.cacheKey, module });
@@ -486,6 +490,7 @@ globalThis.createPvmRuntime = (endpoint) => {
       pendingMotionSample = null;
       backend = "compiler";
     } catch (error) {
+      if (disposed) return;
       translated = null;
       pendingOutputs.length = 0;
       if (error !== FORCE_INTERPRETER) {
@@ -705,6 +710,7 @@ globalThis.createPvmRuntime = (endpoint) => {
     const message = event.data;
     if (message?.type === "start") {
       void start(message).catch((error) => {
+        if (disposed) return;
         stopRuntime();
         postMessage({ type: "error", message: error.message });
         postMessage({ type: "terminated" });

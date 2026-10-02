@@ -1,66 +1,134 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
-const outputIndex = process.argv.indexOf("--output");
-if (outputIndex === -1 || !process.argv[outputIndex + 1]) {
+if (process.argv.length !== 4 || process.argv[2] !== "--output") {
   throw new Error("usage: create-release-manifest.mjs --output <path>");
+}
+
+const git = (...args) =>
+  execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+if (git("status", "--porcelain=v1", "--untracked-files=all")) {
+  throw new Error("release artifacts require a clean source checkout");
+}
+const sourceRevision = git("rev-parse", "HEAD");
+if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
+  throw new Error("git did not return an immutable source revision");
 }
 
 const packageJson = JSON.parse(
   await readFile(resolve(root, "package.json"), "utf8"),
 );
-const source = await readFile(
-  resolve(root, "js/packages/pvm-browser-runtime/SOURCE"),
-  "utf8",
+const browserRoot = resolve(root, "js/packages/pvm-browser-runtime");
+const browserPackage = JSON.parse(
+  await readFile(resolve(browserRoot, "package.json"), "utf8"),
 );
-const sums = await readFile(
-  resolve(root, "js/packages/pvm-browser-runtime/dist/SHA256SUMS"),
-  "utf8",
+const lock = JSON.parse(await readFile(resolve(root, "package-lock.json"), "utf8"));
+const version = packageJson.version;
+const versions = [
+  browserPackage.version,
+  lock.version,
+  lock.packages?.[""]?.version,
+  lock.packages?.["js/packages/pvm-browser-runtime"]?.version,
+];
+const workspaceToml = await readFile(resolve(root, "Cargo.toml"), "utf8");
+const workspacePackage = workspaceToml.match(
+  /^\[workspace\.package\][ \t]*\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m,
 );
-const artifacts = {};
-for (const line of sums.trim().split("\n")) {
-  const [sha256, file] = line.split(/\s+/, 2);
-  artifacts[file] = {
-    sha256,
-    size: (await stat(resolve(root, "js/packages/pvm-browser-runtime/dist", file)))
-      .size,
-  };
+const workspaceVersion = workspacePackage?.[1].match(
+  /^version\s*=\s*"([^"]+)"\s*$/m,
+)?.[1];
+versions.push(workspaceVersion);
+const metadata = JSON.parse(
+  execFileSync("cargo", ["metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"], {
+    cwd: root,
+    encoding: "utf8",
+  }),
+);
+const members = metadata.packages.filter((pkg) =>
+  metadata.workspace_members.includes(pkg.id),
+);
+versions.push(...members.map((pkg) => pkg.version));
+if (typeof version !== "string" || versions.some((value) => value !== version)) {
+  throw new Error("workspace, crate, browser package, and npm lockfile versions must match");
+}
+const tag = `v${version}`;
+if (git("rev-parse", "--verify", `refs/tags/${tag}^{commit}`) !== sourceRevision) {
+  throw new Error(`release source must be the commit tagged ${tag}`);
 }
 
-const revision = label => {
-  const match = source.match(new RegExp(`${label}: ([0-9a-f]{40})`));
-  if (!match) throw new Error(`SOURCE is missing ${label}`);
-  return match[1];
+const source = await readFile(resolve(browserRoot, "SOURCE"), "utf8");
+if (!source.split(/\r?\n/).includes(`Release tag: ${tag}`)) {
+  throw new Error("SOURCE release tag does not match the package version");
+}
+const runtime = members.find((pkg) => pkg.name === "pvm-runtime");
+if (!runtime) throw new Error("workspace is missing pvm-runtime");
+const revision = (label, rename) => {
+  const match = source.match(new RegExp(`^${label}: ([0-9a-f]{40})$`, "m"));
+  const dependency = runtime.dependencies.find(
+    (dep) => dep.name === "polkavm" && dep.rename === rename,
+  );
+  const pinned = dependency?.source?.startsWith("git+")
+    ? new URL(dependency.source.slice(4)).searchParams.get("rev")
+    : null;
+  if (!match || match[1] !== pinned) {
+    throw new Error(`SOURCE ${label} does not match the pinned Cargo dependency`);
+  }
+  return pinned;
 };
-const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], {
-  cwd: root,
-  encoding: "utf8",
-}).trim();
-if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
-  throw new Error("git did not return an immutable source revision");
+const nativeRevision = revision("PolkaVM native revision", null);
+const wasmRevision = revision("PolkaVM wasm revision", "polkavm-wasm");
+
+const dist = resolve(browserRoot, "dist");
+const embedded = resolve(root, "rust/crates/pvm-runtime-assets/assets");
+const sums = await readFile(resolve(dist, "SHA256SUMS"), "utf8");
+const artifacts = {};
+for (const line of sums.trimEnd().split("\n")) {
+  const match = /^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(line);
+  if (!match) throw new Error("invalid browser checksum record");
+  const [, sha256, file] = match;
+  if (file === "SHA256SUMS" || Object.hasOwn(artifacts, file)) {
+    throw new Error(`duplicate or reserved checksum path: ${file}`);
+  }
+  const path = resolve(dist, file);
+  if (!(await lstat(path)).isFile()) {
+    throw new Error(`browser artifact is not a regular file: ${file}`);
+  }
+  const bytes = await readFile(path);
+  if (createHash("sha256").update(bytes).digest("hex") !== sha256) {
+    throw new Error(`browser artifact checksum mismatch: ${file}`);
+  }
+  artifacts[file] = { sha256, size: bytes.length };
+}
+const files = [...Object.keys(artifacts), "SHA256SUMS"].sort();
+for (const directory of [dist, embedded]) {
+  if (JSON.stringify((await readdir(directory)).sort()) !== JSON.stringify(files)) {
+    throw new Error(`browser artifact inventory differs from checksums: ${directory}`);
+  }
+}
+for (const file of files) {
+  if (!(await lstat(resolve(embedded, file))).isFile()) {
+    throw new Error(`embedded artifact is not a regular file: ${file}`);
+  }
+  if (!(await readFile(resolve(dist, file))).equals(await readFile(resolve(embedded, file)))) {
+    throw new Error(`browser artifact differs from embedded release bytes: ${file}`);
+  }
 }
 
 const manifest = {
   schemaVersion: 1,
-  version: packageJson.version,
-  sourceRepository: "https://github.com/paritytech/pvm-host-runtime",
+  version,
+  sourceRepository: "https://github.com/paritytech/polkavm-host-runtime",
   sourceRevision,
-  rustCrates: {
-    "pvm-runtime": packageJson.version,
-    "pvm-gpu-wire": packageJson.version,
-    "pvm-runtime-assets": packageJson.version,
-  },
+  rustCrates: Object.fromEntries(members.map((pkg) => [pkg.name, pkg.version])),
   npmPackages: {
-    "@parity/pvm-browser-runtime": packageJson.version,
+    [browserPackage.name]: browserPackage.version,
   },
-  polkavm: {
-    nativeRevision: revision("PolkaVM native revision"),
-    wasmRevision: revision("PolkaVM wasm revision"),
-  },
+  polkavm: { nativeRevision, wasmRevision },
   artifacts,
 };
-const outputPath = resolve(root, process.argv[outputIndex + 1]);
+const outputPath = resolve(root, process.argv[3]);
 await mkdir(dirname(outputPath), { recursive: true });
 await writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);

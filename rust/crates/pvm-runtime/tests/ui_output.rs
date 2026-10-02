@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! UI output transport and guest-to-host command decoding conformance.
+
 use polkavm::ProgramBlob;
 use pvm_runtime::ui_wire::{
     decode_ui_output, UiCursorIcon, UiOutputCommand, UI_OUTPUT_SUBMIT_IMPORT,
