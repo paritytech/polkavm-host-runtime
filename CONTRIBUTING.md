@@ -61,6 +61,11 @@ The Linux runner enables userfaultfd and unprivileged namespaces only inside
 its ephemeral VM; do not weaken a developer workstation's kernel policy merely
 to obtain a green result.
 
+Engine regression fixtures must use the existing `test_module_config()` helper
+when they require native execution: the default 4 KiB module page size is
+incompatible with Apple Silicon's 16 KiB host pages. Preserve the semantic
+assertions rather than skipping those backends.
+
 Keep guest bytecode encoding compatible during engine refreshes. Upstream
 `e68f2a60f4e6cbc9ea7b10e5cccbafc531c2f8f0` removed the non-legacy code-length
 field without changing the ISA version: existing `Latest64` blobs can parse

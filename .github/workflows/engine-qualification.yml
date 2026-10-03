@@ -3,6 +3,8 @@ name: Engine candidate qualification
 on:
   push:
     branches: [fix/runtime-readiness-main]
+    paths:
+      - .github/workflows/engine-qualification.yml
   pull_request:
     paths:
       - .github/workflows/engine-qualification.yml
@@ -17,7 +19,7 @@ concurrency:
 
 # This is a qualification candidate, not the runtime's production dependency pin.
 env:
-  ENGINE_REVISION: 95886b5c651e1392f6db06674d95d29b7e128ff6
+  ENGINE_REVISION: 65bec622fbb6a081eac1a2cb2f050f60fef35890
   RUSTC_WRAPPER: ""
   CARGO_TERM_COLOR: always
 
