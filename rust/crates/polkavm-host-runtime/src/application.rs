@@ -4,9 +4,11 @@
 
 use crate::corevm::{Interruption, Vm};
 use crate::{
-    AudioChunk, ComputerContext, Frame, GpuBatch, HostFrameResponseError, InputEvent,
-    InputEventType, MediatedInputCommand, MediatedInputStatus, PresentationProfile, Runtime,
-    TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame, INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
+    AudioChunk, ComputerContext, FileCache, FileInputDelivery, FileInputSupport, FileReadSource,
+    FileRegistration, FileRelaunch, FileSelection, FileStreamSelection, Frame, GpuBatch,
+    HostFrameResponseError, InputEvent, InputEventType, MediatedInputCommand, MediatedInputStatus,
+    PresentationProfile, Runtime, TextInputKind, Tri2dFrame, UiOutputFrame, UiSemanticsFrame,
+    INPUT_EVENT_BYTES, MAX_FRAME_BYTES,
 };
 use anyhow::{anyhow, Context, Result};
 use polkavm::ProgramBlob;
@@ -388,6 +390,60 @@ impl ApplicationRuntime {
         match self {
             Self::Cooperative(runtime) => runtime.send_mediated_input_result(handle, status, bytes),
             Self::CoreVm(_) => Err(anyhow!("CoreVM does not support mediated input")),
+        }
+    }
+
+    pub fn set_file_input_support(&mut self, support: FileInputSupport) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_file_input_support(support),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
+        }
+    }
+
+    pub fn file_registrations(&self) -> Vec<FileRegistration> {
+        match self {
+            Self::Cooperative(runtime) => runtime.file_registrations(),
+            Self::CoreVm(_) => Vec::new(),
+        }
+    }
+
+    pub fn take_file_registrations(&mut self) -> Option<Vec<FileRegistration>> {
+        match self {
+            Self::Cooperative(runtime) => runtime.take_file_registrations(),
+            Self::CoreVm(_) => None,
+        }
+    }
+
+    pub fn send_file_input(
+        &mut self,
+        handle: u32,
+        selection: FileSelection,
+    ) -> Result<FileInputDelivery> {
+        match self {
+            Self::Cooperative(runtime) => runtime.send_file_input(handle, selection),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
+        }
+    }
+
+    pub fn send_file_stream(
+        &mut self,
+        handle: u32,
+        selection: FileStreamSelection,
+        source: Box<dyn FileReadSource>,
+        cache: Option<Box<dyn FileCache>>,
+    ) -> Result<FileInputDelivery> {
+        match self {
+            Self::Cooperative(runtime) => {
+                runtime.send_file_stream(handle, selection, source, cache)
+            }
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
+        }
+    }
+
+    pub fn set_file_relaunch(&mut self, relaunch: FileRelaunch) -> Result<()> {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_file_relaunch(relaunch),
+            Self::CoreVm(_) => Err(anyhow!("CoreVM does not support file input")),
         }
     }
 

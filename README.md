@@ -16,6 +16,17 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 - `docs/runtime/polkavm-app-abi-v1.md`: application ABI contract.
 - `docs/runtime/tri2d-v1.md`: Tri2D frame, command, retained-resource, and limit contract.
 
+The engine crate in `rust/vendor/polkavm` derives from immutable upstream
+revision `c160c13c3c29bf3219ce1404ec95976000235a94` (0.37.0).
+Its local interpreter patch bounds resident stack length by the declared stack
+size, independently of allocation capacity. Without this bound, growth of a
+non-power-of-two stack could corrupt Host reads and expose the lower stack
+guard. Native and browser builds use the same patched crate. The vendored
+manifest expands upstream workspace dependencies while retaining their exact
+PolkaVM revision; its metadata records provenance. Upstream license files are
+retained alongside the source. This is a local dependency patch, not an upstream
+release or a change to the application ABI.
+
 ## Host boundary
 
 Hosts integrate through the `truapi-polkavm-host` bridge in [`paritytech/host-rust-core`](https://github.com/paritytech/host-rust-core). The bridge pins one immutable release of this repository and exposes the supported Rust API plus browser asset identity. Host applications do not pin this repository independently.
@@ -37,6 +48,16 @@ the runtime retries with bounded code modules sharing guest memory, registers,
 and dispatch state before falling back to the interpreter. Cached compiled
 programs include the root and every code module; instantiation creates fresh
 guest state.
+
+File handlers are runtime registrations on the mediated-input lifecycle
+(ABI v1 §File input). A Host declares the deliveries it serves with
+`set_file_input_support` (browser start option `fileInput`), reads the
+registrations with `file_registrations` (`file-registrations` messages), and
+delivers a selected file with `send_file_input` (`file-input`). The runtime
+enforces descriptor rules and `maxBytes` before any byte reaches the guest. A
+relaunch delivery stops the execution and returns the file, which the Host
+mounts in a fresh execution with `set_file_relaunch` (`fileRelaunch`).
+Registrations stay readable after an execution stops or fails.
 
 Application hosts may pause through `ApplicationRuntime::set_paused(bool)`.
 Updates do not execute while paused, execution-scoped monotonic clocks freeze,
@@ -72,7 +93,9 @@ GPU batches and protocol events likewise remain ordered and lossless; Hosts
 suppress new surface presentation rather than discard commands. Already
 submitted GPU work may complete at the transition. Hosts also suppress inactive
 clipboard/navigation actions, defer pointer-capture acquisition, and cancel
-new mediated-input prompts while retaining current cursor/IME state.
+new mediated-input prompts, including file pickers, while retaining current
+cursor/IME state. File deliveries accepted while inactive wait for the next
+executed update.
 Resume does not replay missed ticks or buffered audio, and stopping clears held
 presentation and cannot be reversed by queued work or asynchronous compilation.
 The worker and Wasm runtime must be rebuilt together:
@@ -116,4 +139,6 @@ Release tags use `v<version>`. Moving branch references are not release inputs.
 
 ## License
 
-MPL-2.0. See `LICENSE`.
+Runtime code: MPL-2.0. See `LICENSE`. Vendored PolkaVM engine:
+MIT OR Apache-2.0; see `rust/vendor/polkavm/LICENSE-MIT` and
+`rust/vendor/polkavm/LICENSE-APACHE`.

@@ -2735,10 +2735,24 @@
     }
 
     static async create(runtimeWasm) {
+      const unavailableCache = () => {
+        throw new Error("translator does not own private file caches");
+      };
       const imports = {
         polkavm_browser: {
           clock_wall_ms: () => 0,
           random_fill: () => STATUS_DENIED,
+          file_read: () => {
+            throw new Error("translator does not own selected file sources");
+          },
+          file_close: () => {
+            throw new Error("translator does not own selected file sources");
+          },
+          file_cache_reset: unavailableCache,
+          file_cache_write: unavailableCache,
+          file_cache_read: unavailableCache,
+          file_cache_flush: unavailableCache,
+          file_cache_close: unavailableCache,
         },
       };
       const { instance } =

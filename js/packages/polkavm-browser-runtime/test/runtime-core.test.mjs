@@ -1002,7 +1002,7 @@ test("translated background continuations complete bounded hostcall slices witho
   }
 });
 
-test("background state rejects malformed booleans and sequences", () => {
+test("background state rejects malformed booleans and sequences", async () => {
   for (const message of [
     { type: "background", backgrounded: 1 },
     { type: "background", backgrounded: true, seq: -1 },
@@ -1012,6 +1012,8 @@ test("background state rejects malformed booleans and sequences", () => {
     const { messages, receiver } = endpoint();
     receiver.onmessage({ data: message });
     assert.equal(receiver.onmessage, null);
+    // Termination waits for private file-cache cleanup before it is reported.
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(messages.map((message) => message.type), ["error", "terminated"]);
   }
 });

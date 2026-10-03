@@ -22,7 +22,7 @@ const context = vm.createContext({
     queueMicrotask(callback);
   },
   GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01, COPY_DST: 0x02 },
-  GPUBufferUsage: { COPY_DST: 0x08, MAP_READ: 0x01 },
+  GPUBufferUsage: { COPY_DST: 0x08, MAP_READ: 0x01, COPY_SRC: 0x04, QUERY_RESOLVE: 0x200 },
   GPUMapMode: { READ: 0x01 },
 });
 vm.runInContext(
@@ -224,6 +224,9 @@ function validationEngine() {
       64,
       65_535,
       8192,
+      1,
+      256,
+      256,
     ],
     surfaceGeneration: 1,
   });
@@ -842,4 +845,452 @@ test("a permanently unavailable adapter reports one error after bounded retries"
     capture.messages.map(message => message.type),
     ["error"]
   );
+});
+
+function layeredTexture({
+  slot = 1, width = 8, height = 8, layers = 12, mips = 4,
+  dimension = 1, flags = 1, format = 1, usage = 6,
+} = {}) {
+  const payload = new Uint8Array(flags & 1 ? 28 : 24);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, handle(slot), true);
+  view.setUint32(4, width, true);
+  view.setUint32(8, height, true);
+  view.setUint16(12, mips, true);
+  view.setUint16(14, 1, true);
+  view.setUint16(16, format, true);
+  view.setUint8(18, dimension);
+  view.setUint8(19, flags);
+  view.setUint32(20, usage, true);
+  if (flags & 1) view.setUint32(24, layers, true);
+  return [3, payload];
+}
+
+function layeredView({
+  dimension = 2, mip = 0, mips = 1, layer = 0, layers = 12, format = 1,
+} = {}) {
+  const payload = new Uint8Array(20);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, handle(2), true);
+  view.setUint32(4, handle(1), true);
+  view.setUint16(8, format, true);
+  view.setUint8(10, dimension);
+  view.setUint8(11, 1);
+  view.setUint16(12, mip, true);
+  view.setUint16(14, mips, true);
+  view.setUint16(16, layer, true);
+  view.setUint16(18, layers, true);
+  return [23, payload];
+}
+
+function layeredUpload({
+  mip = 1, z = 0, width = 4, height = 4, layers = 2,
+  bytesPerRow = 20, rowsPerImage = 5, length = 176,
+} = {}) {
+  const payload = new Uint8Array(44 + Math.ceil(length / 4) * 4);
+  const view = new DataView(payload.buffer);
+  [handle(1), mip, 0, 0, z, width, height, layers, bytesPerRow, rowsPerImage, length]
+    .forEach((value, index) => view.setUint32(index * 4, value, true));
+  return [4, payload];
+}
+
+async function rejectsTextureBatch(items, diagnostic, index) {
+  const engine = validationEngine();
+  const rejected = [];
+  engine.device = {
+    pushErrorScope() { assert.fail("invalid texture batch reached the GPU"); },
+  };
+  engine.emitBatchRejected = (...args) => rejected.push(args);
+  await engine.execute(commands(items));
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0][3], diagnostic);
+  if (index !== undefined) assert.equal(rejected[0][0], index);
+  assert.equal(engine.resources.size, 0);
+  assert.equal(engine.handleSlots.size, 0);
+  assert.equal(engine.lastSequence, 0n);
+}
+
+test("rejects unsupported texture shapes before GPU execution", async t => {
+  for (const [name, descriptor] of [
+    ["unknown flags", { flags: 3 }],
+    ["unknown dimension", { dimension: 3 }],
+    ["volume missing depth flag", { dimension: 2, flags: 0 }],
+    ["zero layers", { layers: 0 }],
+    ["too many layers", { layers: 257 }],
+    ["volume width exceeds limit", { dimension: 2, width: 257 }],
+    ["volume height exceeds limit", { dimension: 2, height: 257 }],
+    ["volume depth exceeds limit", { dimension: 2, layers: 257 }],
+    ["too many mips for shape", { mips: 5 }],
+    ["volume depth format", { dimension: 2, format: 6 }],
+    ["volume attachment", { dimension: 2, usage: 0x14 }],
+    ["unknown usage", { usage: 0x20 }],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(
+      [layeredTexture(descriptor)], /texture/,
+    ));
+  }
+});
+
+test("rejects incompatible texture view dimensions and ranges", async t => {
+  for (const [name, texture, view] of [
+    ["array from volume", { dimension: 2 }, {}],
+    ["volume from array", {}, { dimension: 5, layers: 0 }],
+    ["volume layer count", { dimension: 2 }, { dimension: 5, layers: 1 }],
+    ["volume base layer", { dimension: 2 }, { dimension: 5, layers: 0, layer: 1 }],
+    ["2d multiple layers", {}, { dimension: 1, layers: 2 }],
+    ["cube face count", {}, { dimension: 3, layers: 5 }],
+    ["cube array face count", {}, { dimension: 4, layers: 7 }],
+    ["cube array empty", {}, { dimension: 4, layers: 0 }],
+    ["cube nonsquare mip", { height: 4 }, { dimension: 3, layers: 6 }],
+    ["cube nonsquare base despite square last mip", { width: 2, height: 1, mips: 2 },
+      { dimension: 3, layers: 6, mip: 1 }],
+    ["layer overflow", {}, { layer: 1 }],
+    ["mip overflow", {}, { mip: 3, mips: 2 }],
+    ["view format mismatch", {}, { format: 7 }],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(
+      [layeredTexture(texture), layeredView(view)], /texture view/, 1,
+    ));
+  }
+});
+
+test("checks all images, padding and shrinking volume mip depth on upload", async t => {
+  for (const [name, texture, upload, diagnostic] of [
+    ["short last row", {}, { length: 175 }, /too short/],
+    ["short intermediate image", {}, { length: 100 }, /too short/],
+    ["short row stride", {}, { bytesPerRow: 15 }, /layout/],
+    ["short image stride", {}, { rowsPerImage: 3 }, /layout/],
+    ["array layer overflow", {}, { z: 11 }, /range/],
+    ["volume mip depth overflow", { dimension: 2, layers: 2 }, {}, /range/],
+    ["copy destination missing", { usage: 4 }, {}, /invalid texture upload/],
+    ["integer overflow", {}, { bytesPerRow: 0xfffffffc, rowsPerImage: 0xffffffff }, /too short/],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(
+      [layeredTexture(texture), layeredUpload(upload)], diagnostic, 1,
+    ));
+  }
+  // The complete first image is padded; the last image ends at its last texel.
+  const engine = validationEngine();
+  const valid = engine.validate(parseCommands(commands([
+    layeredTexture(), layeredUpload(),
+  ])));
+  engine.resources = valid.shadow;
+  engine.handleSlots = valid.slots;
+  // A later invalid upload leaves the already-created texture live.
+  assert.throws(() => engine.validate(parseCommands(commands([
+    layeredUpload({ length: 175 }),
+  ]))), /too short/);
+  assert.equal(engine.resources.has(handle(1)), true);
+});
+
+function textureBindingCommands(dimension, sampleType = 1) {
+  const layout = new Uint8Array(40);
+  const descriptor = new DataView(layout.buffer);
+  descriptor.setUint32(0, handle(3), true);
+  descriptor.setUint32(4, 1, true);
+  descriptor.setUint32(12, 2, true);
+  descriptor.setUint16(16, 3, true);
+  descriptor.setUint32(32, sampleType, true);
+  descriptor.setUint32(36, dimension, true);
+  const group = new Uint8Array(44);
+  const entry = new DataView(group.buffer);
+  entry.setUint32(0, handle(4), true);
+  entry.setUint32(4, handle(3), true);
+  entry.setUint32(8, 1, true);
+  entry.setUint32(16, handle(2), true);
+  entry.setUint16(20, 3, true);
+  return [[7, layout], [9, group]];
+}
+
+test("rejects texture binding view and sample type mismatches in every new mode", async t => {
+  for (const [name, dimension, layers, texture] of [
+    ["array", 2, 12, {}],
+    ["cube", 3, 6, {}],
+    ["cube array", 4, 12, {}],
+    ["volume", 5, 0, { dimension: 2 }],
+  ]) {
+    await t.test(`${name} dimension`, () => rejectsTextureBatch([
+      layeredTexture(texture), layeredView({ dimension, layers }),
+      ...textureBindingCommands(1),
+    ], /incompatible texture binding/, 3));
+    await t.test(`${name} sample type`, () => rejectsTextureBatch([
+      layeredTexture(texture), layeredView({ dimension, layers }),
+      ...textureBindingCommands(dimension, 3),
+    ], /incompatible texture binding/, 3));
+  }
+});
+
+test("charges every layer and shrinking volume mip against the texture quota", async () => {
+  await rejectsTextureBatch([
+    layeredTexture({ width: 1024, height: 1024, layers: 65, mips: 1 }),
+  ], /texture allocation budget/, 0);
+  // 256^3 + 128^3 texels = 72MiB per volume: three fit, the fourth fails.
+  await rejectsTextureBatch(Array.from({ length: 4 }, (_, i) =>
+    layeredTexture({ slot: i + 1, dimension: 2, width: 256, height: 256, layers: 256, mips: 2 }),
+  ), /texture allocation budget/, 3);
+});
+
+function depthAttachment({ format = 8, aspect = 1 } = {}) {
+  const [, view] = layeredView({ dimension: 1, format, layers: 1 });
+  view[11] = aspect;
+  return [
+    layeredTexture({ format, usage: 0x14, flags: 0 }),
+    [23, view],
+  ];
+}
+
+function stencilRenderPass({ flags = 3 | 8 | 32, clearStencil } = {}) {
+  const values = [0, handle(2), 1, flags, 0, 0, 0, 0, 0x3f800000];
+  if (clearStencil !== undefined) values.push(clearStencil);
+  return [12, u32s(values)];
+}
+
+test("stencil pass operations need a stencil attachment and one stencil byte", async t => {
+  const engine = validationEngine();
+  const valid = engine.validate(parseCommands(commands([
+    ...depthAttachment(),
+    stencilRenderPass({ flags: 3 | 8 | 32 | 64, clearStencil: 255 }),
+    [21, new Uint8Array()],
+  ])));
+  assert.equal(valid.commands[2].clearStencil, 255);
+  for (const [name, attachment, pass] of [
+    ["stencil flags on a depth-only attachment", { format: 5 }, { flags: 16 }],
+    ["load and clear together", {}, { flags: 16 | 64, clearStencil: 1 }],
+    ["clear value above one byte", {}, { flags: 64, clearStencil: 256 }],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(
+      [...depthAttachment(attachment), stencilRenderPass(pass)], /stencil pass/, 2,
+    ));
+  }
+  await t.test("depth-only aspect as attachment", () => rejectsTextureBatch(
+    [...depthAttachment({ aspect: 2 }), stencilRenderPass()], /render attachment/, 2,
+  ));
+  await t.test("combined aspect as sampled view", () => rejectsTextureBatch([
+    layeredTexture({ format: 8, usage: 0x14, flags: 0 }),
+    layeredView({ dimension: 1, format: 8, layers: 1 }),
+    ...textureBindingCommands(1, 3),
+  ], /incompatible texture binding/, 3));
+});
+
+function f32s(values) {
+  const bytes = new Uint8Array(values.length * 4);
+  const view = new DataView(bytes.buffer);
+  values.forEach((value, index) => view.setFloat32(index * 4, value, true));
+  return bytes;
+}
+
+test("blend constant applies in order inside its render pass only", async t => {
+  const engine = validationEngine();
+  const calls = [];
+  Object.assign(engine, {
+    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      createCommandEncoder: () => ({
+        beginRenderPass() {
+          calls.push(["begin"]);
+          return {
+            setBlendConstant(color) { calls.push(["blend", { ...color }]); },
+            end() { calls.push(["end"]); },
+          };
+        },
+        finish: () => ({}),
+      }),
+      queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+    },
+    emitBatchRejected() {
+      assert.fail("valid blend constant batch was rejected");
+    },
+  });
+  const [begin, end] = renderPass(0);
+  await engine.execute(commands([
+    begin, [31, f32s([0.25, 0.5, 0.75, 1])], [31, f32s([1, 0, 0, 0.5])], end,
+    begin, end,
+  ]));
+  assert.deepEqual(calls, [
+    ["begin"],
+    ["blend", { r: 0.25, g: 0.5, b: 0.75, a: 1 }],
+    ["blend", { r: 1, g: 0, b: 0, a: 0.5 }],
+    ["end"],
+    ["begin"],
+    ["end"],
+  ]);
+
+  for (const [name, items, diagnostic, index] of [
+    ["outside a render pass", [[31, f32s([0, 0, 0, 0])]], /blend constant outside render pass/, 0],
+    ["after the pass ended", [begin, end, [31, f32s([0, 0, 0, 0])]], /blend constant outside render pass/, 2],
+    ["non-finite component", [begin, [31, f32s([0, Number.NaN, 0, 0])], end], /non-finite/],
+    ["infinite component", [begin, [31, f32s([0, 0, 0, Infinity])], end], /non-finite/],
+    ["three components", [begin, [31, f32s([0, 0, 0])], end], /GPU/],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(items, diagnostic, index));
+  }
+});
+
+function occlusionPass(count, token = 0) {
+  return [12, u32s([0, 0, 1, 2 | 128, 0, 0, 0, 0x3f800000, 0x3f800000, count, token])];
+}
+
+function occlusionEngine() {
+  const engine = validationEngine();
+  const gates = [];
+  const passCalls = [];
+  const bytes = buffer => new Uint8Array(buffer.storage);
+  Object.assign(engine, {
+    occlusionDelivery: Promise.resolve(),
+    occlusionEpoch: 0,
+    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      createQuerySet: ({ count }) => ({ samples: new Array(count).fill(0n), destroy() {} }),
+      createBuffer: ({ size }) => ({
+        storage: new ArrayBuffer(size),
+        mapAsync() {
+          return new Promise(resolvePromise => gates.push(resolvePromise));
+        },
+        getMappedRange() { return this.storage; },
+        destroy() {},
+      }),
+      createCommandEncoder: () => ({
+        beginRenderPass({ occlusionQuerySet }) {
+          let open = null;
+          return {
+            beginOcclusionQuery(query) { open = query; passCalls.push(["begin", query]); },
+            endOcclusionQuery() { open = null; passCalls.push(["end"]); },
+            setPipeline() {},
+            draw(vertices) { occlusionQuerySet.samples[open] += BigInt(vertices); },
+            end() { passCalls.push(["pass-end"]); },
+          };
+        },
+        resolveQuerySet(querySet, first, count, destination) {
+          querySet.samples.forEach((value, index) =>
+            new DataView(destination.storage).setBigUint64(index * 8, value, true));
+        },
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+          bytes(destination).set(bytes(source).subarray(sourceOffset, sourceOffset + size), destinationOffset);
+        },
+        finish: () => ({}),
+      }),
+      queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+    },
+    emitBatchRejected(...args) {
+      assert.fail(`valid occlusion batch was rejected: ${args[3]}`);
+    },
+  });
+  return { engine, gates, passCalls };
+}
+
+function decodeOcclusion(message) {
+  const view = new DataView(message.bytes.buffer);
+  const count = view.getUint32(28, true);
+  return {
+    type: view.getUint16(6, true),
+    sequence: Number(view.getBigUint64(16, true)),
+    token: view.getUint32(24, true),
+    samples: Array.from({ length: count }, (_, index) =>
+      Number(view.getBigUint64(32 + index * 8, true))),
+  };
+}
+
+test("occlusion results follow their batch in submission order without blocking it", async () => {
+  const { engine, gates, passCalls } = occlusionEngine();
+  const capture = captureMessages();
+  try {
+    const [, end] = renderPass(0);
+    const draw = vertices => [19, u32s([vertices, 1, 0, 0])];
+    await engine.execute(commands([
+      occlusionPass(3, 0xabcd),
+      [32, u32s([0])], draw(3), [33, new Uint8Array()],
+      [32, u32s([2])], draw(6), [33, new Uint8Array()],
+      end,
+    ], 1n));
+    await engine.execute(commands([
+      occlusionPass(1, 7), [32, u32s([0])], draw(9), [33, new Uint8Array()], end,
+    ], 2n));
+    const events = () => capture.messages
+      .filter(message => message.type === "event")
+      .map(message => new DataView(message.bytes.buffer).getUint16(6, true));
+    assert.deepEqual(events(), [5, 5], "batches complete before any result is mapped");
+    assert.deepEqual(passCalls.slice(0, 6), [
+      ["begin", 0], ["end"], ["begin", 2], ["end"], ["begin", 1], ["end"],
+    ], "the unused index runs an empty query before the pass ends");
+    for (let index = 0; index < 2; index++) {
+      while (gates.length <= index) await new Promise(setImmediate);
+      gates[index]();
+    }
+    await engine.occlusionDelivery;
+    const results = capture.messages
+      .filter(message => message.type === "event" &&
+        new DataView(message.bytes.buffer).getUint16(6, true) === 9)
+      .map(decodeOcclusion);
+    assert.deepEqual(results, [
+      { type: 9, sequence: 1, token: 0xabcd, samples: [3, 0, 6] },
+      { type: 9, sequence: 2, token: 7, samples: [9] },
+    ]);
+  } finally {
+    capture.restore();
+  }
+});
+
+test("occlusion queries follow WebGPU nesting and uniqueness rules", async t => {
+  const [, end] = renderPass(0);
+  const begin = query => [32, u32s([query])];
+  const close = [33, new Uint8Array()];
+  for (const [name, items, diagnostic] of [
+    ["nested", [occlusionPass(2), begin(0), begin(1), close, close, end], /cannot nest/],
+    ["index beyond count", [occlusionPass(2), begin(2), close, end], /exceeds the pass query count/],
+    ["reused index", [occlusionPass(2), begin(0), close, begin(0), close, end], /reused/],
+    ["end without begin", [occlusionPass(2), close, end], /not active/],
+    ["open at pass end", [occlusionPass(2), begin(0), end], /open occlusion query/],
+    ["pass without queries", [renderPass(0)[0], begin(0), close, end], /no occlusion queries/],
+    ["outside a pass", [begin(0)], /outside render pass/],
+    ["zero count", [occlusionPass(0), end], /must be nonzero/],
+    ["batch limit", [occlusionPass(4096), end, occlusionPass(1), end], /batch limit/],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(items, diagnostic));
+  }
+});
+
+function stencilPipeline({ depthFormat = 8, topology = 4, compare = 3, bias = 0 } = {}) {
+  const payload = new Uint8Array(40 + 16 + 24);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, handle(5), true);
+  view.setUint32(4, handle(3), true);
+  view.setUint32(8, handle(1), true);
+  view.setUint16(16, 1, true);
+  view.setUint16(18, 2, true);
+  view.setUint16(20, depthFormat, true);
+  view.setUint16(22, 1, true);
+  payload[24] = topology;
+  payload[25] = 1;
+  payload[28] = 8;
+  view.setUint16(40, 1, true);
+  view.setUint16(42, 15, true);
+  payload.set([1, 2, 1, 1, 2, 1], 44);
+  payload.set([compare, 1, 1, 3, compare, 1, 1, 3, 0xff, 0xff], 56);
+  view.setInt32(68, bias, true);
+  return [10, payload];
+}
+
+test("pipeline stencil and depth bias follow WebGPU's format and topology rules", async t => {
+  const prerequisites = [shaderCommands(1)[0], [8, u32s([handle(3), 0])]]
+    .map(item => (Array.isArray(item) ? item : [item.opcode, item.payload]));
+  const engine = validationEngine();
+  const valid = engine.validate(parseCommands(commands([
+    ...prerequisites, stencilPipeline({ bias: -8 }),
+  ])));
+  assert.equal(valid.commands[2].stencilFront.compare, "equal");
+  assert.equal(valid.commands[2].stencilFront.passOp, "replace");
+  assert.equal(valid.commands[2].depthBias, -8);
+  for (const [name, pipeline] of [
+    ["stencil test without a stencil format", { depthFormat: 5 }],
+    ["trailer without a depth format", { depthFormat: 0, compare: 8 }],
+    ["depth bias on lines", { topology: 2, compare: 8, bias: 1 }],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(
+      [...prerequisites, stencilPipeline(pipeline)], /stencil or depth bias/, 2,
+    ));
+  }
 });
