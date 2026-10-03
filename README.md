@@ -197,8 +197,13 @@ Version numbers describe different boundaries; they are not interchangeable:
 | Guest application imports | `runtime.abiVersion: 1` |
 | Presentation records | Graphics ABI 1, with the selected profile and required limits |
 | Browser bootstrap exports | Browser runtime ABI 2; ship Wasm and JS from the same build |
-| Engine and blob encoding | Exact revision `c160c13c3c29bf3219ce1404ec95976000235a94` |
+| Engine and blob encoding | Exact revision `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` |
 | Conformance guest toolchain | `polkatool 0.31.0`, `nightly-2025-10-09` |
+
+The pinned engine passed [Linux and Apple M1 qualification](https://github.com/paritytech/polkavm-host-runtime/actions/runs/37094525375),
+including forced native JIT execution and an ad-hoc signed hardened macOS host
+with `allow-jit`. This maintenance revision preserves the previous `Latest64`
+blob encoding; see [engine maintenance](CONTRIBUTING.md#engine-maintenance).
 
 For [PolkaVM App Kit](https://github.com/paritytech/polkavm-app-kit), match the
 guest's linker/blob format, imported host functions, graphics profile, and limits

@@ -20,7 +20,7 @@ native-gpu = ["dep:pollster", "dep:wgpu"]
 [dependencies]
 anyhow = "1"
 log = "0.4"
-polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", features = ["generic-sandbox"] }
+polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5", version = "=0.37.0", features = ["generic-sandbox"] }
 polkavm-gpu-wire = { version = "0.3.1", path = "../polkavm-gpu-wire", features = ["tri2d-validation"] }
 polkavm-motion-wire = { version = "0.3.1", path = "../polkavm-motion-wire" }
 polkavm-ui-wire = { version = "0.3.1", path = "../polkavm-ui-wire" }
@@ -43,5 +43,5 @@ uniffi = { workspace = true, optional = true }
 [dev-dependencies]
 polkavm-wasm-compiler = { version = "0.3.1", path = "../polkavm-wasm-compiler" }
 wasmi = "0.40"
-polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0" }
+polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5", version = "=0.37.0" }
 wasmparser = "0.240"

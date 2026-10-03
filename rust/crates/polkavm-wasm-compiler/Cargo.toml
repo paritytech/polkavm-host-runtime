@@ -12,10 +12,10 @@ workspace = true
 
 [dependencies]
 anyhow = "1"
-polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", default-features = false, features = ["alloc"] }
+polkavm-common = { git = "https://github.com/paritytech/polkavm.git", rev = "642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5", version = "=0.37.0", default-features = false, features = ["alloc"] }
 wasm-encoder = "0.240"
 
 [dev-dependencies]
-polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "c160c13c3c29bf3219ce1404ec95976000235a94", version = "=0.37.0", features = ["generic-sandbox"] }
+polkavm = { git = "https://github.com/paritytech/polkavm.git", rev = "642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5", version = "=0.37.0", features = ["generic-sandbox"] }
 wasmi = "0.40"
 wasmparser = "0.240"
