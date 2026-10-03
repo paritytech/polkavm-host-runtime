@@ -519,6 +519,13 @@ impl NativePolkaVmRuntime {
                     frame = Some(rendered_frame.into());
                 }
             }
+            // Occlusion results complete after their batch; deliver them on
+            // later renders even when the guest submits nothing new.
+            for event in renderer.poll_events() {
+                runtime
+                    .send_gpu_event(event)
+                    .map_err(NativePolkaVmError::runtime)?;
+            }
             Ok(frame)
         }
         #[cfg(not(feature = "native-gpu"))]

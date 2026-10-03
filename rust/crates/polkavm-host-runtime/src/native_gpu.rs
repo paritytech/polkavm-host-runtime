@@ -1,8 +1,9 @@
 use crate::gpu_wire::{self, GpuOpcode};
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{mpsc, Arc};
 
 const FORMAT_RGBA8_UNORM: u16 = 1;
 const EVENT_HEADER_BYTES: usize = 24;
@@ -62,6 +63,33 @@ struct PendingPass {
     clear_depth: f32,
     clear_stencil: u32,
     operations: Vec<RenderOperation>,
+    occlusion: Option<PassOcclusion>,
+}
+
+/// Occlusion queries declared by `BeginRenderPass`, validated as recorded.
+struct PassOcclusion {
+    count: u32,
+    token: u32,
+    used: Vec<bool>,
+    open: bool,
+}
+
+/// A resolved occlusion pass whose results are copied into `buffer`.
+struct OcclusionReadback {
+    token: u32,
+    count: u32,
+    buffer: wgpu::Buffer,
+}
+
+const OCCLUSION_PENDING: u8 = 0;
+const OCCLUSION_MAPPED: u8 = 1;
+const OCCLUSION_FAILED: u8 = 2;
+
+/// A submitted readback; `state` is set by the `map_async` callback.
+struct PendingOcclusion {
+    sequence: u64,
+    readback: OcclusionReadback,
+    state: Arc<AtomicU8>,
 }
 
 enum RenderOperation {
@@ -88,6 +116,8 @@ enum RenderOperation {
     Draw([u32; 4]),
     StencilReference(u32),
     BlendConstant([f32; 4]),
+    BeginOcclusionQuery(u32),
+    EndOcclusionQuery,
     DrawIndexed {
         indices: u32,
         instances: u32,
@@ -123,6 +153,7 @@ pub struct NativeGpuRenderer {
     height: u32,
     padded_row_bytes: u32,
     generation: u32,
+    occlusion_results: VecDeque<PendingOcclusion>,
 }
 
 impl NativeGpuRenderer {
@@ -160,6 +191,7 @@ impl NativeGpuRenderer {
             height,
             padded_row_bytes,
             generation: 1,
+            occlusion_results: VecDeque::new(),
         })
     }
 
@@ -187,11 +219,13 @@ impl NativeGpuRenderer {
         Ok(())
     }
 
+    /// Executes one batch. Its completion event comes first, followed by any
+    /// occlusion results that have become readable, in submission order.
     pub fn execute(&mut self, batch_bytes: &[u8]) -> NativeGpuOutput {
         let sequence = gpu_wire::decode_gpu_batch(batch_bytes)
             .map(|batch| batch.sequence())
             .unwrap_or(0);
-        match self.execute_inner(batch_bytes) {
+        let mut output = match self.execute_inner(batch_bytes) {
             Ok(frame) => NativeGpuOutput {
                 events: vec![submission_complete(sequence)],
                 frame,
@@ -200,7 +234,37 @@ impl NativeGpuRenderer {
                 events: vec![batch_rejected(sequence, &format!("{error:#}"))],
                 frame: None,
             },
+        };
+        output.events.extend(self.poll_events());
+        output
+    }
+
+    /// Returns occlusion-result events whose readback has completed, without
+    /// waiting for the GPU. Hosts that stop submitting batches call this to
+    /// receive outstanding results.
+    pub fn poll_events(&mut self) -> Vec<Vec<u8>> {
+        self.device.poll(wgpu::Maintain::Poll);
+        let mut events = Vec::new();
+        while let Some(pending) = self.occlusion_results.front() {
+            let state = pending.state.load(Ordering::Acquire);
+            if state == OCCLUSION_PENDING {
+                break;
+            }
+            let pending = self.occlusion_results.pop_front().unwrap();
+            // A failed mapping means the device was lost with the submission.
+            if state != OCCLUSION_MAPPED {
+                continue;
+            }
+            let buffer = &pending.readback.buffer;
+            events.push(occlusion_results(
+                pending.sequence,
+                pending.readback.token,
+                pending.readback.count,
+                &buffer.slice(..).get_mapped_range(),
+            ));
+            buffer.unmap();
         }
+        events
     }
 
     fn execute_inner(&mut self, batch_bytes: &[u8]) -> Result<Option<NativeGpuFrame>> {
@@ -211,6 +275,8 @@ impl NativeGpuRenderer {
         let mut presented = false;
         let mut compute_dispatches = 0usize;
         let mut created_texture_bytes = 0usize;
+        let mut occlusion_queries = 0u32;
+        let mut occlusion_readbacks = Vec::new();
         for (index, command) in batch.commands().enumerate() {
             let mut reader = Reader::new(command.payload);
             match command.opcode {
@@ -405,6 +471,31 @@ impl NativeGpuRenderer {
                     } else {
                         0
                     };
+                    let occlusion = if flags & gpu_wire::GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES != 0
+                    {
+                        let count = reader.u32()?;
+                        let token = reader.u32()?;
+                        if count == 0 {
+                            bail!("occlusion query count must be nonzero");
+                        }
+                        occlusion_queries = occlusion_queries.saturating_add(count);
+                        if occlusion_queries > gpu_wire::MAX_GPU_OCCLUSION_QUERIES_PER_BATCH {
+                            bail!("occlusion query count exceeds the batch limit");
+                        }
+                        Some(PassOcclusion {
+                            count,
+                            token,
+                            used: vec![false; count as usize],
+                            open: false,
+                        })
+                    } else {
+                        None
+                    };
+                    if occlusion.is_some()
+                        && occlusion_readbacks.len() >= gpu_wire::MAX_GPU_RENDER_PASSES_PER_BATCH
+                    {
+                        bail!("too many occlusion query passes");
+                    }
                     reader.finish()?;
                     if generation != self.generation {
                         bail!("stale render attachment");
@@ -426,6 +517,7 @@ impl NativeGpuRenderer {
                         clear_depth,
                         clear_stencil,
                         operations: Vec::new(),
+                        occlusion,
                     });
                 }
                 GpuOpcode::SetPipeline => pending(&mut pending_pass)?
@@ -509,6 +601,35 @@ impl NativeGpuRenderer {
                         .operations
                         .push(RenderOperation::BlendConstant(rgba));
                 }
+                GpuOpcode::BeginOcclusionQuery => {
+                    let query = reader.one_u32()?;
+                    let occlusion = pending(&mut pending_pass)?
+                        .occlusion
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("render pass has no occlusion queries"))?;
+                    if occlusion.open {
+                        bail!("occlusion queries cannot nest");
+                    }
+                    if query >= occlusion.count {
+                        bail!("occlusion query index exceeds the pass query count");
+                    }
+                    if std::mem::replace(&mut occlusion.used[query as usize], true) {
+                        bail!("occlusion query index is reused within its pass");
+                    }
+                    occlusion.open = true;
+                    pending(&mut pending_pass)?
+                        .operations
+                        .push(RenderOperation::BeginOcclusionQuery(query));
+                }
+                GpuOpcode::EndOcclusionQuery => {
+                    reader.finish()?;
+                    let pass = pending(&mut pending_pass)?;
+                    match pass.occlusion.as_mut() {
+                        Some(occlusion) if occlusion.open => occlusion.open = false,
+                        _ => bail!("occlusion query is not active"),
+                    }
+                    pass.operations.push(RenderOperation::EndOcclusionQuery);
+                }
                 GpuOpcode::DrawIndexed => {
                     let op = RenderOperation::DrawIndexed {
                         indices: reader.u32()?,
@@ -525,11 +646,18 @@ impl NativeGpuRenderer {
                     let pass = pending_pass
                         .take()
                         .ok_or_else(|| anyhow!("render pass is not active"))?;
+                    if pass
+                        .occlusion
+                        .as_ref()
+                        .is_some_and(|occlusion| occlusion.open)
+                    {
+                        bail!("render pass ended with an open occlusion query");
+                    }
                     let renders_to_surface = pass.color_view == 0;
                     let command_encoder = encoder.get_or_insert_with(|| {
                         self.device.create_command_encoder(&Default::default())
                     });
-                    self.encode_render_pass(command_encoder, pass)?;
+                    occlusion_readbacks.extend(self.encode_render_pass(command_encoder, pass)?);
                     presented |= renders_to_surface;
                 }
                 GpuOpcode::CopyBufferToBuffer => {
@@ -655,6 +783,27 @@ impl NativeGpuRenderer {
             );
         }
         self.queue.submit([encoder.finish()]);
+        // Results are delivered by later polls; mapping never blocks the batch.
+        for readback in occlusion_readbacks {
+            let state = Arc::new(AtomicU8::new(OCCLUSION_PENDING));
+            let signal = Arc::clone(&state);
+            readback
+                .buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let value = if result.is_ok() {
+                        OCCLUSION_MAPPED
+                    } else {
+                        OCCLUSION_FAILED
+                    };
+                    signal.store(value, Ordering::Release);
+                });
+            self.occlusion_results.push_back(PendingOcclusion {
+                sequence: batch.sequence(),
+                readback,
+                state,
+            });
+        }
         if presented {
             self.read_frame().map(Some)
         } else {
@@ -1147,7 +1296,7 @@ impl NativeGpuRenderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         pending: PendingPass,
-    ) -> Result<()> {
+    ) -> Result<Option<OcclusionReadback>> {
         let surface_view;
         let color_view = if pending.color_view == 0 {
             surface_view = self.surface.create_view(&Default::default());
@@ -1209,12 +1358,20 @@ impl NativeGpuRenderer {
                     }),
                 },
             );
+        let occlusion = pending.occlusion.map(|occlusion| {
+            let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: None,
+                ty: wgpu::QueryType::Occlusion,
+                count: occlusion.count,
+            });
+            (query_set, occlusion)
+        });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[color_attachment],
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
-            occlusion_query_set: None,
+            occlusion_query_set: occlusion.as_ref().map(|(query_set, _)| query_set),
         });
         // WebGPU starts every pass with blend constant 0; wgpu instead rejects
         // constant-factor draws until a constant is set.
@@ -1273,9 +1430,42 @@ impl NativeGpuRenderer {
                     base_vertex,
                     first_instance..first_instance + instances,
                 ),
+                RenderOperation::BeginOcclusionQuery(query) => pass.begin_occlusion_query(query),
+                RenderOperation::EndOcclusionQuery => pass.end_occlusion_query(),
             }
         }
-        Ok(())
+        let Some((query_set, occlusion)) = &occlusion else {
+            return Ok(None);
+        };
+        // Unused indices run an empty query, so every result is defined (zero)
+        // without relying on how a backend resolves never-written queries.
+        for (query, used) in occlusion.used.iter().enumerate() {
+            if !used {
+                pass.begin_occlusion_query(query as u32);
+                pass.end_occlusion_query();
+            }
+        }
+        drop(pass);
+        let bytes = u64::from(occlusion.count) * 8;
+        let resolved = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.resolve_query_set(query_set, 0..occlusion.count, &resolved, 0);
+        encoder.copy_buffer_to_buffer(&resolved, 0, &buffer, 0, bytes);
+        Ok(Some(OcclusionReadback {
+            token: occlusion.token,
+            count: occlusion.count,
+            buffer,
+        }))
     }
 
     fn encode_compute_pass(
@@ -1648,7 +1838,8 @@ fn encode_capabilities(width: u32, height: u32, generation: u32) -> Vec<u8> {
             22,
             gpu_wire::GPU_RASTER_FEATURE_LAYERED_TEXTURES
                 | gpu_wire::GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS
-                | gpu_wire::GPU_RASTER_FEATURE_BLEND_CONSTANT,
+                | gpu_wire::GPU_RASTER_FEATURE_BLEND_CONSTANT
+                | gpu_wire::GPU_RASTER_FEATURE_OCCLUSION_QUERIES,
         ),
         (23, gpu_wire::MAX_GPU_TEXTURE_DIMENSION_3D as u64),
         (24, gpu_wire::MAX_GPU_TEXTURE_ARRAY_LAYERS as u64),
@@ -2001,6 +2192,21 @@ fn submission_complete(sequence: u64) -> Vec<u8> {
     bytes[16..24].copy_from_slice(&sequence.to_le_bytes());
     bytes
 }
+/// Event 9: guest token, query count, then one little-endian `u64` per query.
+fn occlusion_results(sequence: u64, token: u32, count: u32, results: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; EVENT_HEADER_BYTES + gpu_wire::GPU_OCCLUSION_RESULTS_HEADER_BYTES];
+    bytes[..4].copy_from_slice(&gpu_wire::GPU_EVENT_MAGIC);
+    bytes[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+    bytes[6..8].copy_from_slice(&(gpu_wire::GpuEventType::OcclusionResults as u16).to_le_bytes());
+    bytes[16..24].copy_from_slice(&sequence.to_le_bytes());
+    bytes[24..28].copy_from_slice(&token.to_le_bytes());
+    bytes[28..32].copy_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(results);
+    let len = bytes.len() as u32;
+    bytes[8..12].copy_from_slice(&len.to_le_bytes());
+    bytes
+}
+
 fn batch_rejected(sequence: u64, message: &str) -> Vec<u8> {
     let text = message.as_bytes();
     let text = &text[..text.len().min(gpu_wire::MAX_GPU_DIAGNOSTIC_BYTES)];

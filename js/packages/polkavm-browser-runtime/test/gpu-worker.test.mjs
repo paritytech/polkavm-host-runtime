@@ -22,7 +22,7 @@ const context = vm.createContext({
     queueMicrotask(callback);
   },
   GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01, COPY_DST: 0x02 },
-  GPUBufferUsage: { COPY_DST: 0x08, MAP_READ: 0x01 },
+  GPUBufferUsage: { COPY_DST: 0x08, MAP_READ: 0x01, COPY_SRC: 0x04, QUERY_RESOLVE: 0x200 },
   GPUMapMode: { READ: 0x01 },
 });
 vm.runInContext(
@@ -1125,6 +1125,131 @@ test("blend constant applies in order inside its render pass only", async t => {
     ["three components", [begin, [31, f32s([0, 0, 0])], end], /GPU/],
   ]) {
     await t.test(name, () => rejectsTextureBatch(items, diagnostic, index));
+  }
+});
+
+function occlusionPass(count, token = 0) {
+  return [12, u32s([0, 0, 1, 2 | 128, 0, 0, 0, 0x3f800000, 0x3f800000, count, token])];
+}
+
+function occlusionEngine() {
+  const engine = validationEngine();
+  const gates = [];
+  const passCalls = [];
+  const bytes = buffer => new Uint8Array(buffer.storage);
+  Object.assign(engine, {
+    occlusionDelivery: Promise.resolve(),
+    occlusionEpoch: 0,
+    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+    device: {
+      pushErrorScope() {},
+      popErrorScope: async () => null,
+      createQuerySet: ({ count }) => ({ samples: new Array(count).fill(0n), destroy() {} }),
+      createBuffer: ({ size }) => ({
+        storage: new ArrayBuffer(size),
+        mapAsync() {
+          return new Promise(resolvePromise => gates.push(resolvePromise));
+        },
+        getMappedRange() { return this.storage; },
+        destroy() {},
+      }),
+      createCommandEncoder: () => ({
+        beginRenderPass({ occlusionQuerySet }) {
+          let open = null;
+          return {
+            beginOcclusionQuery(query) { open = query; passCalls.push(["begin", query]); },
+            endOcclusionQuery() { open = null; passCalls.push(["end"]); },
+            setPipeline() {},
+            draw(vertices) { occlusionQuerySet.samples[open] += BigInt(vertices); },
+            end() { passCalls.push(["pass-end"]); },
+          };
+        },
+        resolveQuerySet(querySet, first, count, destination) {
+          querySet.samples.forEach((value, index) =>
+            new DataView(destination.storage).setBigUint64(index * 8, value, true));
+        },
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+          bytes(destination).set(bytes(source).subarray(sourceOffset, sourceOffset + size), destinationOffset);
+        },
+        finish: () => ({}),
+      }),
+      queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+    },
+    emitBatchRejected(...args) {
+      assert.fail(`valid occlusion batch was rejected: ${args[3]}`);
+    },
+  });
+  return { engine, gates, passCalls };
+}
+
+function decodeOcclusion(message) {
+  const view = new DataView(message.bytes.buffer);
+  const count = view.getUint32(28, true);
+  return {
+    type: view.getUint16(6, true),
+    sequence: Number(view.getBigUint64(16, true)),
+    token: view.getUint32(24, true),
+    samples: Array.from({ length: count }, (_, index) =>
+      Number(view.getBigUint64(32 + index * 8, true))),
+  };
+}
+
+test("occlusion results follow their batch in submission order without blocking it", async () => {
+  const { engine, gates, passCalls } = occlusionEngine();
+  const capture = captureMessages();
+  try {
+    const [, end] = renderPass(0);
+    const draw = vertices => [19, u32s([vertices, 1, 0, 0])];
+    await engine.execute(commands([
+      occlusionPass(3, 0xabcd),
+      [32, u32s([0])], draw(3), [33, new Uint8Array()],
+      [32, u32s([2])], draw(6), [33, new Uint8Array()],
+      end,
+    ], 1n));
+    await engine.execute(commands([
+      occlusionPass(1, 7), [32, u32s([0])], draw(9), [33, new Uint8Array()], end,
+    ], 2n));
+    const events = () => capture.messages
+      .filter(message => message.type === "event")
+      .map(message => new DataView(message.bytes.buffer).getUint16(6, true));
+    assert.deepEqual(events(), [5, 5], "batches complete before any result is mapped");
+    assert.deepEqual(passCalls.slice(0, 6), [
+      ["begin", 0], ["end"], ["begin", 2], ["end"], ["begin", 1], ["end"],
+    ], "the unused index runs an empty query before the pass ends");
+    for (let index = 0; index < 2; index++) {
+      while (gates.length <= index) await new Promise(setImmediate);
+      gates[index]();
+    }
+    await engine.occlusionDelivery;
+    const results = capture.messages
+      .filter(message => message.type === "event" &&
+        new DataView(message.bytes.buffer).getUint16(6, true) === 9)
+      .map(decodeOcclusion);
+    assert.deepEqual(results, [
+      { type: 9, sequence: 1, token: 0xabcd, samples: [3, 0, 6] },
+      { type: 9, sequence: 2, token: 7, samples: [9] },
+    ]);
+  } finally {
+    capture.restore();
+  }
+});
+
+test("occlusion queries follow WebGPU nesting and uniqueness rules", async t => {
+  const [, end] = renderPass(0);
+  const begin = query => [32, u32s([query])];
+  const close = [33, new Uint8Array()];
+  for (const [name, items, diagnostic] of [
+    ["nested", [occlusionPass(2), begin(0), begin(1), close, close, end], /cannot nest/],
+    ["index beyond count", [occlusionPass(2), begin(2), close, end], /exceeds the pass query count/],
+    ["reused index", [occlusionPass(2), begin(0), close, begin(0), close, end], /reused/],
+    ["end without begin", [occlusionPass(2), close, end], /not active/],
+    ["open at pass end", [occlusionPass(2), begin(0), end], /open occlusion query/],
+    ["pass without queries", [renderPass(0)[0], begin(0), close, end], /no occlusion queries/],
+    ["outside a pass", [begin(0)], /outside render pass/],
+    ["zero count", [occlusionPass(0), end], /must be nonzero/],
+    ["batch limit", [occlusionPass(4096), end, occlusionPass(1), end], /batch limit/],
+  ]) {
+    await t.test(name, () => rejectsTextureBatch(items, diagnostic));
   }
 });
 

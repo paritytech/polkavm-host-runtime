@@ -25,6 +25,7 @@ const MAX_RENDER_PASSES_PER_BATCH = 16;
 const MAX_DRAWS_PER_BATCH = 8_192;
 const MAX_COMPUTE_PASSES_PER_BATCH = 64;
 const MAX_DISPATCHES_PER_BATCH = 8_192;
+const MAX_OCCLUSION_QUERIES_PER_BATCH = 4_096;
 const GPU_SHADER_STAGE_VERTEX = 1;
 const MAX_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_TEXTURE_BYTES = 256 * 1024 * 1024;
@@ -33,12 +34,14 @@ const MAX_TEXTURE_ARRAY_LAYERS = 256;
 const RASTER_FEATURE_LAYERED_TEXTURES = 1;
 const RASTER_FEATURE_STENCIL_DEPTH_BIAS = 2;
 const RASTER_FEATURE_BLEND_CONSTANT = 4;
+const RASTER_FEATURE_OCCLUSION_QUERIES = 8;
 const RENDER_PASS_DEPTH_LOAD = 4;
 const RENDER_PASS_DEPTH_STORE = 8;
 const RENDER_PASS_STENCIL_LOAD = 16;
 const RENDER_PASS_STENCIL_STORE = 32;
 const RENDER_PASS_HAS_STENCIL_CLEAR = 64;
-const RENDER_PASS_FLAGS = 127;
+const RENDER_PASS_HAS_OCCLUSION_QUERIES = 128;
+const RENDER_PASS_FLAGS = 255;
 const PIPELINE_DEPTH_WRITE = 1;
 const PIPELINE_STENCIL_DEPTH_BIAS = 2;
 const PIPELINE_FLAGS = 3;
@@ -1013,6 +1016,10 @@ function parseCommand(command) {
       }
       result.clearStencil =
         result.flags & RENDER_PASS_HAS_STENCIL_CLEAR ? reader.u32() : 0;
+      if (result.flags & RENDER_PASS_HAS_OCCLUSION_QUERIES) {
+        result.queryCount = reader.u32();
+        result.queryToken = reader.u32();
+      }
       break;
     case 14:
       Object.assign(result, {
@@ -1117,6 +1124,11 @@ function parseCommand(command) {
         a: reader.f32(),
       };
       break;
+    case 32:
+      result.query = reader.u32();
+      break;
+    case 33:
+      break;
     default:
       throw new ProtocolError(
         `unsupported GPU opcode ${command.opcode}`,
@@ -1161,6 +1173,9 @@ class GpuEngine {
     this.backgroundTextureValid = false;
     this.backgroundTextureSequence = 0;
     this.queue = Promise.resolve();
+    // Occlusion results resolve after their batch, in submission order.
+    this.occlusionDelivery = Promise.resolve();
+    this.occlusionEpoch = 0;
     this.pendingBatches = 0;
     this.testReadbacksRemaining = testReadback ? 8 : 0;
     this.testDeviceLossPending = testDeviceLoss;
@@ -1190,6 +1205,7 @@ class GpuEngine {
         return;
       }
       this.stopped = true;
+      this.occlusionEpoch++;
       this.destroyBackgroundTexture();
       this.emitTextEvent(7, 0, 1, info.message || "WebGPU device lost");
       void this.restore();
@@ -1348,7 +1364,8 @@ class GpuEngine {
       MAX_DISPATCHES_PER_BATCH,
       RASTER_FEATURE_LAYERED_TEXTURES |
         RASTER_FEATURE_STENCIL_DEPTH_BIAS |
-        RASTER_FEATURE_BLEND_CONSTANT,
+        RASTER_FEATURE_BLEND_CONSTANT |
+        RASTER_FEATURE_OCCLUSION_QUERIES,
       requested.maxTextureDimension3D,
       requested.maxTextureArrayLayers,
     ];
@@ -1585,6 +1602,8 @@ class GpuEngine {
       compilations: 0,
     };
     let renderPasses = 0;
+    let occlusionQueries = 0;
+    let queries = null;
     let draws = 0;
     let computePasses = 0;
     let dispatches = 0;
@@ -1776,6 +1795,17 @@ class GpuEngine {
             validateTextureAttachment(shadow, command.depthView, true, index);
           }
           validateStencilPass(command, shadow, index);
+          queries = null;
+          if (command.flags & RENDER_PASS_HAS_OCCLUSION_QUERIES) {
+            if (command.queryCount === 0) {
+              throw new ProtocolError("occlusion query count must be nonzero", index);
+            }
+            occlusionQueries += command.queryCount;
+            if (occlusionQueries > MAX_OCCLUSION_QUERIES_PER_BATCH) {
+              throw new ProtocolError("occlusion query count exceeds the batch limit", index);
+            }
+            queries = { count: command.queryCount, used: new Set(), open: false };
+          }
           pass = true;
           break;
         case 13:
@@ -1849,7 +1879,11 @@ class GpuEngine {
           if (!pass) {
             throw new ProtocolError("render pass is not active", index);
           }
+          if (queries?.open) {
+            throw new ProtocolError("render pass ended with an open occlusion query", index);
+          }
           pass = false;
+          queries = null;
           break;
         case 22:
           if (pass || computePass) {
@@ -1947,6 +1981,31 @@ class GpuEngine {
             throw new ProtocolError("blend constant outside render pass", index);
           }
           break;
+        case 32:
+          if (!pass) {
+            throw new ProtocolError("occlusion query outside render pass", index);
+          }
+          if (!queries) {
+            throw new ProtocolError("render pass has no occlusion queries", index);
+          }
+          if (queries.open) {
+            throw new ProtocolError("occlusion queries cannot nest", index);
+          }
+          if (command.query >= queries.count) {
+            throw new ProtocolError("occlusion query index exceeds the pass query count", index);
+          }
+          if (queries.used.has(command.query)) {
+            throw new ProtocolError("occlusion query index is reused within its pass", index);
+          }
+          queries.used.add(command.query);
+          queries.open = true;
+          break;
+        case 33:
+          if (!queries?.open) {
+            throw new ProtocolError("occlusion query is not active", index);
+          }
+          queries.open = false;
+          break;
       }
     }
     if (pass) {
@@ -1991,6 +2050,8 @@ class GpuEngine {
     let surfaceTexture = null;
     let readback = null;
     let surfaceStored = false;
+    let occlusion = null;
+    const occlusionReadbacks = [];
     const backgrounded = this.backgrounded;
     const removed = [];
     const shaders = [];
@@ -2226,6 +2287,19 @@ class GpuEngine {
                 });
               }
             }
+            if (command.queryCount) {
+              occlusion = {
+                querySet: this.device.createQuerySet({
+                  type: "occlusion",
+                  count: command.queryCount,
+                }),
+                count: command.queryCount,
+                token: command.queryToken,
+                used: new Uint8Array(command.queryCount),
+              };
+              occlusionReadbacks.push(occlusion);
+              descriptor.occlusionQuerySet = occlusion.querySet;
+            }
             pass = encoder.beginRenderPass(descriptor);
             break;
           }
@@ -2271,8 +2345,43 @@ class GpuEngine {
             pass.drawIndexed(...command.values);
             break;
           case 21:
+            if (occlusion) {
+              // Unused indices run an empty query, so every result is zero
+              // instead of depending on how unwritten queries resolve.
+              occlusion.used.forEach((used, query) => {
+                if (!used) {
+                  pass.beginOcclusionQuery(query);
+                  pass.endOcclusionQuery();
+                }
+              });
+            }
             pass.end();
             pass = null;
+            if (occlusion) {
+              const size = occlusion.count * 8;
+              occlusion.resolved = this.device.createBuffer({
+                size,
+                usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+              });
+              occlusion.results = this.device.createBuffer({
+                size,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+              });
+              encoder.resolveQuerySet(
+                occlusion.querySet, 0, occlusion.count, occlusion.resolved, 0
+              );
+              encoder.copyBufferToBuffer(
+                occlusion.resolved, 0, occlusion.results, 0, size
+              );
+              occlusion = null;
+            }
+            break;
+          case 32:
+            pass.beginOcclusionQuery(command.query);
+            occlusion.used[command.query] = 1;
+            break;
+          case 33:
+            pass.endOcclusionQuery();
             break;
           case 22:
             encoder ||= this.device.createCommandEncoder();
@@ -2386,6 +2495,7 @@ class GpuEngine {
     } catch (error) {
       created.forEach(entry => entry.value?.destroy?.());
       readback?.destroy();
+      destroyOcclusionReadbacks(occlusionReadbacks);
       void this.device.popErrorScope();
       void this.device.popErrorScope();
       throw error;
@@ -2399,6 +2509,7 @@ class GpuEngine {
     const gpuError = outOfMemory || validation;
     if (gpuError) {
       readback?.destroy();
+      destroyOcclusionReadbacks(occlusionReadbacks);
       created.forEach(entry => entry.value?.destroy?.());
       this.emitBatchRejected(
         0xffffffff,
@@ -2431,6 +2542,7 @@ class GpuEngine {
       postMessage({ type: "test-readback", samples });
     }
     postBytes("event", makeEvent(5, batch.sequence));
+    this.deliverOcclusionResults(batch.sequence, occlusionReadbacks);
     if (!backgrounded && !this.backgrounded) {
       postMessage({ type: "presented", sequence: batch.sequence });
     }
@@ -2438,6 +2550,41 @@ class GpuEngine {
       this.testDeviceLossPending = false;
       this.device.destroy();
     }
+  }
+
+  /**
+   * Maps each pass's resolved results after the batch completion event and
+   * posts them in submission order without delaying later batches. Results
+   * of a reset, stopped or lost device are dropped.
+   */
+  deliverOcclusionResults(sequence, readbacks) {
+    if (!readbacks.length) {
+      return;
+    }
+    const epoch = this.occlusionEpoch;
+    for (const entry of readbacks) {
+      entry.querySet.destroy();
+      entry.resolved.destroy();
+    }
+    this.occlusionDelivery = this.occlusionDelivery.then(async () => {
+      for (const { token, count, results } of readbacks) {
+        try {
+          await results.mapAsync(GPUMapMode.READ);
+          if (epoch === this.occlusionEpoch) {
+            const payload = new Uint8Array(8 + count * 8);
+            const view = new DataView(payload.buffer);
+            view.setUint32(0, token, true);
+            view.setUint32(4, count, true);
+            payload.set(new Uint8Array(results.getMappedRange()), 8);
+            postBytes("event", makeEvent(9, sequence, payload));
+          }
+        } catch {
+          // A lost or destroyed device abandons its in-flight results.
+        } finally {
+          results.destroy();
+        }
+      }
+    });
   }
 
   async watchShader(entry, handle, sequence) {
@@ -2510,6 +2657,7 @@ class GpuEngine {
         this.resources.clear();
         this.handleSlots.clear();
         this.destroyBackgroundTexture();
+        this.occlusionEpoch++;
         this.pendingResize = null;
         this.lastSequence = 0;
       })
@@ -2522,6 +2670,7 @@ class GpuEngine {
   stop() {
     this.stopped = true;
     this.disposed = true;
+    this.occlusionEpoch++;
     for (const entry of this.resources.values()) {
       entry.value?.destroy?.();
     }
@@ -2530,6 +2679,14 @@ class GpuEngine {
     this.resources.clear();
     this.handleSlots.clear();
     this.device.destroy();
+  }
+}
+
+function destroyOcclusionReadbacks(readbacks) {
+  for (const entry of readbacks) {
+    entry.querySet.destroy();
+    entry.resolved?.destroy();
+    entry.results?.destroy();
   }
 }
 

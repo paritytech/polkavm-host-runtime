@@ -2607,7 +2607,7 @@ fn validate_gpu_event(bytes: &[u8]) -> Result<()> {
         || bytes.len() > gpu_wire::MAX_GPU_EVENT_BYTES
         || bytes[..4] != gpu_wire::GPU_EVENT_MAGIC
         || gpu_u16(bytes, 4) != Some(gpu_wire::GPU_WIRE_VERSION)
-        || !matches!(gpu_u16(bytes, 6), Some(1..=7))
+        || !matches!(gpu_u16(bytes, 6), Some(1..=7 | 9))
         || gpu_u32(bytes, 8) != Some(bytes.len() as u32)
         || gpu_u32(bytes, 12) != Some(0)
     {
@@ -2641,6 +2641,17 @@ fn validate_gpu_event(bytes: &[u8]) -> Result<()> {
                 || gpu_u16(payload, 26) != Some(0)
             {
                 return Err(anyhow!("invalid GPU surface-change event"));
+            }
+            Ok(())
+        }
+        9 => {
+            let count = gpu_u32(payload, 4).unwrap_or(0);
+            if count == 0
+                || count > gpu_wire::MAX_GPU_OCCLUSION_QUERIES_PER_BATCH
+                || payload.len()
+                    != gpu_wire::GPU_OCCLUSION_RESULTS_HEADER_BYTES + count as usize * 8
+            {
+                return Err(anyhow!("invalid GPU occlusion results"));
             }
             Ok(())
         }
@@ -3550,6 +3561,29 @@ mod tests {
             assert!(
                 validate_gpu_event(&event).is_err(),
                 "invalid scale {scale:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn occlusion_results_carry_exactly_one_count_per_declared_query() {
+        let event = |count: u32, results: usize| {
+            let mut event = vec![0; gpu_wire::GPU_EVENT_HEADER_BYTES + 8 + results * 8];
+            event[..4].copy_from_slice(&gpu_wire::GPU_EVENT_MAGIC);
+            event[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+            event[6..8]
+                .copy_from_slice(&(gpu_wire::GpuEventType::OcclusionResults as u16).to_le_bytes());
+            let event_len = event.len() as u32;
+            event[8..12].copy_from_slice(&event_len.to_le_bytes());
+            event[28..32].copy_from_slice(&count.to_le_bytes());
+            event
+        };
+        validate_gpu_event(&event(3, 3)).unwrap();
+        validate_gpu_event(&event(4_096, 4_096)).unwrap();
+        for (count, results) in [(3, 2), (3, 4), (0, 0), (4_097, 4_097)] {
+            assert!(
+                validate_gpu_event(&event(count, results)).is_err(),
+                "{count} queries with {results} results"
             );
         }
     }

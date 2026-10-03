@@ -356,6 +356,45 @@ recorded after it in that pass. As in WebGPU, every pass starts with constant
 `0, 0, 0, 0`. Blend factors `12` (constant) and `13` (one minus constant) read
 this value; without the extension they always see zero.
 
+#### Occlusion queries
+
+Wire version 1 has a fourth additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `3` (value `8`) advertises
+it; an absent bit does not grant support.
+
+- `BeginRenderPass` (opcode 12) flag `128` declares occlusion queries for the
+  pass. It appends a `u32` query count and a guest-chosen `u32` token after
+  the payload's other fields, including any stencil clear value (payload 44
+  bytes, or 48 with flag `64`). The count is nonzero, and the counts of all
+  passes in one batch total at most 4,096. Payloads without the flag keep
+  their existing layout.
+- `BeginOcclusionQuery` (opcode 32) carries one `u32` query index, below the
+  pass's count. `EndOcclusionQuery` (opcode 33) has an empty payload. Both are
+  valid only inside a render pass that declared queries. As in WebGPU, queries
+  do not nest, each index begins at most once per pass, an end needs an open
+  query, and the pass MUST NOT end while a query is open. A violation rejects
+  the batch.
+
+After the batch completes, the Host resolves each declaring pass and reads its
+results back without delaying the batch or later submissions. It delivers one
+event `9` (occlusion results) per declaring pass, after that batch's
+`submission complete` event, in submission order. The event header carries
+the batch sequence. Its payload is:
+
+```text
+offset  type      meaning
+0       u32       token from BeginRenderPass
+4       u32       query count N
+8       N x u64   samples that passed the depth and stencil tests, by index
+```
+
+Zero means no sample passed; an index the pass never began reports zero.
+Guests SHOULD treat any nonzero value as visible, because backends may report
+a conservative count rather than the exact number of samples. Results of a
+batch whose device is lost or reset, or of a stopped execution, are not
+delivered. Native Hosts receive outstanding results from
+`NativeGpuRenderer::poll_events` as well as from later `execute` calls.
+
 ### WebGPU submission
 
 ```text
@@ -386,7 +425,8 @@ Return values are defined by the selected WebGPU contract. ABI v1 reserves:
 host_gpu_receive(pointer: u32, capacity: u32) -> i32
 ```
 
-The call reads the oldest queued WebGPU event.
+The call reads the oldest queued WebGPU event. Occlusion results (event `9`)
+are described with the occlusion-query extension.
 
 ```text
 > 0  event bytes written
