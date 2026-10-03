@@ -177,7 +177,8 @@ demonstrates routing and consent; it simulates delivery, not an emulator.
 `translate_partitioned(program, limits)`. Its `Limits` require maximum program
 bytes, read-write data, stack, and heap sizes. It contains no Host policy,
 application manifest parsing, Worker lifecycle, graphics renderer, or native
-engine dependency in production.
+engine dependency in production. The native runtime does not pull in the
+translator: it is a `wasm32` production dependency and a native test dependency.
 
 Both outputs retain the existing guest register/memory/gas/resumption contract.
 Partitioned output embeds `epoca.pvm.code-part` modules: instantiate the root,
