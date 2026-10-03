@@ -273,10 +273,12 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-Development versions are currently Rust `0.3.1` and browser
-`0.3.2-background.0`; this checkout is not a tagged release. The release generator
-deliberately refuses inconsistent versions, development-only `SOURCE` records,
-dirty source, stale embedded files, or mismatched compiler/engine provenance.
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.1`.
+See [the candidate release notes](RELEASE_NOTES.md) for changes, compatibility,
+artifact scope, and remaining downstream qualification. `SOURCE` names the
+intended release tag; version metadata alone is not evidence of publication.
+The release generator refuses an untagged or dirty checkout, inconsistent
+versions, stale embedded files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
 
 ## Security

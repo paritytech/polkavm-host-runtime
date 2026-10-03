@@ -51,7 +51,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_flags=()
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" artifacts/* \
             --verify-tag \
             --title "PolkaVM Host Runtime $GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md \
+            "${release_flags[@]}"
