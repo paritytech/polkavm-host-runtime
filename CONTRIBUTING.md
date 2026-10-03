@@ -64,7 +64,8 @@ to obtain a green result.
 Engine regression fixtures must use the existing `test_module_config()` helper
 when they require native execution: the default 4 KiB module page size is
 incompatible with Apple Silicon's 16 KiB host pages. Preserve the semantic
-assertions rather than skipping those backends.
+assertions rather than skipping those backends. Native JIT examples must also
+configure a 16 KiB module page size on macOS, as both runtime execution paths do.
 
 Keep guest bytecode encoding compatible during engine refreshes. Upstream
 `e68f2a60f4e6cbc9ea7b10e5cccbafc531c2f8f0` removed the non-legacy code-length

@@ -19,7 +19,7 @@ concurrency:
 
 # This is a qualification candidate, not the runtime's production dependency pin.
 env:
-  ENGINE_REVISION: 65bec622fbb6a081eac1a2cb2f050f60fef35890
+  ENGINE_REVISION: 642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5
   RUSTC_WRAPPER: ""
   CARGO_TERM_COLOR: always
 
@@ -27,7 +27,7 @@ jobs:
   native:
     name: Engine / ${{ matrix.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         runner: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.runner }}
@@ -70,10 +70,6 @@ jobs:
           PY
       - name: Verify semantics, gas, traps, memory, recycling, and backends
         run: cargo +1.97.1 test --locked -p polkavm --features generic-sandbox
-      - name: Verify assembler, decoder, linker, and specification tools
-        run: cargo +1.97.1 test --locked -p polkavm-assembler -p polkavm-common -p polkavm-linker -p spectool
-      - name: Check browser engine compilation
-        run: cargo +1.97.1 check --locked --target wasm32-unknown-unknown -p polkavm --no-default-features --lib
       - name: Execute real guest with native JIT forced
         shell: bash
         env:
@@ -115,3 +111,7 @@ jobs:
           codesign --force --sign - --options runtime --entitlements "$RUNNER_TEMP/jit-entitlements.plist" "$test_binary"
           "$test_binary" tests::compiler_generic_ --test-threads=1
           "$test_binary" tests::tracing_generic_ --test-threads=1
+      - name: Verify assembler, decoder, linker, and specification tools
+        run: cargo +1.97.1 test --locked -p polkavm-assembler -p polkavm-common -p polkavm-linker -p spectool
+      - name: Check browser engine compilation
+        run: cargo +1.97.1 check --locked --target wasm32-unknown-unknown -p polkavm --no-default-features --lib
