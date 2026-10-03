@@ -3,7 +3,7 @@ name: Runtime CI
 on:
   pull_request:
   push:
-    branches: [main, fix/runtime-readiness-main]
+    branches: [main]
 
 permissions:
   contents: read

@@ -88,10 +88,11 @@ function syscallModule() {
 const module = syscallModule();
 
 function guest(bytes) {
+  const logs = [];
   const runtime = new globalThis.TranslatedPolkaVmRuntime(
     { module, parts: [] },
     [{ path: "input.bin", bytes: new Uint8Array(bytes) }],
-    () => {},
+    (event) => { if (event.type === "log") logs.push(event.message); },
     1_000_000,
     false,
     "framebuffer",
@@ -112,12 +113,16 @@ function guest(bytes) {
   memory.fill(0xcc, OUTPUT_OFFSET, OUTPUT_OFFSET + 32);
   return {
     memory,
+    logs,
     vector(index, address, length, offset = IOV_OFFSET) {
       view.setBigUint64(offset + index * 16, BigInt(address), true);
       view.setBigUint64(offset + index * 16 + 8, BigInt(length), true);
     },
     readv(count, offset = IOV_OFFSET) {
       return syscall(65, fd, RW_ADDRESS + offset, count);
+    },
+    writev(count, offset = IOV_OFFSET, fd = 1) {
+      return syscall(66, fd, RW_ADDRESS + offset, count);
     },
     read(length) {
       return syscall(63, fd, RW_ADDRESS + OUTPUT_OFFSET + 16, length);
@@ -169,4 +174,50 @@ test("CoreVM readv returns EFAULT without consuming data when no bytes were read
   assert.equal(runtime.readv(2), -14n);
   assert.equal(runtime.read(3), 3n);
   assert.deepEqual(runtime.memory.slice(OUTPUT_OFFSET + 16, OUTPUT_OFFSET + 19), new Uint8Array([1, 2, 3]));
+});
+
+test("CoreVM readv preserves progress when only the later descriptor address is readable", () => {
+  const runtime = guest([1, 2, 3]);
+  runtime.vector(0, RW_ADDRESS + OUTPUT_OFFSET, 2, MEMORY_BYTES - 24);
+  assert.equal(runtime.readv(2, MEMORY_BYTES - 24), 2n);
+  assert.equal(runtime.read(2), 1n);
+  assert.equal(runtime.memory[OUTPUT_OFFSET + 16], 3);
+});
+
+test("CoreVM readv rejects non-canonical buffers without consuming the remaining file", () => {
+  const runtime = guest([1, 2, 3]);
+  runtime.vector(0, RW_ADDRESS + OUTPUT_OFFSET, 2);
+  runtime.vector(1, 0x100000000 + RW_ADDRESS + OUTPUT_OFFSET, 1);
+  assert.equal(runtime.readv(2), 2n);
+  assert.equal(runtime.read(2), 1n);
+  assert.equal(runtime.memory[OUTPUT_OFFSET + 16], 3);
+});
+
+test("CoreVM writev preserves output and partial progress after later faults", () => {
+  for (const [offset, badBuffer] of [
+    [MEMORY_BYTES - 16, 0],
+    [MEMORY_BYTES - 24, 0],
+    [IOV_OFFSET, 0],
+    [IOV_OFFSET, 0x100000000 + RW_ADDRESS + OUTPUT_OFFSET],
+  ]) {
+    const runtime = guest([]);
+    runtime.memory.set(encoder.encode("ok"), OUTPUT_OFFSET);
+    runtime.vector(0, RW_ADDRESS + OUTPUT_OFFSET, 2, offset);
+    if (offset === IOV_OFFSET) runtime.vector(1, badBuffer, 2);
+    assert.equal(runtime.writev(2, offset), 2n);
+    assert.deepEqual(runtime.logs, ["ok"]);
+    assert.equal(runtime.writev(1, offset, 2), 2n);
+    assert.deepEqual(runtime.logs, ["ok", "ok"]);
+  }
+});
+
+test("CoreVM writev returns errors without output when no vector made progress", () => {
+  const runtime = guest([]);
+  assert.equal(runtime.writev(1, MEMORY_BYTES), -14n);
+  assert.equal(runtime.writev(1, MEMORY_BYTES - 8), -14n);
+  runtime.vector(0, RW_ADDRESS + OUTPUT_OFFSET, 0);
+  runtime.vector(1, 0, 1);
+  assert.equal(runtime.writev(2), -14n);
+  assert.equal(runtime.writev(1, IOV_OFFSET, 3), -9n);
+  assert.deepEqual(runtime.logs, []);
 });

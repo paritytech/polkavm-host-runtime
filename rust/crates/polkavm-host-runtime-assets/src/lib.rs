@@ -21,7 +21,7 @@ pub fn browser_assets() -> &'static [BrowserAsset] {
     &ASSETS
 }
 
-const ASSETS: [BrowserAsset; 14] = [
+const ASSETS: [BrowserAsset; 15] = [
     BrowserAsset {
         path: "LICENSE-MPL-2.0",
         content_type: "text/plain",
@@ -32,7 +32,7 @@ const ASSETS: [BrowserAsset; 14] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "7c2979a7bcb3ed83347250ef314205f36548962624a634a8dbc0d6efb127d7ca",
+        sha256: "ee1a88ed68a39be68c3e7eabff7be09f6d71eb78b2347f36e2673f71778ea2a1",
     },
     BrowserAsset {
         path: "THIRD_PARTY_LICENSES.txt",
@@ -47,22 +47,28 @@ const ASSETS: [BrowserAsset; 14] = [
         sha256: "9c0e912f1ba2853c28497f21c6bed1aa17dd11939d01cd3d59656bec5fa32ce1",
     },
     BrowserAsset {
+        path: "file-input-router.d.ts",
+        content_type: "text/plain",
+        bytes: include_bytes!("../assets/file-input-router.d.ts"),
+        sha256: "efe631e78c73d2596b2ffae17309778f19451d0d00ed8fdead7d5b4c2624f74a",
+    },
+    BrowserAsset {
         path: "file-input-router.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/file-input-router.js"),
-        sha256: "324bff516e76e7471782f70e283460be9b02aa90d2910146684f5c93416d4ac0",
+        sha256: "c3ebe2241989c92b9bb9badf48ed5280fd78ae32ad2367149ec7604334872652",
     },
     BrowserAsset {
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "de0311b7d3212eb0a926d8cc85765dc39c64811e9f2a5c1b7a11d5e7531c742b",
+        sha256: "f8c2bd2eb00ea6747a2b3c3ba396802f6f2bb4ffb86ef35d171753cbfa9f0e77",
     },
     BrowserAsset {
         path: "polkavm-computer.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-computer.js"),
-        sha256: "d16fb4c2898b2d04671103e0c193d6e21cbb12378c1cd9191ead47b022ca5878",
+        sha256: "20470c948f358926a705be96ebef6b84f25fe686165e05d988ac9aa5b8127142",
     },
     BrowserAsset {
         path: "polkavm-gpu-worker.js",

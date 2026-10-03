@@ -28,6 +28,9 @@ test("browser runtime artifacts match their published checksums", async () => {
     "polkavm-computer.js",
     "session.js",
     "session.d.ts",
+    "file-input-router.js",
+    "file-input-router.d.ts",
+    "LICENSE-MPL-2.0",
     "THIRD_PARTY_NOTICES.md",
     "THIRD_PARTY_LICENSES.txt",
   ]) {

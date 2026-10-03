@@ -110,9 +110,14 @@ pipelines, plus resources referenced by an in-flight batch. A rejected batch is
 not transactional: earlier successful commands and their charges remain.
 These checks do not isolate the Host from native graphics-driver faults.
 
-The computer supervisor shares one bounded resumption budget across foreground,
-background, and nested workspace processes per Host turn. Budget exhaustion
-yields to the Host without discarding output or child state.
+The Rust and browser computer supervisors share one 8,192-resumption budget across
+foreground, background, and nested workspace processes per Host turn. Budget
+exhaustion yields without discarding output, queued input, child state, or pending
+package resolution. Repeated child faults consume that same budget.
+
+Native and translated CoreVM vectored I/O preserve completed bytes when a later
+vector faults. A descriptor fault before any progress returns `EFAULT` rather
+than terminating the guest; short reads and writes stop before later vectors.
 
 ## Direct native embedding
 
@@ -165,10 +170,15 @@ It loads the real fixture, renders its pixels, and exposes pause, background,
 and stop controls. Deployments must serve the Worker and Wasm URLs allowed by
 their CSP; do not mix files from different runtime revisions.
 
-The `./file-input-router` subpath routes selected-file metadata to validated
-`capabilities.fileInput` handlers. Bytes are read only after Host consent and
-delivered as bounded launch assets. The
-[file-input prototype](js/packages/polkavm-browser-runtime/prototype/file-input.html)
+The typed `./file-input-router` subpath routes selected-file metadata to validated
+`capabilities.fileInput` handlers. Its 128 MiB per-file ceiling matches native
+manifest validation and browser launch assets. An absent or `null` capability
+registers no handlers; malformed declarations are rejected, not silently skipped.
+Handler type lists may be omitted but not `null`, and handlers require the runtime
+entrypoint so their mount paths cannot collide with it. Control setup throws for
+malformed registrations; delivery errors return a `rejected` result.
+Bytes are read only after Host consent and delivered as bounded launch assets.
+The [file-input prototype](js/packages/polkavm-browser-runtime/prototype/file-input.html)
 demonstrates routing and consent; it simulates delivery, not an emulator.
 
 ## Standalone compiler boundary

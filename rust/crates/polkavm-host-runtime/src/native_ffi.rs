@@ -683,7 +683,10 @@ impl NativePolkaVmRuntime {
         Ok(self.lock()?.take_log())
     }
 
-    /// Whether a CoreVM guest completed with exit status zero.
+    /// Whether a CoreVM guest exited successfully or the runtime was stopped.
+    ///
+    /// Stopping includes explicit cancellation and execution errors; this is not
+    /// a success-status check.
     pub fn is_exited(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.is_exited())
     }

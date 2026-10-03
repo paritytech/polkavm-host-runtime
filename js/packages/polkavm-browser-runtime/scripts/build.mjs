@@ -100,7 +100,7 @@ await copyFile(
   resolve(source, "polkavm-computer.js"),
   resolve(dist, "polkavm-computer.js"),
 );
-for (const file of ["session.js", "session.d.ts", "file-input-router.js"]) {
+for (const file of ["session.js", "session.d.ts", "file-input-router.js", "file-input-router.d.ts"]) {
   await copyFile(resolve(source, file), resolve(dist, file));
 }
 await copyFile(
@@ -137,6 +137,7 @@ const files = [
   "session.js",
   "session.d.ts",
   "file-input-router.js",
+  "file-input-router.d.ts",
   "LICENSE-MPL-2.0",
   "THIRD_PARTY_NOTICES.md",
   "THIRD_PARTY_LICENSES.txt",

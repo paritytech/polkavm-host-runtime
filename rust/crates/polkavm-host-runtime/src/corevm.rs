@@ -764,6 +764,21 @@ impl Vm {
         fd.position
     }
 
+    fn read_iovec(&mut self, address: u64) -> Result<Option<(u64, u64)>, String> {
+        // The translated ABI wraps each descriptor-field address to 32 bits.
+        let result = self.instance.read_u64(address as u32).and_then(|buffer| {
+            self.instance
+                .read_u64(address.wrapping_add(8) as u32)
+                .map(|length| (buffer, length))
+        });
+        match result {
+            Ok(vector) => Ok(Some(vector)),
+            Err(MemoryAccessError::Error(error)) => Err(error.into()),
+            Err(MemoryAccessError::OutOfRangeAccess { .. })
+            | Err(MemoryAccessError::MemoryLimitReached) => Ok(None),
+        }
+    }
+
     fn handle_read(&mut self, fd: u64, address: u64, length: u64) -> Result<u64, String> {
         log::trace!("Read: fd={fd}, address=0x{address:x}, length={length}");
 
@@ -1247,14 +1262,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_read = self.handle_read(a1, address, length)?;
                                 if (bytes_read as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_read);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_read
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 
@@ -1277,14 +1307,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_written = self.handle_write(a1, address, length)?;
                                 if (bytes_written as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_written);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_written
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 

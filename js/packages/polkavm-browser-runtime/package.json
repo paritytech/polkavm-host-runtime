@@ -24,7 +24,11 @@
     "./worker": "./dist/polkavm-worker.js",
     "./worker-entry": "./dist/polkavm-wasm-worker-entry.js",
     "./translator": "./dist/polkavm-wasm-translated.js",
-    "./file-input-router": "./dist/file-input-router.js",
+    "./file-input-router": {
+      "types": "./dist/file-input-router.d.ts",
+      "import": "./dist/file-input-router.js",
+      "default": "./dist/file-input-router.js"
+    },
     "./runtime-core": "./dist/polkavm-runtime-core.js",
     "./gpu-worker": "./dist/polkavm-gpu-worker.js",
     "./computer": "./dist/polkavm-computer.js",

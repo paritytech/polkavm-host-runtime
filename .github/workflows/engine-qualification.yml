@@ -2,7 +2,7 @@ name: Engine candidate qualification
 
 on:
   push:
-    branches: [fix/runtime-readiness-main]
+    branches: [main]
     paths:
       - .github/workflows/engine-qualification.yml
   pull_request:

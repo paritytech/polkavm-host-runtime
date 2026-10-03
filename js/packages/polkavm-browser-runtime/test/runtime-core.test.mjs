@@ -220,11 +220,11 @@ function controlledTicks(t) {
   return {
     ticks,
     timers,
-    controlTimers() {
+    controlTimers(dispatch = (callback) => callback()) {
       // Install after asynchronous Wasm startup; waitForMessage uses timers.
-      t.mock.method(globalThis, "setTimeout", (callback) => {
+      t.mock.method(globalThis, "setTimeout", (callback, delay = 0) => {
         const id = ++nextTimer;
-        timers.set(id, callback);
+        timers.set(id, () => dispatch(callback, delay));
         return id;
       });
       t.mock.method(globalThis, "clearTimeout", (id) => timers.delete(id));
@@ -448,15 +448,11 @@ test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) =>
       "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
     ),
   );
+  const scheduler = controlledTicks(t);
   const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
-  const originalSetTimeout = globalThis.setTimeout;
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
   const updateStartedAt = [];
-  t.mock.method(
-    globalThis,
-    "setTimeout",
-    (callback, delay = 0, ...args) =>
-      originalSetTimeout(callback, delay > 0 ? delay + 3 : delay, ...args),
-  );
   globalThis.TranslatedPolkaVmRuntime = class extends originalRuntime {
     update(timeMs) {
       updateStartedAt.push(performance.now());
@@ -477,16 +473,23 @@ test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) =>
       },
     });
     await waitForMessage(messages, "ready");
-    const deadline = Date.now() + 2000;
-    while (updateStartedAt.length < 31 && Date.now() < deadline) {
-      await new Promise((resolve) => originalSetTimeout(resolve, 5));
+    scheduler.controlTimers((callback, delay) => {
+      now += delay + 3;
+      callback();
+    });
+    for (let update = 0; update < 31; update++) {
+      assert.equal(scheduler.ticks.length, 1, "continuous updates stalled");
+      scheduler.drain();
+      if (update === 30) break;
+      assert.equal(scheduler.timers.size, 1);
+      const [id, callback] = scheduler.timers.entries().next().value;
+      scheduler.timers.delete(id);
+      callback();
     }
-    assert.ok(updateStartedAt.length >= 31, "continuous updates stalled");
     const elapsed = updateStartedAt[30] - updateStartedAt[0];
-    assert.ok(elapsed >= 450, `continuous updates ran too fast: ${elapsed} ms`);
     assert.ok(
-      elapsed < 550,
-      `timer dispatch latency accumulated across updates: ${elapsed} ms`,
+      Math.abs(elapsed - 503) < 1e-6,
+      `thirty frame intervals must accumulate only one 3 ms dispatch delay: ${elapsed}`,
     );
   } finally {
     receiver.onmessage({ data: { type: "stop" } });

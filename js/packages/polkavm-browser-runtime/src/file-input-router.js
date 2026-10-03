@@ -1,4 +1,4 @@
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_HANDLERS = 16;
 const MAX_PATH_BYTES = 1024;
 
@@ -18,7 +18,11 @@ function normalizedHandlers(product) {
     fail("product registration requires an id and manifest");
   }
   const capability = product.manifest.capabilities?.fileInput;
-  if (capability === undefined) return [];
+  if (capability === undefined || capability === null) return [];
+  const entrypoint = product.manifest.runtime?.entrypoint;
+  if (typeof entrypoint !== "string" || entrypoint.length === 0) {
+    fail(`${product.id} requires a runtime entrypoint`);
+  }
   if (
     !capability ||
     typeof capability !== "object" ||
@@ -64,8 +68,8 @@ function normalizedHandlers(product) {
     ) {
       fail(`${product.id}/${handler.id} has an invalid label`);
     }
-    const extensions = handler.extensions ?? [];
-    const mediaTypes = handler.mediaTypes ?? [];
+    const extensions = handler.extensions === undefined ? [] : handler.extensions;
+    const mediaTypes = handler.mediaTypes === undefined ? [] : handler.mediaTypes;
     if (!Array.isArray(extensions) || !Array.isArray(mediaTypes)) {
       fail(`${product.id}/${handler.id} has invalid accepted types`);
     }
@@ -104,7 +108,7 @@ function normalizedHandlers(product) {
       handler.mountPath.includes("\\") ||
       handler.mountPath.split("/").some((part) => !part || part === "." || part === "..") ||
       mountPaths.has(handler.mountPath) ||
-      handler.mountPath === product.manifest.runtime?.entrypoint
+      handler.mountPath === entrypoint
     ) {
       fail(`${product.id}/${handler.id} has an invalid or duplicate mount path`);
     }

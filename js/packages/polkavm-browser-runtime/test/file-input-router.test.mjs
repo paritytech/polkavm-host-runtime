@@ -57,6 +57,57 @@ test("routes file metadata to matching registered products", () => {
   assert.deepEqual(routeFileInput([supafaust], file("game.nes")), []);
 });
 
+test("routes files up to the runtime asset ceiling and rejects larger declarations", () => {
+  const maxBytes = 128 * 1024 * 1024;
+  const handler = { ...supafaust.manifest.capabilities.fileInput.handlers[0], maxBytes };
+  const target = product("large-files", [handler]);
+  const selected = { name: "large.sfc", size: maxBytes, type: "" };
+  assert.deepEqual(
+    routeFileInput([target], selected).map(({ product }) => product.id),
+    ["large-files"],
+  );
+  assert.deepEqual(routeFileInput([target], { ...selected, size: maxBytes + 1 }), []);
+  handler.maxBytes += 1;
+  assert.throws(() => routeFileInput([target], selected), /invalid maximum size/);
+});
+
+test("a null optional fileInput capability does not disable other products", async () => {
+  const products = [
+    { id: "no-files", manifest: { capabilities: { fileInput: null } } },
+    supafaust,
+  ];
+  const selected = file();
+  assert.deepEqual(
+    routeFileInput(products, selected).map(({ product }) => product.id),
+    ["supafaust"],
+  );
+  assert.equal(filePickerAccept(products), filePickerAccept([supafaust]));
+  const result = await deliverFileInput({
+    products,
+    file: selected,
+    confirmDelivery: async () => false,
+    launchProduct: async () => assert.fail("declined delivery must not launch"),
+  });
+  assert.equal(result.status, "declined");
+  assert.equal(selected.reads, 0);
+});
+
+test("rejects explicit null type lists instead of treating them as omitted", () => {
+  for (const field of ["extensions", "mediaTypes"]) {
+    const target = structuredClone(supafaust);
+    target.manifest.capabilities.fileInput.handlers[0][field] = null;
+    assert.throws(() => routeFileInput([target], file()), /invalid accepted types/);
+  }
+});
+
+test("requires an entrypoint before validating file mount collisions", () => {
+  const target = structuredClone(supafaust);
+  delete target.manifest.runtime;
+  assert.throws(() => routeFileInput([target], file()), /entrypoint/);
+  target.manifest.runtime = { entrypoint: "game/cartridge.sfc" };
+  assert.throws(() => routeFileInput([target], file()), /mount path/);
+});
+
 test("declining consent never reads or delivers file bytes", async () => {
   const selected = file();
   let launches = 0;
