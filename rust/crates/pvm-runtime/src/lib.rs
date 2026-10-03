@@ -23,8 +23,6 @@ mod tri2d;
 mod ui;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
-#[cfg(any(target_arch = "wasm32", test))]
-mod wasm_codegen;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 pub use native_ffi::*;

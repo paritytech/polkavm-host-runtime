@@ -971,12 +971,11 @@ dependencies = [
  "pvm-gpu-wire",
  "pvm-motion-wire",
  "pvm-ui-wire",
+ "pvm-wasm-compiler",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "uniffi",
- "wasm-encoder",
- "wasmi",
  "wasmparser 0.240.0",
  "wgpu",
 ]
@@ -991,6 +990,18 @@ dependencies = [
 [[package]]
 name = "pvm-ui-wire"
 version = "0.1.10"
+
+[[package]]
+name = "pvm-wasm-compiler"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "polkavm 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=e06cce9da5c6d3f72458168876ea304e27992094)",
+ "polkavm-common 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=3df1d0309c4c81a1aad0a755d83570d203bba1d9)",
+ "polkavm-common 0.37.0 (git+https://github.com/paritytech/polkavm.git?rev=e06cce9da5c6d3f72458168876ea304e27992094)",
+ "wasm-encoder",
+ "wasmi",
+]
 
 [[package]]
 name = "quote"

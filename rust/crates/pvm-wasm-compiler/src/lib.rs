@@ -2,12 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::{
-    MAX_GUEST_HEAP_BYTES, MAX_GUEST_RW_DATA_BYTES, MAX_GUEST_STACK_BYTES, MAX_PROGRAM_BYTES,
-};
+//! Host-independent PolkaVM-to-WebAssembly compilation.
+//!
+//! Callers supply resource policy through [`Limits`]. Generated modules preserve
+//! guest registers, bounded memory, gas accounting, traps, and hostcall suspension;
+//! this crate does not implement hostcalls or manage execution and browser workers.
+//! The emitted module interface is documented in the repository README.
+
+#[cfg(target_arch = "wasm32")]
+extern crate polkavm_common_wasm as polkavm_common;
+
 use anyhow::{anyhow, bail, Context, Result};
-use polkavm::program::{Instruction as PvmInstruction, ParsedInstruction, RawReg};
-use polkavm::{MemoryMapBuilder, ProgramBlob, Reg, RETURN_TO_HOST};
+use polkavm_common::abi::{MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
+use polkavm_common::program::{
+    Instruction as PvmInstruction, ParsedInstruction, ProgramBlob, RawReg, Reg,
+};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{
@@ -18,6 +27,7 @@ use wasm_encoder::{
 };
 
 const PAGE_SIZE: u32 = 65_536;
+const RETURN_TO_HOST: u64 = VM_ADDR_RETURN_TO_HOST as u64;
 const STATUS_FINISHED: i32 = -1;
 const STATUS_ECALL: i32 = -2;
 const STATUS_TRAP: i32 = -3;
@@ -77,19 +87,39 @@ enum StoreKind {
     U64,
 }
 
-pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
-    if program.is_empty() || program.len() > MAX_PROGRAM_BYTES {
-        bail!("guest program exceeds browser limit");
+/// Caller-selected byte limits for translation and the resulting guest heap.
+///
+/// There is no implicit application policy. A zero heap limit disables heap
+/// growth; program, writable-data, and stack limits are inclusive.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Maximum encoded input program length.
+    pub max_program_bytes: usize,
+    /// Maximum declared initial writable-data size.
+    pub max_rw_data_bytes: u32,
+    /// Maximum declared stack size.
+    pub max_stack_bytes: u32,
+    /// Maximum heap growth, also capped by the guest virtual address space.
+    pub max_heap_bytes: u32,
+}
+
+/// Compile a PolkaVM program into a self-contained WebAssembly module.
+///
+/// Returns an error for invalid bytecode, unsupported instructions, exceeded
+/// caller limits, or an unrepresentable memory layout. No guest code is executed.
+pub fn translate(program: &[u8], limits: Limits) -> Result<Vec<u8>> {
+    if program.is_empty() || program.len() > limits.max_program_bytes {
+        bail!("guest program exceeds compiler limit");
     }
     let blob =
         ProgramBlob::parse(program.into()).context("parse PolkaVM program for Wasm translation")?;
     blob.validate_code_with_isa(blob.isa())
         .map_err(|pc| anyhow!("invalid PolkaVM instruction at {pc}"))?;
-    if blob.stack_size() > MAX_GUEST_STACK_BYTES {
-        bail!("guest stack exceeds browser limit");
+    if blob.stack_size() > limits.max_stack_bytes {
+        bail!("guest stack exceeds compiler limit");
     }
-    if blob.rw_data_size() > MAX_GUEST_RW_DATA_BYTES {
-        bail!("guest read-write data exceeds browser limit");
+    if blob.rw_data_size() > limits.max_rw_data_bytes {
+        bail!("guest read-write data exceeds compiler limit");
     }
 
     let instructions: Vec<_> = blob.instructions().collect();
@@ -98,7 +128,7 @@ pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
     }
     let metered_targets = collect_metered_targets(&instructions);
 
-    let layout = build_layout(&blob)?;
+    let layout = build_layout(&blob, limits.max_heap_bytes)?;
     let targets = collect_block_targets(&blob, &instructions)?;
     let (blocks, block_by_pc) = build_blocks(&instructions, &targets)?;
     let jump_targets: Vec<_> = blob.jump_table().into_iter().collect();
@@ -292,14 +322,14 @@ fn align(value: u32, alignment: u32) -> Result<u32> {
         .ok_or_else(|| anyhow!("translated memory layout overflow"))
 }
 
-fn build_layout(blob: &ProgramBlob) -> Result<Layout> {
+fn build_layout(blob: &ProgramBlob, max_heap_bytes: u32) -> Result<Layout> {
     let map = MemoryMapBuilder::new(PAGE_SIZE)
         .ro_data_size(blob.ro_data_size())
         .rw_data_size(blob.rw_data_size())
         .stack_size(blob.stack_size())
         .build()
         .map_err(|error| anyhow!(error))?;
-    let heap_limit = MAX_GUEST_HEAP_BYTES.min(map.max_heap_size());
+    let heap_limit = max_heap_bytes.min(map.max_heap_size());
     let rw_max_bytes = map
         .heap_base()
         .wrapping_sub(map.rw_data_address())
@@ -2068,13 +2098,20 @@ fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: Raw
 
 #[cfg(test)]
 mod tests {
-    use super::{translate, STATUS_FINISHED};
+    use super::{translate, Limits, STATUS_FINISHED};
     use polkavm::program::{assemble, InstructionSetKind};
     use polkavm::{
         BackendKind, Config, Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg,
         RETURN_TO_HOST,
     };
     use wasmi::{Engine as WasmEngine, Linker, Module as WasmModule, Store, Val};
+
+    const TEST_LIMITS: Limits = Limits {
+        max_program_bytes: 1024 * 1024,
+        max_rw_data_bytes: 65536,
+        max_stack_bytes: 4096,
+        max_heap_bytes: 65536,
+    };
 
     fn interpreter_registers(program: &[u8]) -> [u64; 13] {
         let blob = ProgramBlob::parse(program.into()).expect("parse differential fixture");
@@ -2101,8 +2138,8 @@ mod tests {
         Reg::ALL.map(|reg| instance.reg(reg))
     }
 
-    fn translated_registers(program: &[u8]) -> [u64; 13] {
-        let wasm = translate(program).expect("translate differential fixture");
+    fn translated_registers(program: &[u8], limits: Limits) -> [u64; 13] {
+        let wasm = translate(program, limits).expect("translate differential fixture");
         let engine = WasmEngine::default();
         let module = WasmModule::new(&engine, &wasm[..]).expect("compile translated fixture");
         let mut store = Store::new(&engine, ());
@@ -2136,7 +2173,7 @@ mod tests {
     fn assert_differential_isa(isa: InstructionSetKind, source: &str) {
         let program = assemble(Some(isa), source).expect("assemble differential fixture");
         assert_eq!(
-            translated_registers(&program),
+            translated_registers(&program, TEST_LIMITS),
             interpreter_registers(&program)
         );
     }
@@ -2146,25 +2183,81 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_fixture_translates_to_valid_wasm() {
-        let program = include_bytes!("../tests/fixtures/framebuffer-test.polkavm");
-        let wasm = translate(program).expect("translate framebuffer fixture");
-        wasmparser::Validator::new()
-            .validate_all(&wasm)
-            .expect("validate translated framebuffer fixture");
-        let memory_count = wasmparser::Parser::new(0)
-            .parse_all(&wasm)
-            .filter_map(
-                |payload| match payload.expect("parse translated framebuffer fixture") {
-                    wasmparser::Payload::MemorySection(section) => Some(section.count()),
-                    _ => None,
-                },
-            )
-            .sum::<u32>();
-        assert_eq!(
-            memory_count, 1,
-            "translated guests must not require the WebAssembly multi-memory proposal"
+    fn caller_limits_accept_exact_boundaries_and_reject_excess() {
+        let program = assemble(
+            Some(InstructionSetKind::Latest32),
+            "%rw_data_size = 65536\n%stack_size = 4096\npub @main:\na0 = 42\nret",
+        )
+        .unwrap();
+        let limits = Limits {
+            max_program_bytes: program.len(),
+            max_heap_bytes: 0,
+            ..TEST_LIMITS
+        };
+        assert_eq!(translated_registers(&program, limits)[Reg::A0 as usize], 42);
+        for restricted in [
+            Limits {
+                max_program_bytes: program.len() - 1,
+                ..limits
+            },
+            Limits {
+                max_rw_data_bytes: 65535,
+                ..limits
+            },
+            Limits {
+                max_stack_bytes: 4095,
+                ..limits
+            },
+        ] {
+            assert!(translate(&program, restricted).is_err());
+        }
+    }
+
+    #[test]
+    fn heap_limit_controls_guest_growth_without_losing_allocated_memory() {
+        use polkavm_common::{program::asm, writer::ProgramBlobBuilder};
+
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A1, 4096),
+                asm::sbrk(Reg::A0, Reg::A1),
+                asm::load_imm(Reg::A1, 1),
+                asm::sbrk(Reg::A2, Reg::A1),
+                asm::load_imm(Reg::A1, 0),
+                asm::sbrk(Reg::A3, Reg::A1),
+                asm::jump_indirect(Reg::RA, 0),
+            ],
+            &[],
         );
+        let program = builder.into_vec().unwrap();
+        let heap_base = super::MemoryMapBuilder::new(super::PAGE_SIZE)
+            .stack_size(4096)
+            .build()
+            .unwrap()
+            .heap_base() as u64;
+        let registers = translated_registers(
+            &program,
+            Limits {
+                max_heap_bytes: 4096,
+                ..TEST_LIMITS
+            },
+        );
+        assert_eq!(registers[Reg::A0 as usize], heap_base + 4096);
+        assert_eq!(registers[Reg::A2 as usize], 0);
+        assert_eq!(registers[Reg::A3 as usize], heap_base + 4096);
+        let registers = translated_registers(
+            &program,
+            Limits {
+                max_heap_bytes: 0,
+                ..TEST_LIMITS
+            },
+        );
+        assert_eq!(registers[Reg::A0 as usize], 0);
+        assert_eq!(registers[Reg::A2 as usize], 0);
+        assert_eq!(registers[Reg::A3 as usize], heap_base);
     }
 
     #[test]

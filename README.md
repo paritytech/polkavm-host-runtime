@@ -14,6 +14,7 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 ## Layout
 
 - `rust/crates/pvm-runtime`: execution, hostcalls, lifecycle, bounds, and native/wasm backends.
+- `rust/crates/pvm-wasm-compiler`: host-independent PolkaVM-to-WASM compiler with caller-supplied resource limits.
 - `rust/crates/pvm-gpu-wire`: bounded Tri2D and WebGPU wire protocol.
 - `rust/crates/pvm-motion-wire`: bounded motion-sample wire protocol.
 - `rust/crates/pvm-ui-wire`: bounded cursor, clipboard, navigation, and IME output protocol.
@@ -44,6 +45,32 @@ errors through `BatchRejected` events. Resource counts, aggregate buffer/texture
 bytes, and per-batch work are bounded. Resources retained by dependent objects
 remain charged after their guest handles are destroyed. A rejected batch is not
 transactional: successful earlier commands remain applied and charged.
+
+## Compiler boundary
+
+`pvm-wasm-compiler` exposes
+`translate(program: &[u8], limits: Limits) -> anyhow::Result<Vec<u8>>`.
+It parses and validates PolkaVM bytecode and emits WebAssembly without executing
+the guest. `Limits` specifies maximum encoded program, initial writable-data,
+stack, and heap sizes in bytes. Program/data/stack bounds are inclusive; a zero
+heap limit disables heap growth. Limits have no default application policy.
+
+The compiler owns instruction lowering, register and memory layout, gas
+accounting, traps, and hostcall suspension. Its production dependencies use
+`polkavm-common`, not the execution engine. The engine is a test-only dependency
+for interpreter/compiler differential checks. Native and WASM builds retain
+their existing immutable PolkaVM revisions.
+
+The emitted interface is unchanged: a single exported `memory`, register and
+execution-state globals, `pvm_begin`, `pvm_resume`, `pvm_set_gas`, and the
+`epoca.pvm.meta` custom section with `EPM2` metadata. These are the compiler's
+contract with its execution adapter, not the guest application ABI.
+
+`pvm-runtime` supplies the application limits at the browser translation entry
+point. JavaScript hostcalls, worker lifecycle, caching, graphics, and browser
+compilation remain in `pvm-browser-runtime`; App Kit continues to build guest
+programs rather than owning an execution backend. Compiler and execution-adapter
+changes must preserve this interface or update both together.
 
 ## Build and test
 

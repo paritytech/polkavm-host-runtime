@@ -152,7 +152,15 @@ pub extern "C" fn pvm_browser_staging_reserve(length: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn pvm_browser_translate_staged() -> u32 {
     status(|host| {
-        host.translation = crate::wasm_codegen::translate(&host.staging)?;
+        host.translation = pvm_wasm_compiler::translate(
+            &host.staging,
+            pvm_wasm_compiler::Limits {
+                max_program_bytes: crate::MAX_PROGRAM_BYTES,
+                max_rw_data_bytes: crate::MAX_GUEST_RW_DATA_BYTES,
+                max_stack_bytes: crate::MAX_GUEST_STACK_BYTES,
+                max_heap_bytes: crate::MAX_GUEST_HEAP_BYTES,
+            },
+        )?;
         Ok(())
     })
 }
