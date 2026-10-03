@@ -2,6 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Host-neutral computer execution and cooperative process supervision.
+//!
+//! Guest resumptions share a bounded host-turn budget across foreground,
+//! piped background, and independently supervised workspace processes.
+
 use crate::corevm::{Interruption, Vm};
 use crate::filesystem::{lock, FileSession, FilesystemMetadata};
 use anyhow::{anyhow, bail, Context, Result};
@@ -472,49 +477,83 @@ impl ComputerDevices {
 /// A spawn/wait/pipe operation awaiting supervisor resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildProcessRequest {
+    /// Starts a registered package without transferring terminal ownership.
     Spawn {
+        /// Host-authorized package name.
         package: String,
+        /// Arguments supplied after the child's package-name argument.
         arguments: Vec<String>,
     },
+    /// Polls an owned background process for its exit status.
     Wait {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
     },
+    /// Reads bytes produced by an owned background process.
     PipeRead {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
+        /// Guest memory address receiving the bytes.
         destination: u32,
+        /// Maximum number of bytes to copy.
         capacity: usize,
     },
+    /// Queues input bytes for an owned background process.
     PipeWrite {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
+        /// Bytes to queue, subject to available input capacity.
         bytes: Vec<u8>,
     },
+    /// Closes the input stream of an owned background process.
     PipeClose {
+        /// Process identifier returned by a successful spawn.
         pid: u32,
     },
+    /// Starts a separately supervised terminal pane for an authorized package.
     WorkspaceSpawn {
+        /// Host-authorized package name.
         package: String,
+        /// Arguments supplied after the package-name argument.
         arguments: Vec<String>,
+        /// Initial terminal width in character cells.
         columns: u32,
+        /// Initial terminal height in character cells.
         rows: u32,
     },
+    /// Queues input for a workspace child.
     WorkspaceSendInput {
+        /// Handle returned by a successful workspace spawn.
         handle: u32,
+        /// Bytes to queue, subject to available terminal input capacity.
         bytes: Vec<u8>,
     },
+    /// Reads terminal output from a workspace child.
     WorkspaceRead {
+        /// Handle returned by a successful workspace spawn.
         handle: u32,
+        /// Guest memory address receiving the bytes.
         destination: u32,
+        /// Maximum number of bytes to copy.
         capacity: usize,
     },
+    /// Updates a workspace child's terminal dimensions.
     WorkspaceResize {
+        /// Handle returned by a successful workspace spawn.
         handle: u32,
+        /// Terminal width in character cells.
         columns: u32,
+        /// Terminal height in character cells.
         rows: u32,
     },
+    /// Polls a workspace child without discarding unread output.
     WorkspaceWait {
+        /// Handle returned by a successful workspace spawn.
         handle: u32,
     },
+    /// Releases a workspace child and its terminal resources.
     WorkspaceClose {
+        /// Handle returned by a successful workspace spawn.
         handle: u32,
     },
 }
@@ -1145,16 +1184,26 @@ impl ComputerSupervisor {
     /// Exit status reported for a child that faulted (trap, gas, segfault).
     const FAULTED_CHILD_STATUS: i32 = 139;
 
-    /// Maximum contained child faults per `run()` before erroring out.
-    const MAX_FAULT_POPS_PER_RUN: usize = 32;
+    /// Maximum guest resumptions shared by every process in a host turn.
+    const MAX_INTERRUPTS_PER_RUN: usize = 8_192;
 
     /// Runs the foreground process until the system yields or the root exits.
     ///
     /// A fault in a child process (trap, out of gas) fails only that child:
     /// it is discarded and its parent resumes with status 139. Only a root
     /// fault propagates as an error.
+    ///
+    /// Each call permits at most 8,192 guest resumptions, including work
+    /// performed for pipe, wait, and workspace requests. Exhausting this budget
+    /// yields control to the Host; the next call continues without replaying
+    /// requests or discarding queued input and output.
     pub fn run(&mut self) -> Result<ComputerStatus> {
-        let result = self.run_inner();
+        let mut interrupts_remaining = Self::MAX_INTERRUPTS_PER_RUN;
+        self.run_with_budget(&mut interrupts_remaining)
+    }
+
+    fn run_with_budget(&mut self, interrupts_remaining: &mut usize) -> Result<ComputerStatus> {
+        let result = self.run_inner(interrupts_remaining);
         if result.is_err() {
             for process in &mut self.stack {
                 process.dispose();
@@ -1166,17 +1215,14 @@ impl ComputerSupervisor {
         result
     }
 
-    fn run_inner(&mut self) -> Result<ComputerStatus> {
+    fn run_inner(&mut self, interrupts_remaining: &mut usize) -> Result<ComputerStatus> {
         if self.pending_resolution.is_some() {
             // Idempotent while suspended: the embedder must provide or
             // reject the pending package before execution continues.
             return Ok(ComputerStatus::PackageRequested);
         }
-        // Bound the fault-containment path so a root that spawns
-        // immediately-faulting children in a loop cannot keep run() from
-        // returning control to the Host.
-        let mut fault_pops = 0usize;
-        loop {
+        while *interrupts_remaining > 0 {
+            *interrupts_remaining -= 1;
             let status = match self.foreground().run() {
                 Ok(status) => status,
                 Err(error) => {
@@ -1185,34 +1231,12 @@ impl ComputerSupervisor {
                         self.workspace_children.clear();
                         return Err(error);
                     }
-                    fault_pops += 1;
-                    if fault_pops > Self::MAX_FAULT_POPS_PER_RUN {
-                        for process in &mut self.stack {
-                            process.dispose();
-                        }
-                        self.background.clear();
-                        self.workspace_children.clear();
-                        return Err(error.context("children faulted repeatedly"));
-                    }
                     self.pop_foreground(Self::FAULTED_CHILD_STATUS)?;
                     continue;
                 }
             };
             match status {
-                ComputerStatus::Yielded => {
-                    // Surface a suspended workspace child's resolution once
-                    // the workspace guest has yielded; the embedder resolves
-                    // it before execution continues anywhere in the tree.
-                    if let Some(child) = self.workspace_children.iter().find(|child| {
-                        child.exit.is_none() && child.supervisor.pending_package().is_some()
-                    }) {
-                        self.pending_resolution = Some(PendingResolution::Child {
-                            handle: child.handle,
-                        });
-                        return Ok(ComputerStatus::PackageRequested);
-                    }
-                    return Ok(ComputerStatus::Yielded);
-                }
+                ComputerStatus::Yielded => return Ok(self.yield_status()),
                 ComputerStatus::SpawnRequested => {
                     let request = self.foreground().take_spawn_request();
                     let Some((package, arguments)) = request else {
@@ -1233,7 +1257,7 @@ impl ComputerSupervisor {
                     let Some(request) = request else {
                         bail!("child-request status without a pending request");
                     };
-                    self.handle_child_request(request)?;
+                    self.handle_child_request(request, interrupts_remaining)?;
                     if self.pending_resolution.is_some() {
                         return Ok(ComputerStatus::PackageRequested);
                     }
@@ -1255,6 +1279,23 @@ impl ComputerSupervisor {
                     bail!("a process runtime cannot request package resolution")
                 }
             }
+        }
+        Ok(self.yield_status())
+    }
+
+    fn yield_status(&mut self) -> ComputerStatus {
+        // Surface suspended package resolution on both guest and budget yields.
+        if let Some(child) = self
+            .workspace_children
+            .iter()
+            .find(|child| child.exit.is_none() && child.supervisor.pending_package().is_some())
+        {
+            self.pending_resolution = Some(PendingResolution::Child {
+                handle: child.handle,
+            });
+            ComputerStatus::PackageRequested
+        } else {
+            ComputerStatus::Yielded
         }
     }
 
@@ -1316,7 +1357,11 @@ impl ComputerSupervisor {
     }
 
     /// Executes one spawn/wait/pipe request and resolves it into the caller.
-    fn handle_child_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+    fn handle_child_request(
+        &mut self,
+        request: ChildProcessRequest,
+        interrupts_remaining: &mut usize,
+    ) -> Result<()> {
         match request {
             ChildProcessRequest::Spawn { package, arguments } => {
                 if self.background.len() >= MAX_BACKGROUND_PROCESSES {
@@ -1337,7 +1382,7 @@ impl ComputerSupervisor {
                     self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
                     return Ok(());
                 };
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 match self.background[index].exit {
                     Some(status) => {
                         self.reap_background(index)?;
@@ -1361,7 +1406,7 @@ impl ComputerSupervisor {
                 if written > 0 {
                     child.runtime.send_terminal_input(&bytes[..written])?;
                 }
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 self.foreground().resolve_spawn(written as i32);
             }
             ChildProcessRequest::PipeRead {
@@ -1374,7 +1419,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 if self.background[index].output.is_empty() {
-                    self.drive_background(index)?;
+                    self.drive_background(index, interrupts_remaining)?;
                 }
                 let child = &mut self.background[index];
                 if !child.output.is_empty() {
@@ -1393,7 +1438,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 self.background[index].runtime.close_terminal_input();
-                self.drive_background(index)?;
+                self.drive_background(index, interrupts_remaining)?;
                 self.foreground().resolve_spawn(0);
             }
             request @ (ChildProcessRequest::WorkspaceSpawn { .. }
@@ -1408,14 +1453,18 @@ impl ComputerSupervisor {
                     self.foreground().resolve_spawn(STATUS_DENIED);
                     return Ok(());
                 }
-                self.handle_workspace_request(request)?;
+                self.handle_workspace_request(request, interrupts_remaining)?;
             }
         }
         Ok(())
     }
 
     /// Executes one workspace operation and resolves it into the root guest.
-    fn handle_workspace_request(&mut self, request: ChildProcessRequest) -> Result<()> {
+    fn handle_workspace_request(
+        &mut self,
+        request: ChildProcessRequest,
+        interrupts_remaining: &mut usize,
+    ) -> Result<()> {
         match request {
             ChildProcessRequest::WorkspaceSpawn {
                 package,
@@ -1456,7 +1505,7 @@ impl ComputerSupervisor {
                 if written > 0 {
                     child.supervisor.send_terminal_input(&bytes[..written])?;
                 }
-                self.drive_workspace_child(index)?;
+                self.drive_workspace_child(index, interrupts_remaining)?;
                 self.foreground().resolve_spawn(written as i32);
             }
             ChildProcessRequest::WorkspaceRead {
@@ -1469,7 +1518,7 @@ impl ComputerSupervisor {
                     return Ok(());
                 };
                 if self.workspace_children[index].output.is_empty() {
-                    self.drive_workspace_child(index)?;
+                    self.drive_workspace_child(index, interrupts_remaining)?;
                 }
                 let child = &mut self.workspace_children[index];
                 if !child.output.is_empty() {
@@ -1505,7 +1554,7 @@ impl ComputerSupervisor {
                     self.foreground().resolve_spawn(STATUS_BAD_HANDLE);
                     return Ok(());
                 };
-                self.drive_workspace_child(index)?;
+                self.drive_workspace_child(index, interrupts_remaining)?;
                 // The handle stays valid after exit so remaining output can
                 // be drained; workspace_close reclaims the slot.
                 match self.workspace_children[index].exit {
@@ -1539,16 +1588,20 @@ impl ComputerSupervisor {
     ///
     /// Cooperative scheduling: workspace children only execute while the
     /// workspace guest is suspended inside a workspace hostcall.
-    fn drive_workspace_child(&mut self, index: usize) -> Result<()> {
+    fn drive_workspace_child(
+        &mut self,
+        index: usize,
+        interrupts_remaining: &mut usize,
+    ) -> Result<()> {
         const MAX_DRIVE_STEPS: usize = 64;
         for _ in 0..MAX_DRIVE_STEPS {
             let child = &mut self.workspace_children[index];
-            if child.exit.is_some() {
+            if child.exit.is_some() || *interrupts_remaining == 0 {
                 return Ok(());
             }
             // A faulted child fails alone; the workspace observes the fault
             // status through wait. Its final output and writes still land.
-            let outcome = child.supervisor.run();
+            let outcome = child.supervisor.run_with_budget(interrupts_remaining);
             while let Some(bytes) = child.supervisor.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
                 child
@@ -1641,16 +1694,17 @@ impl ComputerSupervisor {
     ///
     /// Cooperative scheduling: background children only execute while the
     /// foreground process is suspended inside a pipe or wait hostcall.
-    fn drive_background(&mut self, index: usize) -> Result<()> {
+    fn drive_background(&mut self, index: usize, interrupts_remaining: &mut usize) -> Result<()> {
         const MAX_DRIVE_STEPS: usize = 1_024;
         for _ in 0..MAX_DRIVE_STEPS {
             let child = &mut self.background[index];
-            if child.exit.is_some() {
+            if child.exit.is_some() || *interrupts_remaining == 0 {
                 return Ok(());
             }
             // A faulted piped child fails alone; the parent observes the
             // fault status through wait. Shared writes remain visible and
             // its final terminal output is collected below.
+            *interrupts_remaining -= 1;
             let outcome = child.runtime.run().ok();
             if let Some(bytes) = child.runtime.take_terminal_output() {
                 let available = MAX_TTY_OUTPUT_BYTES.saturating_sub(child.output.len());
@@ -1872,7 +1926,10 @@ mod tests {
             .supervisor
             .send_terminal_input(b"pq")
             .unwrap();
-        supervisor.drive_workspace_child(index).unwrap();
+        let mut interrupts_remaining = ComputerSupervisor::MAX_INTERRUPTS_PER_RUN;
+        supervisor
+            .drive_workspace_child(index, &mut interrupts_remaining)
+            .unwrap();
         let child = &supervisor.workspace_children[index];
         assert_eq!(child.exit, Some(7));
         assert_eq!(child.output.as_slice(), b"pane:readyHELLO, PIPESp:0");
@@ -1983,7 +2040,10 @@ mod tests {
         assert_eq!(pane.fs_stat("/home/log"), Some(4));
         let pane_handle = pane.fs_open("/home/log", flags) as u32;
         assert_eq!(pane.fs_write(pane_handle, b"pane"), 4);
-        supervisor.drive_background(0).unwrap();
+        let mut interrupts_remaining = ComputerSupervisor::MAX_INTERRUPTS_PER_RUN;
+        supervisor
+            .drive_background(0, &mut interrupts_remaining)
+            .unwrap();
         assert_eq!(
             supervisor.take_modified_files(),
             vec![("/home/log".into(), b"pipepane".to_vec())]
@@ -1993,7 +2053,10 @@ mod tests {
             STATUS_DENIED
         );
         supervisor
-            .handle_workspace_request(ChildProcessRequest::WorkspaceClose { handle: workspace })
+            .handle_workspace_request(
+                ChildProcessRequest::WorkspaceClose { handle: workspace },
+                &mut interrupts_remaining,
+            )
             .unwrap();
         // The exited background runtime is retained for wait/output, but owns no open paths.
         assert_eq!(

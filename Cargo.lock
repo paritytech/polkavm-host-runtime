@@ -910,12 +910,12 @@ dependencies = [
  "polkavm-gpu-wire",
  "polkavm-motion-wire",
  "polkavm-ui-wire",
+ "polkavm-wasm-compiler",
  "pollster",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "uniffi",
- "wasm-encoder",
  "wasmi",
  "wasmparser 0.240.0",
  "wgpu",
@@ -940,6 +940,18 @@ version = "0.3.1"
 [[package]]
 name = "polkavm-ui-wire"
 version = "0.3.1"
+
+[[package]]
+name = "polkavm-wasm-compiler"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "polkavm",
+ "polkavm-common",
+ "wasm-encoder",
+ "wasmi",
+ "wasmparser 0.240.0",
+]
 
 [[package]]
 name = "pollster"

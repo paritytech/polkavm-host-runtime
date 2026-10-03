@@ -100,6 +100,21 @@ await copyFile(
   resolve(source, "polkavm-computer.js"),
   resolve(dist, "polkavm-computer.js"),
 );
+for (const file of ["session.js", "session.d.ts", "file-input-router.js"]) {
+  await copyFile(resolve(source, file), resolve(dist, file));
+}
+await copyFile(
+  resolve(repositoryRoot, "THIRD_PARTY_NOTICES.md"),
+  resolve(dist, "THIRD_PARTY_NOTICES.md"),
+);
+await copyFile(
+  resolve(repositoryRoot, "licenses/THIRD_PARTY_LICENSES.txt"),
+  resolve(dist, "THIRD_PARTY_LICENSES.txt"),
+);
+await copyFile(
+  resolve(repositoryRoot, "LICENSE"),
+  resolve(dist, "LICENSE-MPL-2.0"),
+);
 await writeFile(
   resolve(dist, "polkavm-worker.js"),
   Buffer.concat([
@@ -119,6 +134,12 @@ const files = [
   "polkavm-runtime-core.js",
   "polkavm-wasm-worker-entry.js",
   "polkavm-computer.js",
+  "session.js",
+  "session.d.ts",
+  "file-input-router.js",
+  "LICENSE-MPL-2.0",
+  "THIRD_PARTY_NOTICES.md",
+  "THIRD_PARTY_LICENSES.txt",
 ];
 const sums = [];
 for (const file of files) {

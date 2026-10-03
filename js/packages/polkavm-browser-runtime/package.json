@@ -4,6 +4,7 @@
   "description": "Host-neutral PolkaVM App v2 browser runtime artifacts",
   "license": "MPL-2.0",
   "type": "module",
+  "types": "./dist/session.d.ts",
   "files": [
     "dist",
     "LICENSE-MPL-2.0",
@@ -14,10 +15,16 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "exports": {
+    ".": {
+      "types": "./dist/session.d.ts",
+      "import": "./dist/session.js",
+      "default": "./dist/session.js"
+    },
     "./runtime.wasm": "./dist/polkavm-browser-runtime.wasm",
     "./worker": "./dist/polkavm-worker.js",
     "./worker-entry": "./dist/polkavm-wasm-worker-entry.js",
     "./translator": "./dist/polkavm-wasm-translated.js",
+    "./file-input-router": "./dist/file-input-router.js",
     "./runtime-core": "./dist/polkavm-runtime-core.js",
     "./gpu-worker": "./dist/polkavm-gpu-worker.js",
     "./computer": "./dist/polkavm-computer.js",

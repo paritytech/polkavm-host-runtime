@@ -1,0 +1,115 @@
+name: Engine candidate qualification
+
+on:
+  push:
+    branches: [fix/runtime-readiness-main]
+  pull_request:
+    paths:
+      - .github/workflows/engine-qualification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+# This is a qualification candidate, not the runtime's production dependency pin.
+env:
+  ENGINE_REVISION: 95886b5c651e1392f6db06674d95d29b7e128ff6
+  RUSTC_WRAPPER: ""
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Engine / ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: paritytech/polkavm
+          ref: ${{ env.ENGINE_REVISION }}
+      - name: Record native hardware and immutable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          test "$(git rev-parse HEAD)" = "$ENGINE_REVISION"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            test "$(uname -m)" = arm64
+            sysctl -n machdep.cpu.brand_string
+          else
+            test "$(uname -m)" = x86_64
+          fi
+      - name: Install qualification toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --target wasm32-unknown-unknown
+      - name: Enable Linux sandbox features on the ephemeral runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Require compiler backend and stack regression coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.97.1 test --locked -p polkavm --features generic-sandbox --lib -- --list > "$RUNNER_TEMP/engine-tests.txt"
+          python3 - "$RUNNER_TEMP/engine-tests.txt" <<'PY'
+          import pathlib, sys
+          names = pathlib.Path(sys.argv[1]).read_text()
+          assert 'tests::compiler_generic_latest32_' in names
+          assert 'tests::compiler_generic_latest64_' in names
+          assert 'non_power_of_two_stack_growth' in names
+          PY
+      - name: Verify semantics, gas, traps, memory, recycling, and backends
+        run: cargo +1.97.1 test --locked -p polkavm --features generic-sandbox
+      - name: Verify assembler, decoder, linker, and specification tools
+        run: cargo +1.97.1 test --locked -p polkavm-assembler -p polkavm-common -p polkavm-linker -p spectool
+      - name: Check browser engine compilation
+        run: cargo +1.97.1 check --locked --target wasm32-unknown-unknown -p polkavm --no-default-features --lib
+      - name: Execute real guest with native JIT forced
+        shell: bash
+        env:
+          POLKAVM_BACKEND: compiler
+          POLKAVM_SANDBOX: generic
+          POLKAVM_ALLOW_EXPERIMENTAL: "1"
+          RUST_LOG: polkavm=debug
+        run: |
+          set -euo pipefail
+          cargo +1.97.1 run --locked -p hello-world-host --features polkavm/generic-sandbox | tee "$RUNNER_TEMP/jit-smoke.txt"
+          python3 - "$RUNNER_TEMP/jit-smoke.txt" <<'PY'
+          import pathlib, sys
+          assert pathlib.Path(sys.argv[1]).read_text().count('1 + 10 + 100 = 111') == 2
+          PY
+      - name: Qualify hardened Apple Silicon JIT host
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          POLKAVM_BACKEND: compiler
+          POLKAVM_SANDBOX: generic
+          POLKAVM_ALLOW_EXPERIMENTAL: "1"
+          RUST_LOG: polkavm=debug
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/jit-entitlements.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>
+          PLIST
+          codesign --force --sign - --options runtime --entitlements "$RUNNER_TEMP/jit-entitlements.plist" target/debug/hello-world-host
+          codesign --verify --strict target/debug/hello-world-host
+          target/debug/hello-world-host | tee "$RUNNER_TEMP/hardened-jit-smoke.txt"
+          python3 - "$RUNNER_TEMP/hardened-jit-smoke.txt" <<'PY'
+          import pathlib, sys
+          assert pathlib.Path(sys.argv[1]).read_text().count('1 + 10 + 100 = 111') == 2
+          PY
+          test_binary="$(cargo +1.97.1 test --locked -p polkavm --features generic-sandbox --lib --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "polkavm" and .profile.test == true and .executable != null) | .executable')"
+          test -n "$test_binary"
+          codesign --force --sign - --options runtime --entitlements "$RUNNER_TEMP/jit-entitlements.plist" "$test_binary"
+          "$test_binary" tests::compiler_generic_ --test-threads=1
+          "$test_binary" tests::tracing_generic_ --test-threads=1

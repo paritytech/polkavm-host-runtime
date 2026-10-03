@@ -1054,6 +1054,47 @@ test("stopping during asynchronous compilation cannot restart the endpoint", asy
   assert.equal(messages.some((message) => ["ready", "save", "error"].includes(message.type)), false);
 });
 
+test("stop remains terminal when pending instantiation resolves or rejects", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(
+    repositoryRoot, "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+  ));
+  for (const reject of [false, true]) {
+    await t.test(reject ? "late rejection" : "late resolution", async (t) => {
+      const original = WebAssembly.instantiate;
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      t.mock.method(WebAssembly, "instantiate", async (...args) => {
+        const result = await original(...args);
+        entered.resolve();
+        await resume.promise;
+        if (reject) throw new Error("startup failed after cancellation");
+        return result;
+      });
+      const { messages, receiver } = endpoint();
+      try {
+        receiver.onmessage({ data: {
+          type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+        } });
+        await entered.promise;
+        receiver.onmessage({ data: { type: "stop" } });
+        const terminalMessages = messages.slice();
+        assert.equal(messages.at(-1).type, "terminated");
+        resume.resolve();
+        await settle();
+        assert.equal(receiver.onmessage, null);
+        assert.deepEqual(messages, terminalMessages);
+        assert.equal(messages.some((message) => message.type === "ready"), false);
+      } finally {
+        resume.resolve();
+        await settle();
+        receiver.onmessage?.({ data: { type: "stop" } });
+      }
+    });
+  }
+});
+
 test("both browser backends expose application core clocks and entropy", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -1223,7 +1264,7 @@ test("compiler startup keeps the newest GPU capabilities", async () => {
   }
 });
 
-test("native-Wasm and translated backends round-trip opaque host frames", async () => {
+test("byte and Module startup round-trip opaque host frames on both backends", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
   );
@@ -1241,12 +1282,17 @@ test("native-Wasm and translated backends round-trip opaque host frames", async 
   );
   const successBytes = new TextEncoder().encode("host-frame-roundtrip-ok");
 
-  for (const forceInterpreter of [false, true]) {
+  const runtimeInputs = [bytesBuffer(runtime), await WebAssembly.compile(runtime)];
+  for (const { runtimeInput, forceInterpreter } of runtimeInputs.flatMap(
+    (runtimeInput) => [false, true].map((forceInterpreter) => ({
+      runtimeInput, forceInterpreter,
+    })),
+  )) {
     const { messages, receiver } = endpoint();
     receiver.onmessage({
       data: {
         type: "start",
-        runtime: bytesBuffer(runtime),
+        runtime: runtimeInput,
         program: bytesBuffer(program),
         assets: [],
         graphicsProfile: "framebuffer",

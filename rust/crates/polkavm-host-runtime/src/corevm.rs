@@ -1135,6 +1135,9 @@ impl Vm {
                         continue;
                     }
                     let mut buffer = vec![0i16; sample_count];
+                    // SAFETY: i16 has no padding or invalid bit patterns. The initialized
+                    // allocation covers this bounded byte length and is uniquely borrowed.
+                    #[allow(unsafe_code)]
                     self.instance.read_memory_into(address, unsafe {
                         core::slice::from_raw_parts_mut(
                             buffer.as_mut_ptr().cast::<u8>(),
@@ -1156,6 +1159,9 @@ impl Vm {
                             continue;
                         }
                         let address = input_destination(address, written)?;
+                        // SAFETY: repr(C) InputEvent contains only two u8 fields, with
+                        // no padding. This byte view stays within the initialized slice.
+                        #[allow(unsafe_code)]
                         self.instance.write_memory(address, unsafe {
                             core::slice::from_raw_parts(
                                 events.as_ptr().cast::<u8>(),
@@ -1195,6 +1201,10 @@ impl Vm {
                     let address = u32::try_from(address)
                         .map_err(|_| "audio address is out of range".to_owned())?;
                     let mut buffer: Vec<i16> = Vec::with_capacity(length);
+                    // SAFETY: the bounded spare capacity covers `length` i16 values.
+                    // PolkaVM initializes the entire byte range on success; only then
+                    // is the length published. Every i16 bit pattern is valid.
+                    #[allow(unsafe_code)]
                     unsafe {
                         self.instance.read_memory_into(
                             address,

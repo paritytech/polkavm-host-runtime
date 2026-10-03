@@ -2,24 +2,42 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+/// Four-byte discriminator at the start of a Tri2D stream.
 pub const TRI2D_MAGIC: &[u8; 4] = b"ETD1";
+/// Supported Tri2D encoding version.
 pub const TRI2D_VERSION: u16 = 1;
+/// Fixed stream header length in bytes.
 pub const TRI2D_HEADER_BYTES: usize = 24;
+/// Maximum encoded bytes per frame.
 pub const MAX_TRI2D_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum commands per frame, including presentation.
 pub const MAX_TRI2D_COMMANDS: u32 = 8_192;
+/// Maximum surface width or height in pixels.
 pub const MAX_TRI2D_SURFACE_SIZE: u32 = 4_096;
+/// Maximum texture width or height in texels.
 pub const MAX_TRI2D_TEXTURE_SIZE: u32 = 4_096;
+/// Maximum simultaneously live texture handles.
 pub const MAX_TRI2D_TEXTURES: usize = 256;
+/// Maximum aggregate RGBA texture storage in bytes.
 pub const MAX_TRI2D_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum draw commands per frame.
 pub const MAX_TRI2D_DRAWS: u32 = 4_096;
+/// Maximum vertices across all draws in one frame.
 pub const MAX_TRI2D_VERTICES: u32 = 262_144;
+/// Maximum indices across all draws in one frame.
 pub const MAX_TRI2D_INDICES: u32 = 786_432;
 
+/// Encoded vertex stride in bytes: position, UV, and packed color.
 pub const TRI2D_VERTEX_BYTES: usize = 20;
+/// Command allocating a texture and uploading its initial RGBA pixels.
 pub const TRI2D_OPCODE_TEXTURE_CREATE: u8 = 1;
+/// Command replacing pixels in a texture region.
 pub const TRI2D_OPCODE_TEXTURE_UPDATE: u8 = 2;
+/// Command releasing a live texture handle.
 pub const TRI2D_OPCODE_TEXTURE_DESTROY: u8 = 3;
+/// Command drawing indexed, textured triangles.
 pub const TRI2D_OPCODE_DRAW: u8 = 4;
+/// Final command presenting the completed frame.
 pub const TRI2D_OPCODE_PRESENT: u8 = 5;
 
 #[cfg(feature = "tri2d-validation")]
@@ -29,8 +47,10 @@ mod validation {
     use std::collections::HashMap;
     use std::vec::Vec;
 
+    /// Result of structural and resource-state validation.
     pub type Tri2dResult<T> = core::result::Result<T, Tri2dError>;
 
+    /// Rejection of a malformed or quota-exceeding Tri2D stream.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Tri2dError {
         message: &'static str,
@@ -41,6 +61,7 @@ mod validation {
             Self { message }
         }
 
+        /// Human-readable reason for rejection.
         pub const fn message(self) -> &'static str {
             self.message
         }
@@ -71,31 +92,48 @@ mod validation {
         bytes: usize,
     }
 
+    /// Live texture metadata carried from one accepted frame to the next.
     #[derive(Clone, Debug, Default)]
     pub struct Tri2dState {
         textures: HashMap<u32, Texture>,
         texture_bytes: usize,
     }
 
+    /// Validated frame bytes and aggregate drawing metadata.
     #[derive(Debug)]
     pub struct Tri2dFrame {
+        /// Target surface width in pixels.
         pub width: u32,
+        /// Target surface height in pixels.
         pub height: u32,
+        /// Number of draw commands.
         pub draw_count: u32,
+        /// Total vertices across all draw commands.
         pub vertex_count: u32,
+        /// Total indices across all draw commands.
         pub index_count: u32,
+        /// Complete encoded stream, including resource updates and present.
         pub bytes: Vec<u8>,
     }
 
+    /// Surface dimensions and drawing counts computed during validation.
     #[derive(Clone, Copy, Debug)]
     pub struct Tri2dMetadata {
+        /// Target surface width in pixels.
         pub width: u32,
+        /// Target surface height in pixels.
         pub height: u32,
+        /// Number of draw commands.
         pub draw_count: u32,
+        /// Total vertices across all draw commands.
         pub vertex_count: u32,
+        /// Total indices across all draw commands.
         pub index_count: u32,
     }
 
+    /// Validate one complete frame without changing `current` on failure.
+    ///
+    /// Commit the returned texture state only when the frame is accepted.
     pub fn validate_tri2d(
         bytes: &[u8],
         current: &Tri2dState,

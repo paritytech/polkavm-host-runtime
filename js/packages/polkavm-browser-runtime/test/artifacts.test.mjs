@@ -25,6 +25,11 @@ test("browser runtime artifacts match their published checksums", async () => {
     "polkavm-wasm-translated.js",
     "polkavm-runtime-core.js",
     "polkavm-wasm-worker-entry.js",
+    "polkavm-computer.js",
+    "session.js",
+    "session.d.ts",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_LICENSES.txt",
   ]) {
     const bytes = await readFile(resolve(dist, file));
     assert.equal(

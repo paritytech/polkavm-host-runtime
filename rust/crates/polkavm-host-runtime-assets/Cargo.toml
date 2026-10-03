@@ -8,6 +8,9 @@ repository = "https://github.com/paritytech/polkavm-host-runtime"
 publish = false
 include = ["src/**", "assets/**", "Cargo.toml"]
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["rlib"]
 
