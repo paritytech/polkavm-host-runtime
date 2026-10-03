@@ -4,26 +4,46 @@ use std::collections::HashSet;
 
 use crate::INPUT_EVENT_BYTES;
 
+/// Maximum UTF-8 bytes in one text input operation.
 pub const MAX_UI_TEXT_BYTES: usize = 4 * 1024;
+/// Maximum encoded JSON bytes in one semantic snapshot.
 pub const MAX_UI_SEMANTICS_BYTES: usize = 256 * 1024;
+/// Maximum nodes in one semantic snapshot.
 pub const MAX_UI_SEMANTIC_NODES: usize = 1_024;
+/// Maximum UTF-8 bytes in a semantic node's name or value.
 pub const MAX_UI_SEMANTIC_STRING_BYTES: usize = 1_024;
 
+/// Input discriminator for committed text outside IME composition.
 pub const INPUT_TEXT_COMMIT: u8 = 8;
+/// Input discriminator for the current uncommitted IME composition.
 pub const INPUT_IME_PREEDIT: u8 = 9;
+/// Input discriminator for committed IME composition.
 pub const INPUT_IME_COMMIT: u8 = 10;
+/// Input discriminator announcing IME activation.
 pub const INPUT_IME_ENABLED: u8 = 11;
+/// Input discriminator announcing IME deactivation.
 pub const INPUT_IME_DISABLED: u8 = 12;
+/// Input discriminator announcing surface focus changes.
 pub const INPUT_FOCUS: u8 = 13;
+/// Input discriminator for signed two-axis wheel deltas.
 pub const INPUT_WHEEL: u8 = 14;
+/// Pointer-capture state event discriminant.
 pub const INPUT_POINTER_CAPTURE: u8 = 15;
+/// Safe-area inset event discriminant.
 pub const INPUT_SAFE_AREA_INSETS: u8 = 16;
+/// On-screen keyboard inset event discriminant.
 pub const INPUT_KEYBOARD_INSETS: u8 = 17;
+/// Inset record carrying left and right edges.
 pub const INPUT_INSETS_HORIZONTAL: u8 = 0;
+/// Inset record carrying top and bottom edges.
 pub const INPUT_INSETS_VERTICAL: u8 = 1;
+/// Touch contact started event discriminant.
 pub const INPUT_TOUCH_START: u8 = 18;
+/// Touch contact moved event discriminant.
 pub const INPUT_TOUCH_MOVE: u8 = 19;
+/// Touch contact ended event discriminant.
 pub const INPUT_TOUCH_END: u8 = 20;
+/// Touch contact cancelled event discriminant.
 pub const INPUT_TOUCH_CANCEL: u8 = 21;
 
 const CHUNK_LENGTH_MASK: u8 = 0x07;
@@ -32,10 +52,14 @@ const CHUNK_LAST: u8 = 0x80;
 const CHUNK_ALLOWED: u8 = CHUNK_LENGTH_MASK | CHUNK_FIRST | CHUNK_LAST;
 const CHUNK_BYTES: usize = 6;
 
+/// Text operation represented by a sequence of extended input records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextInputKind {
+    /// Insert committed text without an IME composition.
     Text,
+    /// Replace the current uncommitted IME composition.
     ImePreedit,
+    /// Commit the current IME composition.
     ImeCommit,
 }
 
@@ -49,6 +73,9 @@ impl TextInputKind {
     }
 }
 
+/// Encode bounded UTF-8 text into ordered eight-byte chunk records.
+///
+/// Empty text emits one first-and-last record, allowing composition clearing.
 pub fn encode_text_input(kind: TextInputKind, text: &str) -> Result<Vec<[u8; INPUT_EVENT_BYTES]>> {
     let bytes = text.as_bytes();
     if bytes.len() > MAX_UI_TEXT_BYTES {
@@ -75,6 +102,7 @@ pub fn encode_text_input(kind: TextInputKind, text: &str) -> Result<Vec<[u8; INP
     Ok(records)
 }
 
+/// Encode an IME activation or deactivation record with zeroed reserved bytes.
 pub fn ime_state_record(enabled: bool) -> [u8; INPUT_EVENT_BYTES] {
     let mut record = [0u8; INPUT_EVENT_BYTES];
     record[0] = if enabled {
@@ -85,6 +113,7 @@ pub fn ime_state_record(enabled: bool) -> [u8; INPUT_EVENT_BYTES] {
     record
 }
 
+/// Encode a surface focus transition with zeroed reserved bytes.
 pub fn focus_record(focused: bool) -> [u8; INPUT_EVENT_BYTES] {
     let mut record = [0u8; INPUT_EVENT_BYTES];
     record[0] = INPUT_FOCUS;
@@ -92,6 +121,7 @@ pub fn focus_record(focused: bool) -> [u8; INPUT_EVENT_BYTES] {
     record
 }
 
+/// Encode signed horizontal and vertical wheel deltas as little-endian i16 values.
 pub fn wheel_record(delta_x: i16, delta_y: i16) -> [u8; INPUT_EVENT_BYTES] {
     let mut record = [0u8; INPUT_EVENT_BYTES];
     record[0] = INPUT_WHEEL;
@@ -203,62 +233,97 @@ pub(crate) fn validate_input_record(record: &[u8; INPUT_EVENT_BYTES]) -> Result<
     Ok(())
 }
 
+/// Accessibility role serialized using kebab-case names.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiSemanticRole {
+    /// Top-level application surface.
     Window,
+    /// Container grouping related controls.
     Group,
+    /// Noninteractive text description.
     Label,
+    /// Activatable push control.
     Button,
+    /// Navigation target.
     Link,
+    /// Toggle with checked/unchecked state.
     CheckBox,
+    /// Adjustable value within a range.
     Slider,
+    /// Single-line editable text.
     TextInput,
+    /// Multiline editable text.
     MultilineTextInput,
+    /// Editable text whose contents should be concealed.
     PasswordInput,
+    /// Non-text graphical content.
     Image,
+    /// Element without a more specific supported role.
     Unknown,
 }
 
+/// User operation supported by an accessibility node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiSemanticAction {
+    /// Activate the node.
     Click,
+    /// Move keyboard focus to the node.
     Focus,
+    /// Replace the node's editable value.
     SetValue,
+    /// Increase the node's adjustable value.
     Increment,
+    /// Decrease the node's adjustable value.
     Decrement,
 }
 
+/// Guest-provided node in a host accessibility snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UiSemanticNode {
+    /// Unique lowercase hexadecimal identifier, at most 16 bytes.
     pub id: String,
+    /// Parent identifier, or `None` for the snapshot's single root.
     pub parent: Option<String>,
+    /// Accessibility interpretation of the node.
     pub role: UiSemanticRole,
+    /// Human-readable accessible label.
     #[serde(default)]
     pub name: String,
+    /// Current textual value exposed to accessibility tools.
     #[serde(default)]
     pub value: String,
+    /// Finite `[x_min, y_min, x_max, y_max]` rectangle in surface coordinates.
     pub bounds: [f32; 4],
+    /// Operations the guest advertises for this node.
     #[serde(default)]
     pub actions: Vec<UiSemanticAction>,
+    /// Whether interaction with the node is disabled.
     #[serde(default)]
     pub disabled: bool,
+    /// Whether the node currently owns keyboard focus.
     #[serde(default)]
     pub focused: bool,
 }
 
+/// Versioned accessibility tree replacing the previous guest snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UiSemanticSnapshot {
+    /// Encoding version; validation currently accepts only 1.
     pub version: u32,
+    /// Guest-assigned snapshot generation.
     pub generation: u64,
+    /// Nodes with unique IDs and exactly one root.
     pub nodes: Vec<UiSemanticNode>,
 }
 
+/// Validated semantic JSON awaiting host consumption.
 #[derive(Clone, Debug)]
 pub struct UiSemanticsFrame {
+    /// Complete UTF-8 JSON snapshot bytes.
     pub bytes: Vec<u8>,
 }
 

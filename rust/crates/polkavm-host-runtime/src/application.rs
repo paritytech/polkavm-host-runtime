@@ -15,14 +15,18 @@ use std::collections::{HashMap, VecDeque};
 const MAX_INTERRUPTS_PER_UPDATE: usize = 8_192;
 const MAX_QUEUED_AUDIO_CHUNKS: usize = 64;
 
+/// Unified host interface selecting the cooperative or CoreVM guest ABI.
 // Both variants are large, long-lived runtime state machines. Boxing either
 // adds allocation and indirection to every host call to save 576 enum bytes.
 #[allow(clippy::large_enum_variant)]
 pub enum ApplicationRuntime {
+    /// Guest driven through explicit `init` and `update` calls.
     Cooperative(Runtime),
+    /// Guest driven from `_pvm_start` through VM interruptions.
     CoreVm(CoreVmRuntime),
 }
 
+/// CoreVM framebuffer adapter with bounded audio and per-update execution.
 pub struct CoreVmRuntime {
     vm: Vm,
     frame: Option<Frame>,
@@ -39,6 +43,9 @@ pub struct CoreVmRuntime {
 }
 
 impl ApplicationRuntime {
+    /// Validate launch inputs and select the guest ABI using its exports.
+    ///
+    /// Uses the platform-preferred backend and a nonzero per-update gas budget.
     pub fn new(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -56,6 +63,7 @@ impl ApplicationRuntime {
         )
     }
 
+    /// Instantiate with an explicit backend; CoreVM requires framebuffer presentation.
     pub fn new_with_backend(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -107,6 +115,7 @@ impl ApplicationRuntime {
         }))
     }
 
+    /// Initialize a cooperative guest; CoreVM setup already occurs at construction.
     pub fn init(&mut self) -> Result<()> {
         if self.is_stopped() {
             return Err(anyhow!("runtime is stopped"));
@@ -121,6 +130,7 @@ impl ApplicationRuntime {
         result
     }
 
+    /// Run one bounded update; execution errors stop the runtime.
     pub fn update(&mut self) -> Result<()> {
         if self.is_stopped() {
             return Err(anyhow!("runtime is stopped"));
@@ -135,6 +145,7 @@ impl ApplicationRuntime {
         result
     }
 
+    /// Stop execution and discard pending execution work.
     pub fn stop(&mut self) {
         match self {
             Self::Cooperative(runtime) => runtime.stop(),
@@ -142,6 +153,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Whether execution has been permanently stopped.
     pub fn is_stopped(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.is_stopped(),
@@ -178,6 +190,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Backend actually selected by the PolkaVM engine.
     pub fn backend(&self) -> polkavm::BackendKind {
         match self {
             Self::Cooperative(runtime) => runtime.backend(),
@@ -185,6 +198,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Whether the guest imports the motion-sample host call.
     pub fn uses_motion(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.uses_motion(),
@@ -192,6 +206,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Whether the guest imports pointer-capture operations.
     pub fn uses_pointer_capture(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.uses_pointer_capture(),
@@ -214,6 +229,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Set whether the host can honor pointer-capture requests.
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
         match self {
             Self::Cooperative(runtime) => runtime.set_pointer_capture_supported(supported),
@@ -221,6 +237,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Report the actual host pointer-capture state to the guest.
     pub fn set_pointer_capture_active(&mut self, active: bool) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_pointer_capture_active(active),
@@ -231,6 +248,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Take the pending capture request: `true` acquires, `false` releases.
     pub fn take_pointer_capture_request(&mut self) -> Option<bool> {
         match self {
             Self::Cooperative(runtime) => runtime.take_pointer_capture_request(),
@@ -238,6 +256,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Gas consumed from the latest execution budget.
     pub fn last_gas_used(&self) -> u64 {
         match self {
             Self::Cooperative(runtime) => runtime.last_gas_used(),
@@ -247,6 +266,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Queue input, translating fixed events for CoreVM's supported input ABI.
     pub fn send_input(&mut self, event: InputEvent) {
         match self {
             Self::Cooperative(runtime) => runtime.send_input(event),
@@ -254,6 +274,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Validate and queue an extended record; unsupported for CoreVM.
     pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_input_record(record),
@@ -261,6 +282,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Validate and queue extended input records; unsupported for CoreVM.
     pub fn send_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_input_records(records),
@@ -268,6 +290,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Queue a bounded UTF-8 text operation; unsupported for CoreVM.
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_text_input(kind, text),
@@ -275,6 +298,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Replace cooperative guest entropy with bounded host bytes; ignored by CoreVM.
     pub fn set_random_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_random_bytes(bytes),
@@ -282,6 +306,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Update motion availability and discard samples when access is unavailable.
     pub fn set_motion_availability(
         &mut self,
         availability: crate::motion_wire::MotionAvailability,
@@ -292,6 +317,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Validate and replace the latest motion sample.
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_motion_sample(bytes),
@@ -302,6 +328,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Whether execution has no outstanding GPU capabilities prerequisite.
     pub fn gpu_ready(&self) -> bool {
         match self {
             Self::Cooperative(runtime) => runtime.gpu_ready(),
@@ -309,6 +336,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Install validated host capabilities for a cooperative GPU guest.
     pub fn set_gpu_capabilities(&mut self, bytes: Vec<u8>) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_gpu_capabilities(bytes),
@@ -316,6 +344,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Queue a validated host event for a cooperative GPU guest.
     pub fn send_gpu_event(&mut self, bytes: Vec<u8>) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.send_gpu_event(bytes),
@@ -323,6 +352,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Remove the oldest GPU batch, or return `None` for CoreVM.
     pub fn take_gpu_batch(&mut self) -> Option<GpuBatch> {
         match self {
             Self::Cooperative(runtime) => runtime.take_gpu_batch(),
@@ -330,6 +360,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Remove the oldest guest host-service request.
     pub fn take_host_frame_request(&mut self) -> Option<Vec<u8>> {
         if self.is_stopped() {
             return None;
@@ -340,6 +371,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Queue a nonempty bounded host-service response; report backpressure without dropping it.
     pub fn send_host_frame_response(
         &mut self,
         bytes: Vec<u8>,
@@ -365,6 +397,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Set supported mediated-input kinds; reject invalid kinds or an active request.
     pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_mediated_input_kinds(kinds),
@@ -372,6 +405,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Remove the oldest request or cancellation for the host to process.
     pub fn take_mediated_input_command(&mut self) -> Option<MediatedInputCommand> {
         match self {
             Self::Cooperative(runtime) => runtime.take_mediated_input_command(),
@@ -379,6 +413,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Complete an active mediated-input request with a validated terminal status and bounded bytes.
     pub fn send_mediated_input_result(
         &mut self,
         handle: u32,
@@ -391,6 +426,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Advance browser monotonic time in milliseconds, ignoring earlier values.
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
         match self {
@@ -399,12 +435,14 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Take the latest framebuffer, clearing its pending state.
     pub fn take_frame(&mut self) -> Option<Frame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_frame(),
             Self::CoreVm(runtime) => runtime.frame.take(),
         }
     }
+    /// Take the pending Tri2D frame, or return `None` for CoreVM.
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_tri2d(),
@@ -412,6 +450,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Take the latest accessibility snapshot, or return `None` for CoreVM.
     pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_ui_semantics(),
@@ -419,6 +458,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Take the latest platform-output snapshot, or return `None` for CoreVM.
     pub fn take_ui_output(&mut self) -> Option<UiOutputFrame> {
         match self {
             Self::Cooperative(runtime) => runtime.take_ui_output(),
@@ -426,6 +466,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Remove the oldest queued audio chunk.
     pub fn take_audio(&mut self) -> Option<AudioChunk> {
         match self {
             Self::Cooperative(runtime) => runtime.take_audio(),
@@ -433,6 +474,7 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Remove the oldest cooperative guest log, or return `None` for CoreVM.
     pub fn take_log(&mut self) -> Option<String> {
         match self {
             Self::Cooperative(runtime) => runtime.take_log(),
@@ -440,10 +482,12 @@ impl ApplicationRuntime {
         }
     }
 
+    /// Whether a CoreVM guest has completed with exit status zero.
     pub fn is_exited(&self) -> bool {
         self.is_stopped() || matches!(self, Self::CoreVm(runtime) if runtime.exited)
     }
 
+    /// Take the latest cooperative guest save payload, or return `None` for CoreVM.
     pub fn take_save(&mut self) -> Option<Vec<u8>> {
         match self {
             Self::Cooperative(runtime) => runtime.take_save(),

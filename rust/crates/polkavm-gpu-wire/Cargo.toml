@@ -7,6 +7,9 @@ license = "MPL-2.0"
 repository = "https://github.com/paritytech/polkavm-host-runtime"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 default = []
 tri2d-validation = []

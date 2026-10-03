@@ -2,12 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::{
-    MAX_GUEST_HEAP_BYTES, MAX_GUEST_RW_DATA_BYTES, MAX_GUEST_STACK_BYTES, MAX_PROGRAM_BYTES,
-};
+//! Host-independent PolkaVM-to-WebAssembly compilation.
+//!
+//! Callers supply resource policy through [`Limits`]. This crate emits modules;
+//! it does not execute guest code, implement hostcalls, or manage browser workers.
+//!
+//! # Output ABI
+//!
+//! Both translation functions return a root Wasm module with `epoca.pvm.meta`
+//! metadata (format `EPM2`). [`translate_partitioned`] additionally embeds Wasm
+//! modules in repeated `epoca.pvm.code-part` custom sections. Instantiate the root,
+//! then every code part with the root exports under the `pvm` import namespace,
+//! before calling any guest entrypoint. Parts share the root's memory, table, and
+//! globals; they are not independent guests.
+//!
+//! The root exports `pvm_begin(entry: i32, gas: i64) -> i32`,
+//! `pvm_resume() -> i32`, and `pvm_set_gas(gas: i64)`. Entry values are opaque
+//! block tokens from the metadata, not Wasm function indices. Execution returns
+//! `-1` on completion, `-2` on a hostcall, `-3` on a trap, and `-4` on exhaustion
+//! of gas. Hostcalls report their import index in `ecall`; traps report the guest
+//! instruction offset in `trap_pc`. Service a hostcall or refill gas before
+//! resuming. Guest registers are mutable `i64` globals `r0` through `r12`; the
+//! memory, dispatch table, and internal globals are also exported for linking.
+//! Generated modules require WebAssembly tail calls but use only one memory.
+
 use anyhow::{anyhow, bail, Context, Result};
-use polkavm::program::{Instruction as PvmInstruction, ParsedInstruction, RawReg};
-use polkavm::{MemoryMapBuilder, ProgramBlob, Reg, RETURN_TO_HOST};
+use polkavm_common::abi::{MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
+use polkavm_common::program::{
+    Instruction as PvmInstruction, ParsedInstruction, ProgramBlob, RawReg, Reg,
+};
 use std::borrow::Cow;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
@@ -17,6 +40,7 @@ use wasm_encoder::{
 };
 
 const PAGE_SIZE: u32 = 65_536;
+const RETURN_TO_HOST: u64 = VM_ADDR_RETURN_TO_HOST as u64;
 const STATUS_FINISHED: i32 = -1;
 const STATUS_ECALL: i32 = -2;
 const STATUS_TRAP: i32 = -3;
@@ -101,28 +125,58 @@ enum StoreKind {
     U64,
 }
 
-pub fn translate(program: &[u8]) -> Result<Vec<u8>> {
-    translate_with_part_limit(program, None)
+/// Caller-selected byte limits for translation and the resulting guest heap.
+///
+/// Limits are inclusive. There is no implicit application policy, and a zero
+/// heap limit disables heap growth.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Maximum encoded input program length. Empty input is always rejected.
+    pub max_program_bytes: usize,
+    /// Maximum declared initial writable-data size, before page alignment.
+    pub max_rw_data_bytes: u32,
+    /// Maximum declared stack size, before page alignment.
+    pub max_stack_bytes: u32,
+    /// Maximum heap growth, also capped by the guest virtual address space.
+    pub max_heap_bytes: u32,
 }
 
-pub fn translate_partitioned(program: &[u8]) -> Result<Vec<u8>> {
-    translate_with_part_limit(program, Some(CODE_PART_BYTES))
+/// Compile a PolkaVM program into one self-contained WebAssembly module.
+///
+/// Returns an error for invalid bytecode, unsupported instructions, exceeded
+/// caller limits, or an unrepresentable memory layout. No guest code is executed.
+pub fn translate(program: &[u8], limits: Limits) -> Result<Vec<u8>> {
+    translate_with_part_limit(program, limits, None)
 }
 
-fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Result<Vec<u8>> {
+/// Compile a PolkaVM program into a root module with embedded code-part modules.
+///
+/// Use this as a fallback when a Wasm engine cannot compile the single-module
+/// output of [`translate`]. Code parts target an 8 MiB code-section bound without
+/// splitting block-group functions. All parts must be instantiated before use;
+/// see the crate-level ABI documentation. Errors and limits match [`translate`].
+pub fn translate_partitioned(program: &[u8], limits: Limits) -> Result<Vec<u8>> {
+    translate_with_part_limit(program, limits, Some(CODE_PART_BYTES))
+}
+
+fn translate_with_part_limit(
+    program: &[u8],
+    limits: Limits,
+    part_limit: Option<usize>,
+) -> Result<Vec<u8>> {
     let partitioned = part_limit.is_some();
-    if program.is_empty() || program.len() > MAX_PROGRAM_BYTES {
-        bail!("guest program exceeds browser limit");
+    if program.is_empty() || program.len() > limits.max_program_bytes {
+        bail!("guest program exceeds compiler limit");
     }
     let blob =
         ProgramBlob::parse(program.into()).context("parse PolkaVM program for Wasm translation")?;
     blob.validate_code_with_isa(blob.isa())
         .map_err(|pc| anyhow!("invalid PolkaVM instruction at {pc}"))?;
-    if blob.stack_size() > MAX_GUEST_STACK_BYTES {
-        bail!("guest stack exceeds browser limit");
+    if blob.stack_size() > limits.max_stack_bytes {
+        bail!("guest stack exceeds compiler limit");
     }
-    if blob.rw_data_size() > MAX_GUEST_RW_DATA_BYTES {
-        bail!("guest read-write data exceeds browser limit");
+    if blob.rw_data_size() > limits.max_rw_data_bytes {
+        bail!("guest read-write data exceeds compiler limit");
     }
 
     let instructions: Vec<_> = blob.instructions().collect();
@@ -131,7 +185,7 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
     }
     let metered_targets = collect_metered_targets(&instructions);
 
-    let layout = build_layout(&blob)?;
+    let layout = build_layout(&blob, limits.max_heap_bytes)?;
     let targets = collect_block_targets(&blob, &instructions)?;
     let (blocks, block_by_pc) = build_blocks(&instructions, &targets)?;
     let jump_targets = blob.jump_table();
@@ -462,14 +516,14 @@ fn align(value: u32, alignment: u32) -> Result<u32> {
         .ok_or_else(|| anyhow!("translated memory layout overflow"))
 }
 
-fn build_layout(blob: &ProgramBlob) -> Result<Layout> {
+fn build_layout(blob: &ProgramBlob, max_heap_bytes: u32) -> Result<Layout> {
     let map = MemoryMapBuilder::new(PAGE_SIZE)
         .ro_data_size(blob.ro_data_size())
         .rw_data_size(blob.rw_data_size())
         .stack_size(blob.stack_size())
         .build()
         .map_err(|error| anyhow!(error))?;
-    let heap_limit = MAX_GUEST_HEAP_BYTES.min(map.max_heap_size());
+    let heap_limit = max_heap_bytes.min(map.max_heap_size());
     let rw_max_bytes = map
         .heap_base()
         .wrapping_sub(map.rw_data_address())
@@ -2328,7 +2382,7 @@ fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: Raw
 #[cfg(test)]
 mod tests {
     use super::{
-        translate, translate_partitioned, translate_with_part_limit, BLOCKS_PER_FUNCTION,
+        translate, translate_partitioned, translate_with_part_limit, Limits, BLOCKS_PER_FUNCTION,
         CODE_PART_SECTION, INSTRUCTIONS_PER_BLOCK, STATUS_ECALL, STATUS_FINISHED,
         STATUS_OUT_OF_GAS, STATUS_TRAP,
     };
@@ -2339,6 +2393,13 @@ mod tests {
     };
     use polkavm_common::{program::asm, writer::ProgramBlobBuilder};
     use wasmi::{Engine as WasmEngine, Instance, Linker, Module as WasmModule, Store, Val};
+
+    const TEST_LIMITS: Limits = Limits {
+        max_program_bytes: 64 * 1024 * 1024,
+        max_rw_data_bytes: 64 * 1024 * 1024,
+        max_stack_bytes: 16 * 1024 * 1024,
+        max_heap_bytes: 128 * 1024 * 1024,
+    };
 
     fn interpreter_registers(program: &[u8]) -> [u64; 13] {
         let blob = ProgramBlob::parse(program.into()).expect("parse differential fixture");
@@ -2367,8 +2428,8 @@ mod tests {
 
     fn translated_instance(program: &[u8]) -> (Store<()>, Instance) {
         // Exercise all existing group-boundary regressions across module boundaries.
-        let wasm =
-            translate_with_part_limit(program, Some(1)).expect("translate differential fixture");
+        let wasm = translate_with_part_limit(program, TEST_LIMITS, Some(1))
+            .expect("translate differential fixture");
         instance_from_wasm(&wasm)
     }
 
@@ -2451,31 +2512,100 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_fixture_translates_to_valid_wasm() {
-        let program = include_bytes!("../tests/fixtures/framebuffer-test.polkavm");
-        let wasm = translate(program).expect("translate framebuffer fixture");
-        wasmparser::Validator::new()
-            .validate_all(&wasm)
-            .expect("validate translated framebuffer fixture");
-        for part in code_parts(&wasm) {
-            wasmparser::Validator::new()
-                .validate_all(part)
-                .expect("validate translated framebuffer code part");
-        }
-        instance_from_wasm(&wasm);
-        let memory_count = wasmparser::Parser::new(0)
-            .parse_all(&wasm)
-            .filter_map(
-                |payload| match payload.expect("parse translated framebuffer fixture") {
-                    wasmparser::Payload::MemorySection(section) => Some(section.count()),
-                    _ => None,
+    fn caller_limits_accept_exact_boundaries_and_reject_excess() {
+        let program = assemble(
+            Some(InstructionSetKind::Latest32),
+            "%rw_data_size = 65536\n%stack_size = 4096\npub @main:\na0 = 42\nret",
+        )
+        .unwrap();
+        let limits = Limits {
+            max_program_bytes: program.len(),
+            max_rw_data_bytes: 65536,
+            max_stack_bytes: 4096,
+            max_heap_bytes: 0,
+        };
+        for compile in [translate, translate_partitioned] {
+            let wasm = compile(&program, limits).unwrap();
+            let (mut store, instance) = instance_from_wasm(&wasm);
+            let begin = instance
+                .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                .unwrap();
+            assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+            assert_eq!(register_values(&store, instance)[Reg::A0 as usize], 42);
+            for restricted in [
+                Limits {
+                    max_program_bytes: program.len() - 1,
+                    ..limits
                 },
-            )
-            .sum::<u32>();
-        assert_eq!(
-            memory_count, 1,
-            "translated guests must not require the WebAssembly multi-memory proposal"
+                Limits {
+                    max_rw_data_bytes: 65535,
+                    ..limits
+                },
+                Limits {
+                    max_stack_bytes: 4095,
+                    ..limits
+                },
+            ] {
+                assert!(compile(&program, restricted).is_err());
+            }
+            assert!(compile(&[], limits).is_err());
+        }
+    }
+
+    #[test]
+    fn heap_limit_controls_growth_without_losing_the_current_break() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A1, 4096),
+                asm::sbrk(Reg::A0, Reg::A1),
+                asm::load_imm(Reg::A1, 1),
+                asm::sbrk(Reg::A2, Reg::A1),
+                asm::load_imm(Reg::A1, 0),
+                asm::sbrk(Reg::A3, Reg::A1),
+                asm::ret(),
+            ],
+            &[],
         );
+        let program = builder.into_vec().unwrap();
+        let heap_base = super::MemoryMapBuilder::new(super::PAGE_SIZE)
+            .stack_size(4096)
+            .build()
+            .unwrap()
+            .heap_base() as u64;
+        for compile in [translate, translate_partitioned] {
+            for max_heap_bytes in [4096, 0] {
+                let wasm = compile(
+                    &program,
+                    Limits {
+                        max_heap_bytes,
+                        ..TEST_LIMITS
+                    },
+                )
+                .unwrap();
+                let (mut store, instance) = instance_from_wasm(&wasm);
+                let begin = instance
+                    .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                    .unwrap();
+                assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_FINISHED);
+                let registers = register_values(&store, instance);
+                assert_eq!(
+                    registers[Reg::A0 as usize],
+                    if max_heap_bytes == 0 {
+                        0
+                    } else {
+                        heap_base + 4096
+                    },
+                );
+                assert_eq!(registers[Reg::A2 as usize], 0);
+                assert_eq!(
+                    registers[Reg::A3 as usize],
+                    heap_base + u64::from(max_heap_bytes),
+                );
+            }
+        }
     }
 
     #[test]
@@ -2701,7 +2831,7 @@ mod tests {
             interpreter_registers(&program)
         );
 
-        let wasm = translate(&program).unwrap();
+        let wasm = translate(&program, TEST_LIMITS).unwrap();
         for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
             match payload.unwrap() {
                 wasmparser::Payload::CustomSection(section)
@@ -2751,11 +2881,11 @@ mod tests {
         ));
         for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
             let program = assemble(Some(isa), &source).unwrap();
-            let wasm = translate_with_part_limit(&program, Some(1)).unwrap();
+            let wasm = translate_with_part_limit(&program, TEST_LIMITS, Some(1)).unwrap();
             assert_eq!(code_parts(&wasm).count(), 2, "fixture must cross parts");
             for wasm in [
-                translate(&program).unwrap(),
-                translate_partitioned(&program).unwrap(),
+                translate(&program, TEST_LIMITS).unwrap(),
+                translate_partitioned(&program, TEST_LIMITS).unwrap(),
                 wasm,
             ] {
                 let (mut store, instance) = instance_from_wasm(&wasm);

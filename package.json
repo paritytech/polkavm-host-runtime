@@ -10,8 +10,9 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @parity/polkavm-browser-runtime",
-    "test": "npm run test --workspace @parity/polkavm-browser-runtime && node scripts/verify-browser-assets.mjs",
+    "test": "npm run test --workspace @parity/polkavm-browser-runtime && node --test scripts/*.test.mjs && node scripts/verify-browser-assets.mjs",
     "verify:assets": "node scripts/verify-browser-assets.mjs",
+    "verify:notices": "node scripts/generate-third-party-notices.mjs --check",
     "manifest": "node scripts/create-release-manifest.mjs --output artifacts/runtime-release.json",
     "pack:browser": "npm pack --workspace @parity/polkavm-browser-runtime"
   },

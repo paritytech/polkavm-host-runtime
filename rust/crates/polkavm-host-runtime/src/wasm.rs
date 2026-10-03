@@ -2,6 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Browser-only Wasm ABI. Unless documented otherwise, status operations return
+//! zero on success and one on failure; error accessors expose the last diagnostic
+//! as UTF-8 bytes.
+//!
+//! Output pointers are read-only offsets into this module's linear memory, valid
+//! until the corresponding output is replaced, cleared, or reset. Staging is the
+//! only writable region exposed to callers and must be filled before consumption.
+//! JavaScript must refresh memory views after calls that can grow memory.
+//!
+//! SAFETY: the `polkavm_browser_*` export names are unique in this Wasm module.
+//! Individual allowances permit their required unmangled symbols; other code
+//! remains subject to the workspace unsafe-code policy.
+
 use crate::{
     keyboard_insets_records, safe_area_insets_records, ApplicationRuntime, AudioChunk, Frame,
     GpuBatch, InputEvent, InputEventType, MediatedInputCommand, MediatedInputStatus,
@@ -16,7 +29,16 @@ use std::collections::HashMap;
 
 const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_STAGING_BYTES: usize = MAX_ASSET_FILE_BYTES + MAX_ASSET_NAME_BYTES;
+const TRANSLATION_LIMITS: polkavm_wasm_compiler::Limits = polkavm_wasm_compiler::Limits {
+    max_program_bytes: MAX_PROGRAM_BYTES,
+    max_rw_data_bytes: crate::MAX_GUEST_RW_DATA_BYTES,
+    max_stack_bytes: crate::MAX_GUEST_STACK_BYTES,
+    max_heap_bytes: crate::MAX_GUEST_HEAP_BYTES,
+};
 
+// SAFETY: the browser host provides these synchronous imports. random_fill writes
+// only the supplied region and must not retain the pointer or re-enter the runtime.
+#[allow(unsafe_code)]
 #[link(wasm_import_module = "polkavm_browser")]
 unsafe extern "C" {
     #[link_name = "clock_wall_ms"]
@@ -25,7 +47,9 @@ unsafe extern "C" {
     fn browser_random_fill(pointer: *mut u8, length: usize) -> i32;
 }
 
+#[allow(unsafe_code)] // Narrow boundary to the synchronous browser clock import.
 pub(crate) fn wall_clock_ns() -> u64 {
+    // SAFETY: the clock import takes no pointers and does not re-enter the runtime.
     let milliseconds = unsafe { browser_clock_wall_ms() };
     if !milliseconds.is_finite() || milliseconds < 0.0 {
         return 0;
@@ -33,7 +57,9 @@ pub(crate) fn wall_clock_ns() -> u64 {
     (milliseconds as u64).saturating_mul(1_000_000)
 }
 
+#[allow(unsafe_code)] // Narrow boundary to the synchronous browser random import.
 pub(crate) fn fill_random(bytes: &mut [u8]) -> i32 {
+    // SAFETY: bytes is exclusively borrowed and valid for the synchronous call.
     unsafe { browser_random_fill(bytes.as_mut_ptr(), bytes.len()) }
 }
 
@@ -128,16 +154,22 @@ fn status(operation: impl FnOnce(&mut BrowserHost) -> Result<()>) -> u32 {
     })
 }
 
+/// Return the browser ABI version.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_abi_version() -> u32 {
     2
 }
 
+/// Stop the runtime and invalidate all staging, translation, and output buffers.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_reset() {
     HOST.with(|host| *host.borrow_mut() = BrowserHost::new());
 }
 
+/// Allocate bounded writable staging bytes; return their offset, or zero on error.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_staging_reserve(length: u32) -> u32 {
     HOST.with(|host| {
@@ -154,27 +186,36 @@ pub extern "C" fn polkavm_browser_staging_reserve(length: u32) -> u32 {
     })
 }
 
+/// Translate the staged program into a single Wasm module; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_translate_staged() -> u32 {
     status(|host| {
-        host.translation = crate::wasm_codegen::translate(&host.staging)?;
+        host.translation = polkavm_wasm_compiler::translate(&host.staging, TRANSLATION_LIMITS)?;
         Ok(())
     })
 }
 
+/// Translate the staged program into a root with embedded code parts; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_translate_partitioned_staged() -> u32 {
     status(|host| {
-        host.translation = crate::wasm_codegen::translate_partitioned(&host.staging)?;
+        host.translation =
+            polkavm_wasm_compiler::translate_partitioned(&host.staging, TRANSLATION_LIMITS)?;
         Ok(())
     })
 }
 
+/// Return the translated root module's read-only memory offset.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_translation_pointer() -> u32 {
     HOST.with(|host| host.borrow().translation.as_ptr() as usize as u32)
 }
 
+/// Return the translated root module's length in bytes, including embedded parts.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_translation_length() -> u32 {
     HOST.with(|host| host.borrow().translation.len() as u32)
@@ -216,11 +257,15 @@ fn launch_begin(max_gas_per_update: u64, audio_enabled: u32, presentation: u32) 
     })
 }
 
+/// Consume the staged program and begin a framebuffer launch; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_launch_begin(max_gas_per_update: u64, audio_enabled: u32) -> u32 {
     launch_begin(max_gas_per_update, audio_enabled, 0)
 }
 
+/// Begin launch with profile 0=framebuffer, 1=Tri2D, 2=raster GPU, or 3=full GPU.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_launch_begin_v2(
     max_gas_per_update: u64,
@@ -230,6 +275,8 @@ pub extern "C" fn polkavm_browser_launch_begin_v2(
     launch_begin(max_gas_per_update, audio_enabled, presentation)
 }
 
+/// Consume staged UTF-8 path bytes followed by asset content; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_launch_add_asset(path_length: u32) -> u32 {
     status(|host| {
@@ -269,6 +316,8 @@ pub extern "C" fn polkavm_browser_launch_add_asset(path_length: u32) -> u32 {
     })
 }
 
+/// Instantiate the pending launch using the interpreter backend; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_launch_start() -> u32 {
     status(|host| {
@@ -290,6 +339,8 @@ pub extern "C" fn polkavm_browser_launch_start() -> u32 {
     })
 }
 
+/// Consume staged random bytes for the running guest; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_random_bytes() -> u32 {
     status(|host| {
@@ -298,6 +349,8 @@ pub extern "C" fn polkavm_browser_set_random_bytes() -> u32 {
     })
 }
 
+/// Return one when the running guest imports motion support, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_uses_motion() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -306,6 +359,8 @@ pub extern "C" fn polkavm_browser_uses_motion() -> u32 {
     })
 }
 
+/// Return one when the running guest imports pointer capture, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_uses_pointer_capture() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -314,6 +369,8 @@ pub extern "C" fn polkavm_browser_uses_pointer_capture() -> u32 {
     })
 }
 
+/// Set whether the host supports pointer capture; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_pointer_capture_supported(supported: u32) -> u32 {
     status(|host| {
@@ -323,12 +380,15 @@ pub extern "C" fn polkavm_browser_set_pointer_capture_supported(supported: u32) 
     })
 }
 
+/// Report whether pointer capture is active; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_pointer_capture_active(active: u32) -> u32 {
     status(|host| host.running()?.set_pointer_capture_active(active != 0))
 }
 
 /// Returns 0 when the guest asked for nothing, 1 to arm capture, 2 to release.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_pointer_capture_request() -> u32 {
     HOST.with(|host| match &mut host.borrow_mut().phase {
@@ -341,6 +401,8 @@ pub extern "C" fn polkavm_browser_take_pointer_capture_request() -> u32 {
     })
 }
 
+/// Set the motion-wire availability value; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_motion_availability(availability: u32) -> u32 {
     status(|host| {
@@ -351,6 +413,8 @@ pub extern "C" fn polkavm_browser_set_motion_availability(availability: u32) -> 
     })
 }
 
+/// Consume a staged motion-wire sample for the guest; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_motion_sample() -> u32 {
     status(|host| {
@@ -359,6 +423,8 @@ pub extern "C" fn polkavm_browser_send_motion_sample() -> u32 {
     })
 }
 
+/// Consume the staged GPU capability record; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_gpu_capabilities() -> u32 {
     status(|host| {
@@ -367,6 +433,8 @@ pub extern "C" fn polkavm_browser_set_gpu_capabilities() -> u32 {
     })
 }
 
+/// Consume a staged GPU event for the guest; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_gpu_event() -> u32 {
     status(|host| {
@@ -376,6 +444,7 @@ pub extern "C" fn polkavm_browser_send_gpu_event() -> u32 {
 }
 
 /// Returns 0 on admission, 1 on a terminal/invalid response, and 2 on retryable backpressure.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
     HOST.with(|host| {
@@ -401,6 +470,7 @@ pub extern "C" fn polkavm_browser_send_host_frame_response() -> u32 {
 }
 
 /// Number of accepted responses still waiting for the guest to poll them.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_pending_host_frame_responses() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -409,6 +479,8 @@ pub extern "C" fn polkavm_browser_pending_host_frame_responses() -> u32 {
     })
 }
 
+/// Consume staged NUL-separated UTF-8 mediated-input kinds; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_set_mediated_input_kinds() -> u32 {
     status(|host| {
@@ -419,6 +491,8 @@ pub extern "C" fn polkavm_browser_set_mediated_input_kinds() -> u32 {
         host.running()?.set_mediated_input_kinds(&kinds)
     })
 }
+/// Complete a mediated-input handle, forwarding staged data only for Ready results.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_mediated_input_result(handle: u32, result: u32) -> u32 {
     status(|host| {
@@ -432,11 +506,15 @@ pub extern "C" fn polkavm_browser_send_mediated_input_result(handle: u32, result
     })
 }
 
+/// Invoke guest initialization; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_init() -> u32 {
     status(|host| host.running()?.init())
 }
 
+/// Set elapsed milliseconds and invoke the guest update; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_update(time_ms: f64) -> u32 {
     status(|host| {
@@ -449,6 +527,8 @@ pub extern "C" fn polkavm_browser_update(time_ms: f64) -> u32 {
     })
 }
 
+/// Return one when the running guest imports update scheduling, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_uses_update_scheduling() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -457,6 +537,8 @@ pub extern "C" fn polkavm_browser_uses_update_scheduling() -> u32 {
     })
 }
 
+/// Return the requested update delay, or UPDATE_AFTER_IDLE when idle or unsupported.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_update_after_ms() -> u32 {
     HOST.with(|host| match &host.borrow().phase {
@@ -467,6 +549,8 @@ pub extern "C" fn polkavm_browser_update_after_ms() -> u32 {
     })
 }
 
+/// Release held input and discard retained audio; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_pause_input() -> u32 {
     status(|host| {
@@ -476,6 +560,8 @@ pub extern "C" fn polkavm_browser_pause_input() -> u32 {
     })
 }
 
+/// Queue a checked compact input event; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_input(event_type: u32, code: u32, x: u32, y: u32) -> u32 {
     status(|host| {
@@ -506,6 +592,8 @@ pub extern "C" fn polkavm_browser_send_input(event_type: u32, code: u32, x: u32,
     })
 }
 
+/// Consume one staged extended input record; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_input_record() -> u32 {
     status(|host| {
@@ -517,6 +605,8 @@ pub extern "C" fn polkavm_browser_send_input_record() -> u32 {
     })
 }
 
+/// Queue checked safe-area or keyboard inset records; return status.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_send_view_insets(
     event_type: u32,
@@ -539,6 +629,8 @@ pub extern "C" fn polkavm_browser_send_view_insets(
     })
 }
 
+/// Retain the next framebuffer output; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_frame() -> u32 {
     HOST.with(|host| {
@@ -551,16 +643,22 @@ pub extern "C" fn polkavm_browser_take_frame() -> u32 {
     })
 }
 
+/// Return the retained framebuffer width in pixels, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_frame_width() -> u32 {
     HOST.with(|host| host.borrow().frame.as_ref().map_or(0, |frame| frame.width))
 }
 
+/// Return the retained framebuffer height in pixels, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_frame_height() -> u32 {
     HOST.with(|host| host.borrow().frame.as_ref().map_or(0, |frame| frame.height))
 }
 
+/// Return the retained framebuffer's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_frame_pointer() -> u32 {
     HOST.with(|host| {
@@ -571,6 +669,8 @@ pub extern "C" fn polkavm_browser_frame_pointer() -> u32 {
     })
 }
 
+/// Return the retained framebuffer length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_frame_length() -> u32 {
     HOST.with(|host| {
@@ -581,6 +681,8 @@ pub extern "C" fn polkavm_browser_frame_length() -> u32 {
     })
 }
 
+/// Retain the next Tri2D frame; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_tri2d() -> u32 {
     HOST.with(|host| {
@@ -593,6 +695,8 @@ pub extern "C" fn polkavm_browser_take_tri2d() -> u32 {
     })
 }
 
+/// Return the retained Tri2D frame's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_tri2d_pointer() -> u32 {
     HOST.with(|host| {
@@ -603,6 +707,8 @@ pub extern "C" fn polkavm_browser_tri2d_pointer() -> u32 {
     })
 }
 
+/// Return the retained Tri2D frame length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_tri2d_length() -> u32 {
     HOST.with(|host| {
@@ -613,6 +719,8 @@ pub extern "C" fn polkavm_browser_tri2d_length() -> u32 {
     })
 }
 
+/// Retain the next UI semantics frame; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_ui_semantics() -> u32 {
     HOST.with(|host| {
@@ -625,6 +733,8 @@ pub extern "C" fn polkavm_browser_take_ui_semantics() -> u32 {
     })
 }
 
+/// Return the retained UI semantics frame's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_ui_semantics_pointer() -> u32 {
     HOST.with(|host| {
@@ -635,6 +745,8 @@ pub extern "C" fn polkavm_browser_ui_semantics_pointer() -> u32 {
     })
 }
 
+/// Return the retained UI semantics frame length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_ui_semantics_length() -> u32 {
     HOST.with(|host| {
@@ -645,6 +757,8 @@ pub extern "C" fn polkavm_browser_ui_semantics_length() -> u32 {
     })
 }
 
+/// Retain the next UI output frame; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_ui_output() -> u32 {
     HOST.with(|host| {
@@ -657,6 +771,8 @@ pub extern "C" fn polkavm_browser_take_ui_output() -> u32 {
     })
 }
 
+/// Return the retained UI output frame's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_ui_output_pointer() -> u32 {
     HOST.with(|host| {
@@ -667,6 +783,8 @@ pub extern "C" fn polkavm_browser_ui_output_pointer() -> u32 {
     })
 }
 
+/// Return the retained UI output frame length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_ui_output_length() -> u32 {
     HOST.with(|host| {
@@ -677,6 +795,8 @@ pub extern "C" fn polkavm_browser_ui_output_length() -> u32 {
     })
 }
 
+/// Retain the next GPU batch; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_gpu_batch() -> u32 {
     HOST.with(|host| {
@@ -689,6 +809,8 @@ pub extern "C" fn polkavm_browser_take_gpu_batch() -> u32 {
     })
 }
 
+/// Return the retained GPU batch's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_gpu_batch_pointer() -> u32 {
     HOST.with(|host| {
@@ -699,6 +821,8 @@ pub extern "C" fn polkavm_browser_gpu_batch_pointer() -> u32 {
     })
 }
 
+/// Return the retained GPU batch length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_gpu_batch_length() -> u32 {
     HOST.with(|host| {
@@ -709,6 +833,8 @@ pub extern "C" fn polkavm_browser_gpu_batch_length() -> u32 {
     })
 }
 
+/// Retain the next host-frame request; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_host_frame_request() -> u32 {
     HOST.with(|host| {
@@ -721,6 +847,8 @@ pub extern "C" fn polkavm_browser_take_host_frame_request() -> u32 {
     })
 }
 
+/// Return the retained host-frame request's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_host_frame_request_pointer() -> u32 {
     HOST.with(|host| {
@@ -731,6 +859,8 @@ pub extern "C" fn polkavm_browser_host_frame_request_pointer() -> u32 {
     })
 }
 
+/// Return the retained host-frame request length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_host_frame_request_length() -> u32 {
     HOST.with(|host| {
@@ -741,6 +871,8 @@ pub extern "C" fn polkavm_browser_host_frame_request_length() -> u32 {
     })
 }
 
+/// Retain the next mediated-input command: zero=none, one=request, two=cancel.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_mediated_input_command() -> u32 {
     HOST.with(|host| {
@@ -757,6 +889,8 @@ pub extern "C" fn polkavm_browser_take_mediated_input_command() -> u32 {
     })
 }
 
+/// Return the retained mediated-input command's handle, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_handle() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -766,6 +900,8 @@ pub extern "C" fn polkavm_browser_mediated_input_handle() -> u32 {
     })
 }
 
+/// Return the retained request's maximum result size in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_max_bytes() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -774,6 +910,8 @@ pub extern "C" fn polkavm_browser_mediated_input_max_bytes() -> u32 {
     })
 }
 
+/// Return the retained request kind's read-only UTF-8 memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_kind_pointer() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -782,6 +920,8 @@ pub extern "C" fn polkavm_browser_mediated_input_kind_pointer() -> u32 {
     })
 }
 
+/// Return the retained request kind's UTF-8 length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_kind_length() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -790,6 +930,8 @@ pub extern "C" fn polkavm_browser_mediated_input_kind_length() -> u32 {
     })
 }
 
+/// Return the retained request media type's read-only UTF-8 offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_media_type_pointer() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -798,6 +940,8 @@ pub extern "C" fn polkavm_browser_mediated_input_media_type_pointer() -> u32 {
     })
 }
 
+/// Return the retained request media type's UTF-8 length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_mediated_input_media_type_length() -> u32 {
     HOST.with(|host| match host.borrow().mediated_input_command.as_ref() {
@@ -805,6 +949,8 @@ pub extern "C" fn polkavm_browser_mediated_input_media_type_length() -> u32 {
         _ => 0,
     })
 }
+/// Retain the next audio chunk; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_audio() -> u32 {
     HOST.with(|host| {
@@ -817,6 +963,8 @@ pub extern "C" fn polkavm_browser_take_audio() -> u32 {
     })
 }
 
+/// Return the retained audio chunk's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_audio_pointer() -> u32 {
     HOST.with(|host| {
@@ -827,6 +975,8 @@ pub extern "C" fn polkavm_browser_audio_pointer() -> u32 {
     })
 }
 
+/// Return the retained audio chunk's interleaved i16 sample count, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_audio_length() -> u32 {
     HOST.with(|host| {
@@ -837,6 +987,8 @@ pub extern "C" fn polkavm_browser_audio_length() -> u32 {
     })
 }
 
+/// Return the retained audio chunk's sample rate in Hz, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_audio_sample_rate() -> u32 {
     HOST.with(|host| {
@@ -847,6 +999,8 @@ pub extern "C" fn polkavm_browser_audio_sample_rate() -> u32 {
     })
 }
 
+/// Return the retained audio chunk's channel count, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_audio_channels() -> u32 {
     HOST.with(|host| {
@@ -857,6 +1011,8 @@ pub extern "C" fn polkavm_browser_audio_channels() -> u32 {
     })
 }
 
+/// Retain the next guest log message; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_log() -> u32 {
     HOST.with(|host| {
@@ -869,6 +1025,8 @@ pub extern "C" fn polkavm_browser_take_log() -> u32 {
     })
 }
 
+/// Return the retained log message's read-only UTF-8 memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_log_pointer() -> u32 {
     HOST.with(|host| {
@@ -879,11 +1037,15 @@ pub extern "C" fn polkavm_browser_log_pointer() -> u32 {
     })
 }
 
+/// Return the retained log message's UTF-8 length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_log_length() -> u32 {
     HOST.with(|host| host.borrow().log.as_ref().map_or(0, |log| log.len() as u32))
 }
 
+/// Retain the next save payload; return one if present, otherwise zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_take_save() -> u32 {
     HOST.with(|host| {
@@ -896,6 +1058,8 @@ pub extern "C" fn polkavm_browser_take_save() -> u32 {
     })
 }
 
+/// Return the retained save payload's read-only memory offset, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_save_pointer() -> u32 {
     HOST.with(|host| {
@@ -906,6 +1070,8 @@ pub extern "C" fn polkavm_browser_save_pointer() -> u32 {
     })
 }
 
+/// Return the retained save payload length in bytes, or zero.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_save_length() -> u32 {
     HOST.with(|host| {
@@ -916,16 +1082,22 @@ pub extern "C" fn polkavm_browser_save_length() -> u32 {
     })
 }
 
+/// Return the last error's read-only UTF-8 memory offset.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_error_pointer() -> u32 {
     HOST.with(|host| host.borrow().error.as_ptr() as usize as u32)
 }
 
+/// Return the last error's UTF-8 length in bytes.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_error_length() -> u32 {
     HOST.with(|host| host.borrow().error.len() as u32)
 }
 
+/// Discard retained output buffers without resetting the running guest.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]
 pub extern "C" fn polkavm_browser_clear_outputs() {
     HOST.with(|host| host.borrow_mut().clear_outputs());

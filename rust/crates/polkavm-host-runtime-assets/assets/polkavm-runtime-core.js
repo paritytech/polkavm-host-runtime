@@ -697,6 +697,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     return program;
   }
 
+  async function instantiateRuntime(runtime, imports) {
+    const result = await WebAssembly.instantiate(runtime, imports);
+    return (result instanceof WebAssembly.Instance ? result : result.instance).exports;
+  }
+
   async function start(message) {
     if (disposed) {
       throw new Error("PolkaVM browser worker is stopped");
@@ -747,9 +752,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         },
       },
     };
-    pvm = (
-      await WebAssembly.instantiate(message.runtime, runtimeImports)
-    ).instance.exports;
+    pvm = await instantiateRuntime(message.runtime, runtimeImports);
     if (disposed) {
       pvm.polkavm_browser_reset?.();
       return;
@@ -813,9 +816,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
           );
           compilerStage = "compiler-translating-parts";
-          pvm = (
-            await WebAssembly.instantiate(message.runtime, runtimeImports)
-          ).instance.exports;
+          pvm = await instantiateRuntime(message.runtime, runtimeImports);
           if (disposed) {
             pvm.polkavm_browser_reset?.();
             return;
@@ -905,9 +906,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
       }
       if (pvm === null) {
-        pvm = (
-          await WebAssembly.instantiate(message.runtime, runtimeImports)
-        ).instance.exports;
+        pvm = await instantiateRuntime(message.runtime, runtimeImports);
         if (disposed) {
           pvm.polkavm_browser_reset?.();
           return;

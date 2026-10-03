@@ -5,6 +5,7 @@ members = [
     "rust/crates/polkavm-motion-wire",
     "rust/crates/polkavm-ui-wire",
     "rust/crates/polkavm-host-runtime",
+    "rust/crates/polkavm-wasm-compiler",
     "rust/crates/polkavm-host-runtime-assets",
     "rust/crates/polkavm-assets-export",
 ]
