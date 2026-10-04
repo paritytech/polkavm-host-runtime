@@ -12,6 +12,8 @@ export function startSession(options) {
   let worker;
   let state = "starting";
   let stopTimer;
+  let fatalError;
+  const privateCachesEnabled = options.fileCache === true;
   let onOutput = options.onOutput;
   let resolveReady;
   let rejectReady;
@@ -25,9 +27,11 @@ export function startSession(options) {
   const terminal = new Promise((resolve) => { resolveTerminal = resolve; });
   const asError = (error) => error instanceof Error ? error : new Error(String(error));
 
-  function finish(result) {
+  function finish(result, cleanupConfirmed = false) {
     if (state === "terminated") return;
     state = "terminated";
+    if (fatalError) result = { ...result, reason: "error", error: fatalError };
+    if (privateCachesEnabled && !cleanupConfirmed) result.cleanupFailed = true;
     clearTimeout(stopTimer);
     if (worker) {
       worker.removeEventListener("message", receive);
@@ -41,6 +45,27 @@ export function startSession(options) {
     resolveTerminal(result);
   }
 
+  function fail(error) {
+    fatalError ??= asError(error);
+    rejectReady(fatalError);
+  }
+
+  function requestStop() {
+    if (state === "terminated" || state === "stopping") return terminal;
+    state = "stopping";
+    rejectReady(fatalError ?? new DOMException("Session stopped before ready", "AbortError"));
+    // Cleanup normally completes before the worker acknowledges stop. Bound the
+    // wait for busy/broken workers, without claiming unconfirmed cache deletion.
+    stopTimer = setTimeout(() => finish({ reason: "stopped" }), 1000);
+    try {
+      worker.postMessage({ type: "stop" });
+    } catch (error) {
+      fail(error);
+      finish({ reason: "error", error: fatalError });
+    }
+    return terminal;
+  }
+
   function receive(event) {
     if (state === "terminated") return;
     const output = event.data;
@@ -50,18 +75,24 @@ export function startSession(options) {
     }
     // A late ready/frame cannot resurrect a session after stop was requested.
     if (state === "stopping" && output.type !== "mediated-input-cancel" &&
-        output.type !== "error" && output.type !== "terminated") return;
+        output.type !== "file-registrations" && output.type !== "error" &&
+        output.type !== "terminated") return;
     const stopping = state === "stopping";
+    if (output.type === "error" && output.fatal !== false) fail(new Error(output.message));
     try {
       onOutput?.(output);
     } catch (error) {
-      finish({ reason: "error", error: asError(error) });
-      return;
+      // Do not call a broken observer again for errors or cleanup cancellation.
+      onOutput = undefined;
+      fail(error);
     }
-    if (output.type === "error") {
-      finish({ reason: "error", error: new Error(output.message) });
-    } else if (output.type === "terminated") {
-      finish({ reason: stopping ? "stopped" : "terminated" });
+    if (output.type === "terminated") {
+      finish({
+        reason: stopping ? "stopped" : "terminated",
+        ...(output.cleanupFailed === true ? { cleanupFailed: true } : {}),
+      }, true);
+    } else if (fatalError) {
+      requestStop();
     }
   }
 
@@ -88,24 +119,12 @@ export function startSession(options) {
       try {
         worker.postMessage(input);
       } catch (error) {
-        finish({ reason: "error", error: asError(error) });
+        fail(error);
+        requestStop();
         throw error;
       }
     },
-    stop() {
-      if (state === "terminated" || state === "stopping") return terminal;
-      state = "stopping";
-      rejectReady(new DOMException("Session stopped before ready", "AbortError"));
-      // Normally the worker cancels active mediated inputs and acknowledges stop.
-      // A busy or broken guest must not retain a Worker indefinitely.
-      stopTimer = setTimeout(() => finish({ reason: "stopped" }), 1000);
-      try {
-        worker.postMessage({ type: "stop" });
-      } catch (error) {
-        finish({ reason: "error", error: asError(error) });
-      }
-      return terminal;
-    },
+    stop: requestStop,
   };
 
   try {
@@ -120,7 +139,9 @@ export function startSession(options) {
     worker.addEventListener("messageerror", messageError);
     worker.postMessage({ ...startup, type: "start" });
   } catch (error) {
-    finish({ reason: "error", error: asError(error) });
+    fail(error);
+    if (worker) requestStop();
+    else finish({ reason: "error", error: fatalError });
   }
   return session;
 }

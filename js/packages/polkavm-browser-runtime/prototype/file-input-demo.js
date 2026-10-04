@@ -3,23 +3,22 @@ import { attachFileInputControls } from "../src/file-input-router.js";
 const supafaust = {
   id: "supafaust",
   displayName: "Supafaust",
-  manifest: {
-    runtime: { kind: "polkavm", abiVersion: 1, entrypoint: "app.polkavm" },
-    capabilities: {
-      fileInput: {
-        abiVersion: 1,
-        handlers: [
-          {
-            id: "snes-rom",
-            label: "SNES cartridge image",
-            extensions: [".sfc", ".smc", ".swc", ".fig"],
-            maxBytes: 16 * 1024 * 1024,
-            mountPath: "game/cartridge.sfc",
-          },
-        ],
+  entrypoint: "app.polkavm",
+  // Simulated runtime file-registrations output, not discovery metadata.
+  registrations: [
+    {
+      handle: 1,
+      descriptor: {
+        id: "snes-rom",
+        label: "SNES cartridge image",
+        extensions: [".sfc", ".smc", ".swc", ".fig"],
+        mimeTypes: ["application/x-snes-rom"],
+        delivery: "relaunch",
+        maxBytes: 16 * 1024 * 1024,
+        mountPath: "game/cartridge.sfc",
       },
     },
-  },
+  ],
 };
 
 const dropTarget = document.querySelector("#drop-zone");
@@ -38,6 +37,7 @@ function askForConsent({ file, product, handler }) {
       dialog.close();
       confirmButton.onclick = null;
       cancelButton.onclick = null;
+      dialog.oncancel = null;
       resolve(approved);
     };
     confirmButton.onclick = () => finish(true);
@@ -54,21 +54,21 @@ attachFileInputControls({
   dropTarget,
   openButton,
   confirmDelivery: askForConsent,
-  launchProduct({ product, handler, asset }) {
-    // This prototype demonstrates the handoff only; no guest is launched.
+  sendToRuntime({ product, handle, handler, message }) {
+    // This prototype displays the handoff only; there is no runtime execution.
     const heading = document.createElement("strong");
     heading.textContent = `Simulated delivery to ${product.displayName}`;
     result.replaceChildren(
       heading,
       document.createElement("br"),
       document.createTextNode(
-        `${asset.bytes.byteLength.toLocaleString()} bytes read for ${handler.mountPath}. No emulator was launched or cartridge validated.`,
+        `${message.bytes.byteLength.toLocaleString()} bytes prepared in a file-input message for handle ${handle}. The runtime would decide whether to relaunch using ${handler.mountPath}. No message was sent, emulator launched, or cartridge validated.`,
       ),
     );
   },
   onResult(delivery) {
     if (delivery.status === "unhandled") {
-      result.textContent = "No installed product registered a handler for that file.";
+      result.textContent = "No simulated runtime registration accepts that file.";
     } else if (delivery.status === "declined" || delivery.status === "cancelled") {
       result.textContent = "Delivery cancelled. The file was not read.";
     } else if (delivery.status === "rejected") {

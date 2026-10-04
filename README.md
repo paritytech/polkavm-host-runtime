@@ -24,6 +24,12 @@ The repository owns one implementation of the App Manifest v2 PolkaVM execution 
 - `docs/runtime/polkavm-app-abi-v1.md`: application ABI contract.
 - `docs/runtime/tri2d-v1.md`: Tri2D frame, command, retained-resource, and limit contract.
 
+The engine is pinned to immutable upstream revision
+`642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` (0.37.0), which includes the
+interpreter stack-residency fix: resident stack length is bounded by the
+declared stack size, independently of allocation capacity. Native and browser
+interpreter builds use that same upstream crate; no local engine fork is needed.
+
 ## Host boundary
 
 Native Hosts can consume `polkavm-host-runtime` directly. TrUAPI-based native
@@ -55,6 +61,16 @@ the runtime retries with bounded code modules sharing guest memory, registers,
 and dispatch state before falling back to the interpreter. Cached compiled
 programs include the root and every code module; instantiation creates fresh
 guest state.
+
+File handlers are runtime registrations on the mediated-input lifecycle
+(ABI v1 §File input). A Host declares the deliveries it serves with
+`set_file_input_support` (browser start option `fileInput`), reads the
+registrations with `file_registrations` (`file-registrations` messages), and
+delivers a selected file with `send_file_input` (`file-input`). The runtime
+enforces descriptor rules and `maxBytes` before any byte reaches the guest. A
+relaunch delivery stops the execution and returns the file, which the Host
+mounts in a fresh execution with `set_file_relaunch` (`fileRelaunch`).
+Registrations stay readable after an execution stops or fails.
 
 Application hosts may pause through `ApplicationRuntime::set_paused(bool)`.
 Updates do not execute while paused, execution-scoped monotonic clocks freeze,
@@ -90,7 +106,9 @@ GPU batches and protocol events likewise remain ordered and lossless; Hosts
 suppress new surface presentation rather than discard commands. Already
 submitted GPU work may complete at the transition. Hosts also suppress inactive
 clipboard/navigation actions, defer pointer-capture acquisition, and cancel
-new mediated-input prompts while retaining current cursor/IME state.
+new mediated-input prompts, including file pickers, while retaining current
+cursor/IME state. File deliveries accepted while inactive wait for the next
+executed update.
 Resume does not replay missed ticks or buffered audio, and stopping clears held
 presentation and cannot be reversed by queued work or asynchronous compilation.
 The worker and Wasm runtime must be rebuilt together:
@@ -147,7 +165,8 @@ The session owns one Worker; the Host owns all presentation and permissions.
 
 - Await `session.ready` before `session.send(input)`. Startup failure rejects it.
 - `RuntimeInput` and `RuntimeOutput` cover input, pause/background, graphics,
-  audio, host frames, mediated input, and compiler-cache messages.
+  audio, host frames, mediated input, runtime file registrations and delivery,
+  and compiler-cache messages.
 - Frame pixels are RGBA bytes; audio samples are signed-16-bit bytes. GPU and
   Tri2D outputs require their corresponding Host renderers.
 - Binary inputs are cloned rather than transferred; callers retain ownership.
@@ -157,6 +176,12 @@ The session owns one Worker; the Host owns all presentation and permissions.
   outstanding Host prompts, audio, graphics, and other resources on every terminal
   outcome, including startup/callback failure. Stopping before ready rejects
   `ready` with `AbortError`; queued startup work cannot resurrect the session.
+- A runtime error marked `fatal: false` reports a recoverable file-delivery
+  failure; it does not terminate the session. Fatal errors and output-callback
+  failures request runtime shutdown before the Worker is released.
+- With private file caching enabled, inspect `terminal.cleanupFailed`: it is
+  set if cleanup failed or a forced Worker termination left cleanup unconfirmed.
+  Worker termination alone is not proof that private disk files were removed.
 
 Run the [browser framebuffer example](js/packages/polkavm-browser-runtime/examples/framebuffer.html)
 after `npm run build`, serving the repository root over HTTP:
@@ -170,14 +195,15 @@ It loads the real fixture, renders its pixels, and exposes pause, background,
 and stop controls. Deployments must serve the Worker and Wasm URLs allowed by
 their CSP; do not mix files from different runtime revisions.
 
-The typed `./file-input-router` subpath routes selected-file metadata to validated
-`capabilities.fileInput` handlers. Its 128 MiB per-file ceiling matches native
-manifest validation and browser launch assets. An absent or `null` capability
-registers no handlers; malformed declarations are rejected, not silently skipped.
-Handler type lists may be omitted but not `null`, and handlers require the runtime
-entrypoint so their mount paths cannot collide with it. Control setup throws for
-malformed registrations; delivery errors return a `rejected` result.
-Bytes are read only after Host consent and delivered as bounded launch assets.
+The typed `./file-input-router` subpath routes selected-file metadata to the
+active runtime's `file-registrations` output, not manifest declarations.
+Products supply their ID, entrypoint and current `{ handle, descriptor }`
+registrations. The runtime validates handler bounds when the guest registers;
+the router rejects malformed or stale metadata rather than mounting files itself.
+Host consent precedes reading or delivering a selected file. The router passes
+`file-input` messages through the Host's `sendToRuntime` callback: stream
+handlers receive a Blob, while inline and relaunch handlers receive bounded
+bytes. The runtime owns readiness, cancellation and relaunch outcomes.
 The [file-input prototype](js/packages/polkavm-browser-runtime/prototype/file-input.html)
 demonstrates routing and consent; it simulates delivery, not an emulator.
 

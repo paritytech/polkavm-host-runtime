@@ -65,6 +65,10 @@ pub const MAX_GPU_TEXTURES: usize = 512;
 pub const MAX_GPU_TOTAL_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum width or height of a 2D texture, in texels.
 pub const MAX_GPU_TEXTURE_DIMENSION_2D: u32 = 4_096;
+/// Maximum width, height or depth of a 3D texture, in texels.
+pub const MAX_GPU_TEXTURE_DIMENSION_3D: u32 = 256;
+/// Maximum array layers in a 2D texture.
+pub const MAX_GPU_TEXTURE_ARRAY_LAYERS: u32 = 256;
 /// Maximum samples per texture texel.
 pub const MAX_GPU_TEXTURE_SAMPLE_COUNT: u32 = 1;
 /// Maximum mip levels in one texture.
@@ -105,6 +109,8 @@ pub const MAX_GPU_DRAWS_PER_BATCH: usize = 8_192;
 pub const MAX_GPU_COMPUTE_PASSES_PER_BATCH: usize = 64;
 /// Maximum compute dispatch commands encoded in one batch.
 pub const MAX_GPU_DISPATCHES_PER_BATCH: usize = 8_192;
+/// Bounds each pass's query count and the sum over one batch.
+pub const MAX_GPU_OCCLUSION_QUERIES_PER_BATCH: u32 = 4_096;
 
 /// Submission status: the batch was accepted.
 pub const GPU_SUBMIT_ACCEPTED: i32 = 0;
@@ -172,6 +178,12 @@ pub enum GpuCapabilityKey {
     MaxComputeWorkgroupsPerDimension = 20,
     /// Maximum dispatch commands per batch.
     MaxDispatchesPerBatch = 21,
+    /// Bitmask of supported additive raster features.
+    RasterFeatures = 22,
+    /// Maximum dimension of a 3D texture, in texels.
+    MaxTextureDimension3d = 23,
+    /// Maximum array layers in a 2D texture.
+    MaxTextureArrayLayers = 24,
 }
 
 /// Discriminants for asynchronous host-to-guest GPU events.
@@ -194,6 +206,8 @@ pub enum GpuEventType {
     DeviceLost = 7,
     /// A replacement GPU device is ready for resource recreation.
     DeviceRestored = 8,
+    /// A render pass's token and ordered 64-bit occlusion results.
+    OcclusionResults = 9,
 }
 
 /// Command discriminants in the GPU batch wire protocol.
@@ -258,6 +272,14 @@ pub enum GpuOpcode {
     DispatchWorkgroups = 28,
     /// End the active compute pass.
     EndComputePass = 29,
+    /// Set the active render pass's eight-bit stencil reference.
+    SetStencilReference = 30,
+    /// Set the active render pass's constant blend color.
+    SetBlendConstant = 31,
+    /// Begin an unused occlusion query declared by the active render pass.
+    BeginOcclusionQuery = 32,
+    /// End the active occlusion query.
+    EndOcclusionQuery = 33,
 }
 
 impl TryFrom<u16> for GpuOpcode {
@@ -294,6 +316,10 @@ impl TryFrom<u16> for GpuOpcode {
             27 => Ok(Self::SetComputeBindGroup),
             28 => Ok(Self::DispatchWorkgroups),
             29 => Ok(Self::EndComputePass),
+            30 => Ok(Self::SetStencilReference),
+            31 => Ok(Self::SetBlendConstant),
+            32 => Ok(Self::BeginOcclusionQuery),
+            33 => Ok(Self::EndOcclusionQuery),
             _ => Err(()),
         }
     }
@@ -317,6 +343,8 @@ pub enum GpuTextureFormat {
     Depth32Float = 6,
     /// One unsigned normalized 8-bit red component.
     R8Unorm = 7,
+    /// Depth with at least 24 bits of precision and an eight-bit stencil.
+    Depth24PlusStencil8 = 8,
 }
 
 /// Vertex attribute storage formats.
@@ -399,6 +427,28 @@ pub enum GpuCompareFunction {
     GreaterEqual = 7,
     /// Every comparison passes.
     Always = 8,
+}
+
+/// Operation updating a stored stencil value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GpuStencilOperation {
+    /// Leave the stored value unchanged.
+    Keep = 1,
+    /// Store zero.
+    Zero = 2,
+    /// Store the current stencil reference.
+    Replace = 3,
+    /// Invert every stencil bit.
+    Invert = 4,
+    /// Increment, saturating at the maximum value.
+    IncrementClamp = 5,
+    /// Decrement, saturating at zero.
+    DecrementClamp = 6,
+    /// Increment, wrapping after the maximum value.
+    IncrementWrap = 7,
+    /// Decrement, wrapping below zero.
+    DecrementWrap = 8,
 }
 
 /// Operation combining factored source and destination colors.
@@ -545,6 +595,8 @@ pub enum GpuVertexStepMode {
 pub enum GpuTextureDimension {
     /// Two-dimensional texture.
     D2 = 1,
+    /// Three-dimensional texture.
+    D3 = 2,
 }
 
 /// Dimensionality exposed by a texture view.
@@ -553,6 +605,14 @@ pub enum GpuTextureDimension {
 pub enum GpuTextureViewDimension {
     /// Two-dimensional texture view.
     D2 = 1,
+    /// Array of two-dimensional views.
+    D2Array = 2,
+    /// Six square faces forming one cube.
+    Cube = 3,
+    /// Array of complete six-face cubes.
+    CubeArray = 4,
+    /// Three-dimensional view without array-layer selection.
+    D3 = 5,
 }
 
 /// Subset of a texture's components exposed by a view.
@@ -564,6 +624,17 @@ pub enum GpuTextureAspect {
     /// Only the depth component.
     DepthOnly = 2,
 }
+
+/// Texture descriptor flag appending a depth or array-layer count.
+pub const GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS: u8 = 1;
+/// Raster feature bit enabling 3D, array and cube textures.
+pub const GPU_RASTER_FEATURE_LAYERED_TEXTURES: u64 = 1;
+/// Raster feature bit enabling stencil state and depth bias.
+pub const GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS: u64 = 2;
+/// Raster feature bit enabling constant blend factors and dynamic blend color.
+pub const GPU_RASTER_FEATURE_BLEND_CONSTANT: u64 = 4;
+/// Raster feature bit enabling asynchronous occlusion queries.
+pub const GPU_RASTER_FEATURE_OCCLUSION_QUERIES: u64 = 8;
 
 /// Buffer usage bit permitting copy-source operations.
 pub const GPU_BUFFER_USAGE_COPY_SRC: u32 = 4;
@@ -605,10 +676,38 @@ pub const GPU_RENDER_PASS_COLOR_STORE: u32 = 2;
 pub const GPU_RENDER_PASS_DEPTH_LOAD: u32 = 4;
 /// Render pass bit preserving depth after the pass.
 pub const GPU_RENDER_PASS_DEPTH_STORE: u32 = 8;
+/// Render pass bit loading existing stencil values rather than clearing.
+pub const GPU_RENDER_PASS_STENCIL_LOAD: u32 = 16;
+/// Render pass bit preserving stencil values after the pass.
+pub const GPU_RENDER_PASS_STENCIL_STORE: u32 = 32;
+/// Render pass bit appending an explicit stencil clear value.
+pub const GPU_RENDER_PASS_HAS_STENCIL_CLEAR: u32 = 64;
+/// Render pass bit appending the occlusion query count and guest token.
+pub const GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES: u32 = 128;
+/// All supported render pass flag bits.
+pub const GPU_RENDER_PASS_FLAGS: u32 = 255;
+/// Fixed render pass payload size before optional trailers.
+pub const GPU_RENDER_PASS_BYTES: usize = 36;
+/// Size of an explicit stencil clear value, in bytes.
+pub const GPU_RENDER_PASS_STENCIL_CLEAR_BYTES: usize = 4;
+/// Query count and guest token, after any stencil clear value.
+pub const GPU_RENDER_PASS_OCCLUSION_BYTES: usize = 8;
+/// Occlusion results: token, query count, then one `u64` per query.
+pub const GPU_OCCLUSION_RESULTS_HEADER_BYTES: usize = 8;
 /// Binding flag requiring a dynamic buffer offset at bind time.
 pub const GPU_BINDING_HAS_DYNAMIC_OFFSET: u16 = 1;
 /// Pipeline flag enabling depth-buffer writes.
 pub const GPU_PIPELINE_DEPTH_WRITE: u16 = 1;
+/// Pipeline flag appending stencil and depth-bias state.
+pub const GPU_PIPELINE_STENCIL_DEPTH_BIAS: u16 = 2;
+/// All supported render pipeline flag bits.
+pub const GPU_PIPELINE_FLAGS: u16 = 3;
+/// Fixed render pipeline payload size before counted arrays and trailers.
+pub const GPU_PIPELINE_HEADER_BYTES: usize = 40;
+/// Size of the stencil and depth-bias trailer, in bytes.
+pub const GPU_PIPELINE_STENCIL_DEPTH_BIAS_BYTES: usize = 24;
+/// Largest stencil reference or clear value.
+pub const MAX_GPU_STENCIL_VALUE: u32 = 255;
 
 /// Structural batch validation failure, before device execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -667,6 +766,15 @@ pub enum GpuWireError {
         index: u32,
         /// Raw flag bits.
         flags: u16,
+    },
+    /// Reserved flags in a command-specific payload were nonzero.
+    ReservedPayloadFlags {
+        /// Zero-based command index.
+        index: u32,
+        /// Command containing the flags.
+        opcode: GpuOpcode,
+        /// Raw flag bits.
+        flags: u32,
     },
     /// Command discriminant is not supported.
     UnknownOpcode {
@@ -744,6 +852,14 @@ impl fmt::Display for GpuWireError {
             Self::ReservedCommandFlags { index, flags } => write!(
                 formatter,
                 "GPU command {index} has reserved flags 0x{flags:04x}"
+            ),
+            Self::ReservedPayloadFlags {
+                index,
+                opcode,
+                flags,
+            } => write!(
+                formatter,
+                "GPU command {index} ({opcode:?}) has reserved flags 0x{flags:x}"
             ),
             Self::UnknownOpcode { index, opcode } => {
                 write!(formatter, "GPU command {index} uses unknown opcode {opcode}")
@@ -936,7 +1052,24 @@ fn validate_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
     match opcode {
         GpuOpcode::CreateBuffer => exact_payload(index, opcode, payload, 16),
         GpuOpcode::WriteBuffer => inline_payload(index, opcode, payload, 24, 16, false),
-        GpuOpcode::CreateTexture => exact_payload(index, opcode, payload, 24),
+        GpuOpcode::CreateTexture => {
+            if payload.len() < 24 {
+                return exact_payload(index, opcode, payload, 24);
+            }
+            let flags = payload[19];
+            if flags & !GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS != 0 {
+                return Err(GpuWireError::ReservedCommandFlags {
+                    index,
+                    flags: flags as u16,
+                });
+            }
+            let expected = if flags & GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS != 0 {
+                28
+            } else {
+                24
+            };
+            exact_payload(index, opcode, payload, expected)
+        }
         GpuOpcode::WriteTexture => inline_payload(index, opcode, payload, 44, 40, false),
         GpuOpcode::CreateSampler => exact_payload(index, opcode, payload, 24),
         GpuOpcode::CreateShaderWgsl => inline_payload(index, opcode, payload, 8, 4, true),
@@ -947,7 +1080,7 @@ fn validate_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
         GpuOpcode::DestroyResource | GpuOpcode::SetPipeline => {
             exact_payload(index, opcode, payload, 4)
         }
-        GpuOpcode::BeginRenderPass => exact_payload(index, opcode, payload, 36),
+        GpuOpcode::BeginRenderPass => render_pass_payload(index, opcode, payload),
         GpuOpcode::CopyBufferToBuffer => exact_payload(index, opcode, payload, 32),
         GpuOpcode::SetVertexBuffer | GpuOpcode::SetIndexBuffer | GpuOpcode::SetViewport => {
             exact_payload(index, opcode, payload, 24)
@@ -964,6 +1097,10 @@ fn validate_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
         GpuOpcode::SetComputePipeline => exact_payload(index, opcode, payload, 4),
         GpuOpcode::SetComputeBindGroup => counted_payload(index, opcode, payload, 12, 8, 4),
         GpuOpcode::DispatchWorkgroups => exact_payload(index, opcode, payload, 12),
+        GpuOpcode::SetStencilReference => exact_payload(index, opcode, payload, 4),
+        GpuOpcode::SetBlendConstant => exact_payload(index, opcode, payload, 16),
+        GpuOpcode::BeginOcclusionQuery => exact_payload(index, opcode, payload, 4),
+        GpuOpcode::EndOcclusionQuery => exact_payload(index, opcode, payload, 0),
     }
 }
 
@@ -1046,19 +1183,53 @@ fn counted_payload(
     exact_payload(index, opcode, payload, expected)
 }
 
+fn render_pass_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(), GpuWireError> {
+    if payload.len() < GPU_RENDER_PASS_BYTES {
+        return exact_payload(index, opcode, payload, GPU_RENDER_PASS_BYTES);
+    }
+    let flags = u32_at(payload, 12);
+    if flags & !GPU_RENDER_PASS_FLAGS != 0 {
+        return Err(GpuWireError::ReservedPayloadFlags {
+            index,
+            opcode,
+            flags,
+        });
+    }
+    let mut expected = GPU_RENDER_PASS_BYTES;
+    if flags & GPU_RENDER_PASS_HAS_STENCIL_CLEAR != 0 {
+        expected += GPU_RENDER_PASS_STENCIL_CLEAR_BYTES;
+    }
+    if flags & GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES != 0 {
+        expected += GPU_RENDER_PASS_OCCLUSION_BYTES;
+    }
+    exact_payload(index, opcode, payload, expected)
+}
+
 fn pipeline_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(), GpuWireError> {
-    const HEADER_BYTES: usize = 40;
-    if payload.len() < HEADER_BYTES {
+    if payload.len() < GPU_PIPELINE_HEADER_BYTES {
         return Err(GpuWireError::InvalidPayloadLength {
             index,
             opcode,
-            expected: HEADER_BYTES,
+            expected: GPU_PIPELINE_HEADER_BYTES,
             actual: payload.len(),
+        });
+    }
+    let flags = u16_at(payload, 18);
+    if flags & !GPU_PIPELINE_FLAGS != 0 {
+        return Err(GpuWireError::ReservedPayloadFlags {
+            index,
+            opcode,
+            flags: flags as u32,
         });
     }
     let vertex_layouts = u16_at(payload, 12) as usize;
     let vertex_attributes = u16_at(payload, 14) as usize;
     let color_targets = u16_at(payload, 16) as usize;
+    let trailer = if flags & GPU_PIPELINE_STENCIL_DEPTH_BIAS != 0 {
+        GPU_PIPELINE_STENCIL_DEPTH_BIAS_BYTES
+    } else {
+        0
+    };
     let expected = vertex_layouts
         .checked_mul(16)
         .and_then(|value| {
@@ -1071,7 +1242,8 @@ fn pipeline_payload(index: u32, opcode: GpuOpcode, payload: &[u8]) -> Result<(),
                 .checked_mul(16)
                 .and_then(|next| value.checked_add(next))
         })
-        .and_then(|arrays| HEADER_BYTES.checked_add(arrays))
+        .and_then(|arrays| GPU_PIPELINE_HEADER_BYTES.checked_add(arrays))
+        .and_then(|value| value.checked_add(trailer))
         .ok_or(GpuWireError::IntegerOverflow { index })?;
     exact_payload(index, opcode, payload, expected)
 }
@@ -1193,6 +1365,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_texture_extent_flag_and_payload_disagreement() {
+        for (flags, length, expected) in [(1, 24, 28), (0, 28, 24), (1, 32, 28)] {
+            let mut payload = vec![0; length];
+            payload[19] = flags;
+            let batch = single_command(GpuOpcode::CreateTexture, &payload);
+            assert_eq!(
+                decode_gpu_batch(&batch).unwrap_err(),
+                GpuWireError::InvalidPayloadLength {
+                    index: 0,
+                    opcode: GpuOpcode::CreateTexture,
+                    expected,
+                    actual: length,
+                }
+            );
+        }
+        let mut payload = [0; 28];
+        payload[19] = GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS | 2;
+        let batch = single_command(GpuOpcode::CreateTexture, &payload);
+        assert!(matches!(
+            decode_gpu_batch(&batch),
+            Err(GpuWireError::ReservedCommandFlags { index: 0, .. })
+        ));
+    }
+
+    #[test]
     fn rejects_non_utf8_shader_source() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&9u32.to_le_bytes());
@@ -1221,6 +1418,57 @@ mod tests {
                 actual: 12,
             }
         );
+    }
+
+    #[test]
+    fn sizes_stencil_extension_payloads_by_their_flags() {
+        let mut pass = vec![0; 40];
+        pass[12..16].copy_from_slice(&GPU_RENDER_PASS_HAS_STENCIL_CLEAR.to_le_bytes());
+        decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass)).unwrap();
+        assert_eq!(
+            decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..36])).unwrap_err(),
+            GpuWireError::InvalidPayloadLength {
+                index: 0,
+                opcode: GpuOpcode::BeginRenderPass,
+                expected: 40,
+                actual: 36,
+            }
+        );
+        pass[12..16].copy_from_slice(&256u32.to_le_bytes());
+        assert_eq!(
+            decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..36])).unwrap_err(),
+            GpuWireError::ReservedPayloadFlags {
+                index: 0,
+                opcode: GpuOpcode::BeginRenderPass,
+                flags: 256,
+            }
+        );
+
+        let mut pipeline = vec![0; 40 + 16 + 24];
+        pipeline[16] = 1;
+        pipeline[18] = (GPU_PIPELINE_DEPTH_WRITE | GPU_PIPELINE_STENCIL_DEPTH_BIAS) as u8;
+        decode_gpu_batch(&single_command(GpuOpcode::CreateRenderPipeline, &pipeline)).unwrap();
+        assert_eq!(
+            decode_gpu_batch(&single_command(
+                GpuOpcode::CreateRenderPipeline,
+                &pipeline[..56]
+            ))
+            .unwrap_err(),
+            GpuWireError::InvalidPayloadLength {
+                index: 0,
+                opcode: GpuOpcode::CreateRenderPipeline,
+                expected: 80,
+                actual: 56,
+            }
+        );
+        pipeline[18] = 4;
+        assert!(matches!(
+            decode_gpu_batch(&single_command(
+                GpuOpcode::CreateRenderPipeline,
+                &pipeline[..56]
+            )),
+            Err(GpuWireError::ReservedPayloadFlags { flags: 4, .. })
+        ));
     }
 
     #[test]
@@ -1255,6 +1503,10 @@ mod tests {
             (GpuOpcode::SetComputeBindGroup, 12),
             (GpuOpcode::DispatchWorkgroups, 12),
             (GpuOpcode::EndComputePass, 0),
+            (GpuOpcode::SetStencilReference, 4),
+            (GpuOpcode::SetBlendConstant, 16),
+            (GpuOpcode::BeginOcclusionQuery, 4),
+            (GpuOpcode::EndOcclusionQuery, 0),
         ];
         for (opcode, payload_bytes) in payloads {
             let batch = single_command(opcode, &vec![0; payload_bytes]);
@@ -1270,6 +1522,64 @@ mod tests {
         assert_eq!(GpuBindingKind::StorageBufferReadWrite as u16, 5);
         assert_eq!(GpuCapabilityKey::MaxDispatchesPerBatch as u16, 21);
         assert_eq!(GPU_BUFFER_USAGE_STORAGE, 128);
+    }
+
+    #[test]
+    fn occlusion_queries_extend_render_passes_without_breaking_old_payloads() {
+        assert_eq!(GpuOpcode::try_from(32), Ok(GpuOpcode::BeginOcclusionQuery));
+        assert_eq!(GpuOpcode::try_from(33), Ok(GpuOpcode::EndOcclusionQuery));
+        assert_eq!(GpuEventType::OcclusionResults as u16, 9);
+        assert_eq!(GPU_RASTER_FEATURE_OCCLUSION_QUERIES, 8);
+        let mut pass = [0u8; 48];
+        decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..36])).unwrap();
+        for (flags, length) in [
+            (GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES, 44),
+            (
+                GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES | GPU_RENDER_PASS_HAS_STENCIL_CLEAR,
+                48,
+            ),
+        ] {
+            pass[12..16].copy_from_slice(&flags.to_le_bytes());
+            decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..length])).unwrap();
+            assert_eq!(
+                decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..36]))
+                    .unwrap_err(),
+                GpuWireError::InvalidPayloadLength {
+                    index: 0,
+                    opcode: GpuOpcode::BeginRenderPass,
+                    expected: length,
+                    actual: 36,
+                }
+            );
+        }
+        pass[12..16].copy_from_slice(&256u32.to_le_bytes());
+        assert!(matches!(
+            decode_gpu_batch(&single_command(GpuOpcode::BeginRenderPass, &pass[..36])),
+            Err(GpuWireError::ReservedPayloadFlags { flags: 256, .. })
+        ));
+        assert!(decode_gpu_batch(&single_command(GpuOpcode::EndOcclusionQuery, &[0; 4])).is_err());
+    }
+
+    #[test]
+    fn blend_constant_is_opcode_31_with_four_floats() {
+        assert_eq!(GpuOpcode::try_from(31), Ok(GpuOpcode::SetBlendConstant));
+        assert_eq!(GpuOpcode::try_from(34), Err(()));
+        assert_eq!(GPU_RASTER_FEATURE_BLEND_CONSTANT, 4);
+        for actual in [12, 20] {
+            assert_eq!(
+                decode_gpu_batch(&single_command(
+                    GpuOpcode::SetBlendConstant,
+                    &vec![0; actual]
+                ))
+                .unwrap_err(),
+                GpuWireError::InvalidPayloadLength {
+                    index: 0,
+                    opcode: GpuOpcode::SetBlendConstant,
+                    expected: 16,
+                    actual,
+                }
+            );
+        }
     }
 
     #[test]

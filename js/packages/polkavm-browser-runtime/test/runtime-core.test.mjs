@@ -494,6 +494,7 @@ test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) =>
   } finally {
     receiver.onmessage({ data: { type: "stop" } });
     globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+    t.mock.restoreAll();
     await waitForMessage(messages, "terminated");
   }
 });
@@ -1005,7 +1006,7 @@ test("translated background continuations complete bounded hostcall slices witho
   }
 });
 
-test("background state rejects malformed booleans and sequences", () => {
+test("background state rejects malformed booleans and sequences", async () => {
   for (const message of [
     { type: "background", backgrounded: 1 },
     { type: "background", backgrounded: true, seq: -1 },
@@ -1015,6 +1016,8 @@ test("background state rejects malformed booleans and sequences", () => {
     const { messages, receiver } = endpoint();
     receiver.onmessage({ data: message });
     assert.equal(receiver.onmessage, null);
+    // Termination waits for private file-cache cleanup before it is reported.
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(messages.map((message) => message.type), ["error", "terminated"]);
   }
 });
@@ -1082,8 +1085,8 @@ test("stop remains terminal when pending instantiation resolves or rejects", asy
         } });
         await entered.promise;
         receiver.onmessage({ data: { type: "stop" } });
+        await waitForMessage(messages, "terminated");
         const terminalMessages = messages.slice();
-        assert.equal(messages.at(-1).type, "terminated");
         resume.resolve();
         await settle();
         assert.equal(receiver.onmessage, null);
