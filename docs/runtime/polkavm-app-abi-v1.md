@@ -53,9 +53,13 @@ The Host instantiates a fresh program, calls `init` exactly once, and calls
 `update` zero or more times while the App is running. Calls are serialized; the
 Host MUST NOT enter the same program concurrently.
 
-The Host selects and enforces a nonzero gas budget for each call. A trap, gas
-exhaustion, invalid guest-memory access, or Host-call budget failure fails the
-current execution. ABI v1 does not restart a failed program transparently.
+The Host selects and enforces a nonzero gas budget for each call. It MAY
+execute that budget as smaller internal quanta, returning to its scheduler and
+resuming the same call between quanta. This preserves the program counter,
+registers, memory, and remaining call budget; it is not a transparent restart.
+Exhausting the complete call budget, a trap, invalid guest-memory access, or a
+Host-call budget failure fails the current execution. ABI v1 does not restart
+a failed program transparently.
 
 The Host owns scheduling and presentation. Returning from `update` yields
 control to the Host; it does not imply that a frame was presented.
@@ -1255,8 +1259,10 @@ conforming Host must provide.
 ## Failure and shutdown
 
 A successful `init` does not guarantee that later updates will succeed. The
-Host stops the execution on an unhandled guest trap, gas exhaustion, invalid
-memory access, unrecoverable profile error, or Host transport failure.
+Host stops the execution on an unhandled guest trap, exhaustion of the complete
+call gas budget, invalid memory access, unrecoverable profile error, or Host
+transport failure. An internal execution quantum ending is not gas exhaustion
+at this contract boundary.
 
 The Host may stop an execution when its App surface closes, the Product is
 replaced, the user selects a file for a relaunch registration, or platform
