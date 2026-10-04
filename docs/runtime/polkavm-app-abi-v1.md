@@ -289,6 +289,11 @@ the byte range may end at the last texel of the final row. R8 copies use one
 byte per texel, color RGBA/BGRA copies four. Depth uploads are not supported.
 The 16 MiB per-tick inline-upload budget is unchanged.
 
+The native backend also charges the backend's aligned staging row span,
+including gaps between array layers or volume slices, against that budget.
+Short final rows are padded before the backend copy; a small inline payload
+does not authorize an unbounded staging allocation.
+
 Texture quota accounting conservatively reserves four bytes per texel,
 including R8, across every layer and mip. The 256 MiB live texture limit
 and per-batch allocation budget, and the 512-texture limit, apply to the
@@ -394,6 +399,13 @@ a conservative count rather than the exact number of samples. Results of a
 batch whose device is lost or reset, or of a stopped execution, are not
 delivered. Native Hosts receive outstanding results from
 `NativeGpuRenderer::poll_events` as well as from later `execute` calls.
+
+The browser backend retains at most 16,384 unresolved queries across 64
+readback passes. Admission includes readbacks still awaiting asynchronous
+mapping, not only submitted batches; exceeding either bound rejects the
+batch before GPU mutation. Completion or teardown releases the reservation.
+Reset, device loss and stop destroy pending readback buffers, and results
+from a retired device cannot delay or overwrite a replacement device's work.
 
 ### WebGPU submission
 
@@ -634,9 +646,12 @@ otherwise returns:
 ```
 
 `host_input_trigger` returns 0 when accepted, 1 for an unknown handle, and 2
-while any registration is already active. Acceptance means only that the Host
-will present its own consent and capture UI. The guest does not receive raw
-device frames and cannot bypass Host permission policy.
+while any registration is already active or undrained Host commands exhaust
+admission capacity. Hosts reserve capacity for cancellation and teardown.
+Returning 2 does not release an existing selection; the guest may retry after
+the Host drains commands. Acceptance means only that the Host will present its
+own consent and capture UI. The guest does not receive raw device frames and
+cannot bypass Host permission policy.
 
 `host_input_status` returns:
 
@@ -815,10 +830,13 @@ filesystem API. No guest-chosen path or manifest capability is involved.
 Cache calls return `-1` for an unavailable cache (including unsealed reads),
 `-2` for invalid state, range, size, or quota, `-3` for invalid guest memory,
 and `-4` for backend I/O or short transfers. Backend failure drops the derived
-cache and its reservation without changing the Ready original source. Guest
-memory is validated before disk I/O. Cancel, picker reopen, replacement after
-release, and execution stop close both source and cache; refused candidates
-MUST NOT disturb the existing selection.
+cache without changing the Ready original source. Its reservation remains
+charged until the backend has released the storage; asynchronous deletion MUST
+NOT allow overlapping retired and live caches to exceed the aggregate quota.
+Guest memory is validated before disk I/O. Cancel, picker reopen, replacement
+after release, and execution stop (including a fatal guest trap or exhausted
+gas budget) close both source and cache; refused candidates MUST NOT disturb
+the existing selection.
 
 Native `send_file_stream` accepts an optional `Box<dyn FileCache>`;
 `LocalFileCache::new` creates private scratch in a Host-selected directory,

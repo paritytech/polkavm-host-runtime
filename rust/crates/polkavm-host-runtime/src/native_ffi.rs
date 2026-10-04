@@ -12,11 +12,16 @@ use crate::{NativeGpuFrame, NativeGpuRenderer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Foreign-language presentation profile matching the manifest contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePolkaVmPresentationProfile {
+    /// CPU-rendered packed framebuffer pixels.
     Framebuffer,
+    /// Validated textured-triangle command streams.
     Tri2d,
+    /// WebGPU raster commands without compute.
     WebGpuRaster,
+    /// WebGPU raster and compute commands.
     WebGpu,
 }
 
@@ -31,18 +36,30 @@ impl From<NativePolkaVmPresentationProfile> for PresentationProfile {
     }
 }
 
+/// Fixed input event kind accepted by the native binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePolkaVmInputEventType {
+    /// Press a USB HID keyboard usage code.
     KeyDown,
+    /// Release a USB HID keyboard usage code.
     KeyUp,
+    /// Press a pointer button.
     ButtonDown,
+    /// Release a pointer button.
     ButtonUp,
+    /// Set absolute surface pointer coordinates.
     PointerMove,
+    /// Report signed i16 pointer displacement encoded in u16 fields.
     PointerDelta,
+    /// Report surface width and height through the coordinate fields.
     SurfaceMetrics,
+    /// Begin a touch contact identified by the event code.
     TouchStart,
+    /// Move an existing touch contact.
     TouchMove,
+    /// End a touch contact normally.
     TouchEnd,
+    /// Cancel a touch contact without completing its gesture.
     TouchCancel,
 }
 
@@ -64,10 +81,14 @@ impl From<NativePolkaVmInputEventType> for InputEventType {
     }
 }
 
+/// Text operation accepted by the native binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePolkaVmTextInputKind {
+    /// Insert committed text outside IME composition.
     Text,
+    /// Replace the current uncommitted IME composition.
     ImePreedit,
+    /// Commit the current IME composition.
     ImeCommit,
 }
 
@@ -81,10 +102,14 @@ impl From<NativePolkaVmTextInputKind> for TextInputKind {
     }
 }
 
+/// Host permission and availability state for motion input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum NativePolkaVmMotionAvailability {
+    /// No sensor or fallback source exists.
     Unavailable,
+    /// Motion is supported, though a new sample may not yet exist.
     Available,
+    /// Platform or user denied motion access.
     PermissionDenied,
 }
 
@@ -98,16 +123,23 @@ impl From<NativePolkaVmMotionAvailability> for crate::motion_wire::MotionAvailab
     }
 }
 
+/// Immutable launch asset transferred into the runtime.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmAsset {
+    /// Validated relative path visible to the guest.
     pub path: String,
+    /// Complete file contents, subject to launch asset quotas.
     pub bytes: Vec<u8>,
 }
 
+/// CPU framebuffer returned across the foreign-language boundary.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmFrame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
+    /// Packed 0xAARRGGBB pixels, represented as BGRA bytes on little-endian guests.
     pub argb: Vec<u8>,
 }
 
@@ -121,8 +153,10 @@ impl From<Frame> for NativePolkaVmFrame {
     }
 }
 
+/// Accessibility snapshot returned across the foreign-language boundary.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmUiSemanticsFrame {
+    /// Complete validated UTF-8 semantic JSON.
     pub bytes: Vec<u8>,
 }
 
@@ -132,8 +166,10 @@ impl From<UiSemanticsFrame> for NativePolkaVmUiSemanticsFrame {
     }
 }
 
+/// Guest UI platform requests returned to the native host.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmUiOutputFrame {
+    /// Complete validated UI output wire stream.
     pub bytes: Vec<u8>,
 }
 
@@ -143,13 +179,20 @@ impl From<UiOutputFrame> for NativePolkaVmUiOutputFrame {
     }
 }
 
+/// Validated Tri2D stream with aggregate frame metadata.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmTri2dFrame {
+    /// Target surface width in pixels.
     pub width: u32,
+    /// Target surface height in pixels.
     pub height: u32,
+    /// Number of draw commands.
     pub draw_count: u32,
+    /// Total vertices across all draws.
     pub vertex_count: u32,
+    /// Total indices across all draws.
     pub index_count: u32,
+    /// Complete encoded stream, including texture updates and presentation.
     pub bytes: Vec<u8>,
 }
 
@@ -166,10 +209,14 @@ impl From<Tri2dFrame> for NativePolkaVmTri2dFrame {
     }
 }
 
+/// Interleaved PCM audio awaiting native playback.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmAudioChunk {
+    /// Signed 16-bit sample values interleaved by channel.
     pub samples: Vec<i16>,
+    /// Samples per second per channel.
     pub sample_rate: u32,
+    /// Number of interleaved channels.
     pub channels: u32,
 }
 
@@ -183,8 +230,10 @@ impl From<AudioChunk> for NativePolkaVmAudioChunk {
     }
 }
 
+/// GPU commands awaiting execution by the native host.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmGpuBatch {
+    /// Complete validated batch encoding.
     pub bytes: Vec<u8>,
 }
 
@@ -194,10 +243,14 @@ impl From<GpuBatch> for NativePolkaVmGpuBatch {
     }
 }
 
+/// Read-back pixels from the native GPU renderer.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NativePolkaVmGpuFrame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
+    /// Tightly packed 8-bit RGBA pixels in row order.
     pub rgba: Vec<u8>,
 }
 
@@ -212,16 +265,28 @@ impl From<NativeGpuFrame> for NativePolkaVmGpuFrame {
     }
 }
 
+/// Native runtime construction, execution, or synchronization failure.
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum NativePolkaVmError {
+    /// Runtime validation or execution rejected an operation.
     #[error("{detail}")]
-    Runtime { detail: String },
+    Runtime {
+        /// Human-readable failure reason.
+        detail: String,
+    },
+    /// Execution was permanently stopped and cannot accept this operation.
     #[error("PolkaVM runtime is stopped")]
     Stopped,
+    /// The response queue is full; the host must retain and retry the response.
     #[error("host-frame response queue is full")]
     HostFrameResponseQueueFull,
+    /// Launch assets contained the same path more than once.
     #[error("asset path appears more than once: {path}")]
-    DuplicateAsset { path: String },
+    DuplicateAsset {
+        /// Duplicate guest-visible asset path.
+        path: String,
+    },
+    /// An earlier panic poisoned the runtime or renderer mutex.
     #[error("PolkaVM runtime mutex was poisoned")]
     RuntimePoisoned,
 }
@@ -234,6 +299,7 @@ impl NativePolkaVmError {
     }
 }
 
+/// Synchronized application runtime exposed through UniFFI.
 #[derive(uniffi::Object)]
 pub struct NativePolkaVmRuntime {
     runtime: Mutex<ApplicationRuntime>,
@@ -268,6 +334,9 @@ impl NativePolkaVmRuntime {
 
 #[uniffi::export]
 impl NativePolkaVmRuntime {
+    /// Validate launch inputs and construct a runtime with a nonzero gas budget.
+    ///
+    /// Assets must have unique relative paths. Call `init` before updating.
     #[uniffi::constructor]
     pub fn new(
         program: Vec<u8>,
@@ -299,43 +368,52 @@ impl NativePolkaVmRuntime {
         }))
     }
 
+    /// Initialize the guest under its execution and host-call quotas.
     pub fn init(&self) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .init()
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Execute one bounded guest update.
     pub fn update(&self) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .update()
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Stop execution and discard pending execution work.
     pub fn stop(&self) -> Result<(), NativePolkaVmError> {
         self.lock()?.stop();
         Ok(())
     }
 
+    /// Return the selected backend's lowercase debug name.
     pub fn backend(&self) -> Result<String, NativePolkaVmError> {
         Ok(format!("{:?}", self.lock()?.backend()).to_ascii_lowercase())
     }
 
+    /// Whether the guest imports motion input.
     pub fn uses_motion(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.uses_motion())
     }
 
+    /// Whether the guest opts into host-scheduled updates.
     pub fn uses_update_scheduling(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.uses_update_scheduling())
     }
 
+    /// Requested delay after the latest update, or `None` to await host input.
     pub fn update_after_ms(&self) -> Result<Option<u32>, NativePolkaVmError> {
         Ok(self.lock()?.update_after_ms())
     }
 
+    /// Gas consumed from the latest guest execution budget.
     pub fn last_gas_used(&self) -> Result<u64, NativePolkaVmError> {
         Ok(self.lock()?.last_gas_used())
     }
 
+    /// Queue a fixed input event; coordinates follow the selected event's contract.
     pub fn send_input(
         &self,
         event_type: NativePolkaVmInputEventType,
@@ -352,6 +430,7 @@ impl NativePolkaVmRuntime {
         Ok(())
     }
 
+    /// Validate and queue exactly eight encoded input bytes; unsupported for CoreVM.
     pub fn send_input_record(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
         let record: [u8; INPUT_EVENT_BYTES] = bytes.try_into().map_err(|_| {
@@ -392,6 +471,7 @@ impl NativePolkaVmRuntime {
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Encode and queue a bounded UTF-8 text operation; unsupported for CoreVM.
     pub fn send_text_input(
         &self,
         kind: NativePolkaVmTextInputKind,
@@ -402,6 +482,7 @@ impl NativePolkaVmRuntime {
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Update motion availability, clearing pending samples if access is lost.
     pub fn set_motion_availability(
         &self,
         availability: NativePolkaVmMotionAvailability,
@@ -411,48 +492,59 @@ impl NativePolkaVmRuntime {
         Ok(())
     }
 
+    /// Validate and replace the latest encoded motion sample.
     pub fn send_motion_sample(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .send_motion_sample(&bytes)
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Whether the guest imports pointer-capture operations.
     pub fn uses_pointer_capture(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.uses_pointer_capture())
     }
 
+    /// Set whether the host can honor pointer-capture requests.
     pub fn set_pointer_capture_supported(&self, supported: bool) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .set_pointer_capture_supported(supported);
         Ok(())
     }
 
+    /// Report the actual host pointer-capture state to the guest.
     pub fn set_pointer_capture_active(&self, active: bool) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .set_pointer_capture_active(active)
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Take the pending capture request: `true` acquires, `false` releases.
     pub fn take_pointer_capture_request(&self) -> Result<Option<bool>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_pointer_capture_request())
     }
 
+    /// Whether no GPU capabilities prerequisite remains before execution.
     pub fn gpu_ready(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock_running()?.gpu_ready())
     }
 
+    /// Validate and install encoded host capabilities for a GPU guest.
     pub fn set_gpu_capabilities(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .set_gpu_capabilities(bytes)
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Validate and queue an encoded host GPU event.
     pub fn send_gpu_event(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         self.lock_running()?
             .send_gpu_event(bytes)
             .map_err(NativePolkaVmError::runtime)
     }
 
+    /// Create a native GPU surface of the requested pixel dimensions and install capabilities.
+    ///
+    /// Fails when this build lacks the `native-gpu` feature.
     pub fn configure_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
         #[cfg(feature = "native-gpu")]
@@ -475,6 +567,7 @@ impl NativePolkaVmRuntime {
         }
     }
 
+    /// Resize the configured GPU surface in pixels and refresh guest capabilities.
     pub fn resize_native_gpu(&self, width: u32, height: u32) -> Result<(), NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
         #[cfg(feature = "native-gpu")]
@@ -499,6 +592,9 @@ impl NativePolkaVmRuntime {
         }
     }
 
+    /// Drain pending GPU batches and return the newest rendered frame, if any.
+    ///
+    /// Execution events are queued back to the guest; requires a configured renderer.
     pub fn render_native_gpu(&self) -> Result<Option<NativePolkaVmGpuFrame>, NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
         #[cfg(feature = "native-gpu")]
@@ -537,26 +633,32 @@ impl NativePolkaVmRuntime {
         }
     }
 
+    /// Take the newest CPU framebuffer.
     pub fn take_frame(&self) -> Result<Option<NativePolkaVmFrame>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_frame().map(Into::into))
     }
 
+    /// Take the pending Tri2D frame.
     pub fn take_tri2d(&self) -> Result<Option<NativePolkaVmTri2dFrame>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_tri2d().map(Into::into))
     }
 
+    /// Remove the oldest audio chunk.
     pub fn take_audio(&self) -> Result<Option<NativePolkaVmAudioChunk>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_audio().map(Into::into))
     }
 
+    /// Remove the oldest GPU batch for execution by an external renderer.
     pub fn take_gpu_batch(&self) -> Result<Option<NativePolkaVmGpuBatch>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_gpu_batch().map(Into::into))
     }
 
+    /// Remove the oldest pending guest host-service request.
     pub fn take_host_frame_request(&self) -> Result<Option<Vec<u8>>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_host_frame_request())
     }
 
+    /// Queue a nonempty bounded host-service response; report backpressure without dropping it.
     pub fn send_host_frame_response(&self, bytes: Vec<u8>) -> Result<(), NativePolkaVmError> {
         let mut runtime = self.lock_running()?;
         match runtime.send_host_frame_response(bytes) {
@@ -571,24 +673,32 @@ impl NativePolkaVmRuntime {
         }
     }
 
+    /// Take the newest validated accessibility snapshot.
     pub fn take_ui_semantics(
         &self,
     ) -> Result<Option<NativePolkaVmUiSemanticsFrame>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_ui_semantics().map(Into::into))
     }
 
+    /// Take the newest UI platform-output snapshot.
     pub fn take_ui_output(&self) -> Result<Option<NativePolkaVmUiOutputFrame>, NativePolkaVmError> {
         Ok(self.lock_running()?.take_ui_output().map(Into::into))
     }
 
+    /// Remove the oldest queued guest log.
     pub fn take_log(&self) -> Result<Option<String>, NativePolkaVmError> {
         Ok(self.lock()?.take_log())
     }
 
+    /// Whether a CoreVM guest exited successfully or the runtime was stopped.
+    ///
+    /// Stopping includes explicit cancellation and execution errors; this is not
+    /// a success-status check.
     pub fn is_exited(&self) -> Result<bool, NativePolkaVmError> {
         Ok(self.lock()?.is_exited())
     }
 
+    /// Take the latest guest save payload.
     pub fn take_save(&self) -> Result<Option<Vec<u8>>, NativePolkaVmError> {
         Ok(self.lock()?.take_save())
     }

@@ -90,10 +90,13 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   let updateCount = 0;
   const updateSamples = [];
   const activeMediatedInputHandles = new Set();
+  let activeMediatedInputRequest = null;
   const streamFiles = new Map();
   let lastFileSourceToken = 0;
   let fileReader;
   let fileCacheEnabled = false;
+  // Include retired caches until their private storage has actually been deleted.
+  let reservedFileCacheBytes = 0;
   let termination;
   let cleanupFailed = false;
   const pendingSelections = new Map();
@@ -119,6 +122,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
     cleanupFailed = true;
     postMessage({
       type: "error",
+      fatal: false,
       message: `PolkaVM private cache cleanup failed: ${error?.message ?? error}`,
     });
   }
@@ -134,9 +138,15 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
     }
   }
 
-  function closeCache(cache) {
+  function closeCache(cache, reservedBytes = 0) {
     try {
-      return trackCleanup(cache.close());
+      const closing = cache.close();
+      if (closing?.then) {
+        return trackCleanup(Promise.resolve(closing).then(() => {
+          reservedFileCacheBytes -= reservedBytes;
+        }));
+      }
+      reservedFileCacheBytes -= reservedBytes;
     } catch (error) {
       reportCleanupFailure(error);
     }
@@ -219,8 +229,13 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       output?.type === "mediated-input-request" ||
       output?.type === "file-input-request"
     ) {
+      invalidateSelection(output.handle);
+      activeMediatedInputRequest = output.handle;
       activeMediatedInputHandles.add(output.handle);
     } else if (output?.type === "mediated-input-cancel") {
+      if (activeMediatedInputRequest === output.handle) {
+        activeMediatedInputRequest = null;
+      }
       activeMediatedInputHandles.delete(output.handle);
       invalidateSelection(output.handle);
     } else if (output?.type === "file-registrations") {
@@ -312,6 +327,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
     };
     entry.source = source;
     if (backendCache !== null) {
+      let reservedBytes = 0;
       const checkRange = (offset, length) => {
         if (disposed || entry.cache === null || !Number.isInteger(offset) ||
             !Number.isInteger(length) || offset < 0 || length < 1 ||
@@ -323,13 +339,21 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         size: () => backendCache.size(),
         reset(size) {
           if (disposed || entry.cache === null || !Number.isInteger(size) ||
-              size < 1 || size > MAX_FILE_CACHE_BYTES) {
+              size < 1 || size > MAX_FILE_CACHE_BYTES ||
+              reservedFileCacheBytes - reservedBytes + size > MAX_FILE_CACHE_BYTES) {
             throw new Error("invalid PolkaVM browser cache size");
           }
+          // A failed resize may still have changed the underlying file. Keep
+          // the larger reservation until successful cleanup in that case.
+          const reservation = Math.max(reservedBytes, size);
+          reservedFileCacheBytes += reservation - reservedBytes;
+          reservedBytes = reservation;
           backendCache.reset(size);
           if (backendCache.size() !== size) {
             throw new Error("invalid PolkaVM browser cache size after reset");
           }
+          reservedFileCacheBytes += size - reservedBytes;
+          reservedBytes = size;
         },
         write(offset, bytes) {
           checkRange(offset, bytes.byteLength);
@@ -359,7 +383,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
             removeIfClosed();
             const closing = backendCache;
             backendCache = null;
-            closeCache(closing);
+            closeCache(closing, reservedBytes);
           }
         },
       };
@@ -1027,6 +1051,11 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         };
   }
 
+  async function instantiateRuntime(runtime, imports) {
+    const result = await WebAssembly.instantiate(runtime, imports);
+    return (result instanceof WebAssembly.Instance ? result : result.instance).exports;
+  }
+
   async function start(message) {
     if (disposed) {
       throw new Error("PolkaVM browser worker is stopped");
@@ -1142,9 +1171,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         },
       },
     };
-    pvm = (
-      await WebAssembly.instantiate(message.runtime, runtimeImports)
-    ).instance.exports;
+    pvm = await instantiateRuntime(message.runtime, runtimeImports);
     if (disposed) {
       pvm.polkavm_browser_reset?.();
       return;
@@ -1208,9 +1235,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
             `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
           );
           compilerStage = "compiler-translating-parts";
-          pvm = (
-            await WebAssembly.instantiate(message.runtime, runtimeImports)
-          ).instance.exports;
+          pvm = await instantiateRuntime(message.runtime, runtimeImports);
           if (disposed) {
             pvm.polkavm_browser_reset?.();
             return;
@@ -1309,9 +1334,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         );
       }
       if (pvm === null) {
-        pvm = (
-          await WebAssembly.instantiate(message.runtime, runtimeImports)
-        ).instance.exports;
+        pvm = await instantiateRuntime(message.runtime, runtimeImports);
         if (disposed) {
           pvm.polkavm_browser_reset?.();
           return;
@@ -1712,6 +1735,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       throw new Error("invalid PolkaVM browser mediated-input result");
     }
     invalidateSelection(handle);
+    activeMediatedInputRequest = null;
     if (translated) {
       translated.sendMediatedInputResult(handle, status, bytes);
       activeMediatedInputHandles.delete(handle);
@@ -1800,6 +1824,9 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       selected?.cache?.close();
       throw error;
     }
+    if (delivery.outcome !== "refused" && activeMediatedInputRequest === handle) {
+      activeMediatedInputRequest = null;
+    }
     if (stream && delivery.outcome === "ready") {
       activeMediatedInputHandles.add(handle);
     } else if (delivery.outcome !== "refused") {
@@ -1857,7 +1884,11 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       } catch (error) {
         if (typeof cache?.close === "function") await closeCache(cache);
         if (pending.valid && !disposed) {
-          postMessage({ type: "error", message: `PolkaVM private cache creation failed: ${error.message}` });
+          if (activeMediatedInputRequest === handle) {
+            sendMediatedInputResult(handle, 6, new Uint8Array());
+            wake();
+          }
+          postMessage({ type: "error", fatal: false, message: `PolkaVM private cache creation failed: ${error?.message ?? error}` });
           postMessage({ type: "file-input-delivery", handle, outcome: "error" });
         }
         return;

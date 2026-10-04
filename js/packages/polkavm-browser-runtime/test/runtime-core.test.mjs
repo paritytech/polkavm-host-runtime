@@ -220,11 +220,11 @@ function controlledTicks(t) {
   return {
     ticks,
     timers,
-    controlTimers() {
+    controlTimers(dispatch = (callback) => callback()) {
       // Install after asynchronous Wasm startup; waitForMessage uses timers.
-      t.mock.method(globalThis, "setTimeout", (callback) => {
+      t.mock.method(globalThis, "setTimeout", (callback, delay = 0) => {
         const id = ++nextTimer;
-        timers.set(id, callback);
+        timers.set(id, () => dispatch(callback, delay));
         return id;
       });
       t.mock.method(globalThis, "clearTimeout", (id) => timers.delete(id));
@@ -448,15 +448,11 @@ test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) =>
       "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
     ),
   );
+  const scheduler = controlledTicks(t);
   const originalRuntime = globalThis.TranslatedPolkaVmRuntime;
-  const originalSetTimeout = globalThis.setTimeout;
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
   const updateStartedAt = [];
-  t.mock.method(
-    globalThis,
-    "setTimeout",
-    (callback, delay = 0, ...args) =>
-      originalSetTimeout(callback, delay > 0 ? delay + 3 : delay, ...args),
-  );
   globalThis.TranslatedPolkaVmRuntime = class extends originalRuntime {
     update(timeMs) {
       updateStartedAt.push(performance.now());
@@ -477,20 +473,28 @@ test("continuous guests hold 60 Hz despite timer dispatch latency", async (t) =>
       },
     });
     await waitForMessage(messages, "ready");
-    const deadline = Date.now() + 2000;
-    while (updateStartedAt.length < 31 && Date.now() < deadline) {
-      await new Promise((resolve) => originalSetTimeout(resolve, 5));
+    scheduler.controlTimers((callback, delay) => {
+      now += delay + 3;
+      callback();
+    });
+    for (let update = 0; update < 31; update++) {
+      assert.equal(scheduler.ticks.length, 1, "continuous updates stalled");
+      scheduler.drain();
+      if (update === 30) break;
+      assert.equal(scheduler.timers.size, 1);
+      const [id, callback] = scheduler.timers.entries().next().value;
+      scheduler.timers.delete(id);
+      callback();
     }
-    assert.ok(updateStartedAt.length >= 31, "continuous updates stalled");
     const elapsed = updateStartedAt[30] - updateStartedAt[0];
-    assert.ok(elapsed >= 450, `continuous updates ran too fast: ${elapsed} ms`);
     assert.ok(
-      elapsed < 550,
-      `timer dispatch latency accumulated across updates: ${elapsed} ms`,
+      Math.abs(elapsed - 503) < 1e-6,
+      `thirty frame intervals must accumulate only one 3 ms dispatch delay: ${elapsed}`,
     );
   } finally {
     receiver.onmessage({ data: { type: "stop" } });
     globalThis.TranslatedPolkaVmRuntime = originalRuntime;
+    t.mock.restoreAll();
     await waitForMessage(messages, "terminated");
   }
 });
@@ -1056,6 +1060,47 @@ test("stopping during asynchronous compilation cannot restart the endpoint", asy
   assert.equal(messages.some((message) => ["ready", "save", "error"].includes(message.type)), false);
 });
 
+test("stop remains terminal when pending instantiation resolves or rejects", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const program = await readFile(resolve(
+    repositoryRoot, "rust/crates/polkavm-host-runtime/tests/fixtures/framebuffer-test.polkavm",
+  ));
+  for (const reject of [false, true]) {
+    await t.test(reject ? "late rejection" : "late resolution", async (t) => {
+      const original = WebAssembly.instantiate;
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      t.mock.method(WebAssembly, "instantiate", async (...args) => {
+        const result = await original(...args);
+        entered.resolve();
+        await resume.promise;
+        if (reject) throw new Error("startup failed after cancellation");
+        return result;
+      });
+      const { messages, receiver } = endpoint();
+      try {
+        receiver.onmessage({ data: {
+          type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(program),
+          assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+        } });
+        await entered.promise;
+        receiver.onmessage({ data: { type: "stop" } });
+        await waitForMessage(messages, "terminated");
+        const terminalMessages = messages.slice();
+        resume.resolve();
+        await settle();
+        assert.equal(receiver.onmessage, null);
+        assert.deepEqual(messages, terminalMessages);
+        assert.equal(messages.some((message) => message.type === "ready"), false);
+      } finally {
+        resume.resolve();
+        await settle();
+        receiver.onmessage?.({ data: { type: "stop" } });
+      }
+    });
+  }
+});
+
 test("both browser backends expose application core clocks and entropy", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -1225,7 +1270,7 @@ test("compiler startup keeps the newest GPU capabilities", async () => {
   }
 });
 
-test("native-Wasm and translated backends round-trip opaque host frames", async () => {
+test("byte and Module startup round-trip opaque host frames on both backends", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
   );
@@ -1243,12 +1288,17 @@ test("native-Wasm and translated backends round-trip opaque host frames", async 
   );
   const successBytes = new TextEncoder().encode("host-frame-roundtrip-ok");
 
-  for (const forceInterpreter of [false, true]) {
+  const runtimeInputs = [bytesBuffer(runtime), await WebAssembly.compile(runtime)];
+  for (const { runtimeInput, forceInterpreter } of runtimeInputs.flatMap(
+    (runtimeInput) => [false, true].map((forceInterpreter) => ({
+      runtimeInput, forceInterpreter,
+    })),
+  )) {
     const { messages, receiver } = endpoint();
     receiver.onmessage({
       data: {
         type: "start",
-        runtime: bytesBuffer(runtime),
+        runtime: runtimeInput,
         program: bytesBuffer(program),
         assets: [],
         graphicsProfile: "framebuffer",

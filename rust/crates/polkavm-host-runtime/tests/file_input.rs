@@ -8,10 +8,11 @@
 //! reproduces it byte for byte. During `init` the guest walks the
 //! `descriptors` asset, a sequence of `[tag u32][length u32][payload]` records
 //! ended by tag 0: tag 1 registers the payload with `host_file_register` and
-//! tag 2 registers `camera-ur` with `host_input_register`. Tags 3 and 4 carry
+//! tag 2 registers `camera-ur` with `host_input_register`. Tags 3, 4 and 5 carry
 //! no payload; their `length` indexes an earlier record, whose handle tag 3
-//! triggers and tag 4 selects for cancellation. The guest saves the sixteen
-//! `i32` results. Every `update` cancels the selected handle with
+//! triggers, tag 4 selects for cancellation on update, and tag 5 cancels
+//! immediately. The guest saves the sixteen `i32` results. Every `update`
+//! cancels the selected handle with
 //! `host_input_cancel`, probes handles 1 through 4 with `host_input_status`,
 //! `host_file_info`, and `host_input_read`, reads the `game/cartridge.bin`
 //! asset, and saves the results followed by one [`Snapshot`].
@@ -23,12 +24,13 @@ use polkavm_common::writer::ProgramBlobBuilder;
 use polkavm_host_runtime::{
     ApplicationRuntime, BackendKind, FileCache, FileDelivery, FileInputDelivery, FileInputSupport,
     FileReadSource, FileRelaunch, FileSelection, FileStreamSelection, LocalFileCache,
-    LocalFileSource, MediatedInputCommand, MediatedInputStatus, PresentationProfile,
+    LocalFileSource, MediatedInputCommand, MediatedInputStatus, PresentationProfile, Runtime,
     FILE_READ_INVALID_DESTINATION, FILE_READ_INVALID_HANDLE, FILE_READ_INVALID_RANGE,
     FILE_READ_IO_ERROR, FILE_REGISTER_DELIVERY_UNAVAILABLE, MAX_FILE_CACHE_BYTES,
     MAX_FILE_READ_BYTES, MEDIATED_INPUT_CANCEL_ACCEPTED, MEDIATED_INPUT_CANCEL_NOT_ACTIVE,
     MEDIATED_INPUT_REGISTER_INVALID, MEDIATED_INPUT_REGISTER_QUOTA_EXCEEDED,
-    MEDIATED_INPUT_REGISTER_UNAVAILABLE,
+    MEDIATED_INPUT_REGISTER_UNAVAILABLE, MEDIATED_INPUT_TRIGGER_ACCEPTED,
+    MEDIATED_INPUT_TRIGGER_BUSY,
 };
 use std::collections::HashMap;
 
@@ -105,14 +107,16 @@ fn file_input_program() -> Vec<u8> {
     let [asset_read, file_register, input_register, input_trigger, save_submit, input_status, file_info, input_read, input_cancel] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-    // Basic blocks: 0 init, 1 loop, 2 tag 2?, 3 tag 3?, 4 tag 4?, 5 file,
-    // 6 input, 7 trigger, 8 cancel, 9 store, 10 done, 11 update.
+    // Basic blocks: 0 init, 1 loop, 2 tag 2?, 3 tag 3?, 4 tag 4?, 5 tag 5?,
+    // 6 file, 7 input, 8 trigger, 9 cancel, 10 cancel now, 11 store, 12 done,
+    // 13 update.
     const LOOP: u32 = 1;
-    const INPUT: u32 = 6;
-    const TRIGGER: u32 = 7;
-    const CANCEL: u32 = 8;
-    const STORE: u32 = 9;
-    const DONE: u32 = 10;
+    const INPUT: u32 = 7;
+    const TRIGGER: u32 = 8;
+    const CANCEL: u32 = 9;
+    const CANCEL_NOW: u32 = 10;
+    const STORE: u32 = 11;
+    const DONE: u32 = 12;
     let mut code: Vec<Instruction> = vec![
         asm::load_imm(Reg::A0, descriptors.0),
         asm::load_imm(Reg::A1, descriptors.1),
@@ -130,6 +134,7 @@ fn file_input_program() -> Vec<u8> {
         asm::branch_eq_imm(Reg::T0, 2, INPUT),
         asm::branch_eq_imm(Reg::T0, 3, TRIGGER),
         asm::branch_eq_imm(Reg::T0, 4, CANCEL),
+        asm::branch_eq_imm(Reg::T0, 5, CANCEL_NOW),
         // FILE
         asm::add_imm_32(Reg::A0, Reg::S0, 8),
         asm::move_reg(Reg::A1, Reg::T1),
@@ -156,7 +161,14 @@ fn file_input_program() -> Vec<u8> {
         asm::load_indirect_i32(Reg::A0, Reg::T2, 0),
         asm::store_u32(Reg::A0, cancel_slot),
         asm::load_imm(Reg::T1, 0),
-        asm::fallthrough(),
+        asm::jump(STORE),
+        // CANCEL NOW
+        asm::shift_logical_left_imm_32(Reg::T2, Reg::T1, 2),
+        asm::add_imm_32(Reg::T2, Reg::T2, results),
+        asm::load_indirect_i32(Reg::A0, Reg::T2, 0),
+        asm::ecalli(input_cancel),
+        asm::load_imm(Reg::T1, 0),
+        asm::jump(STORE),
         // STORE
         asm::store_indirect_u32(Reg::A0, Reg::S1, 0),
         asm::add_imm_32(Reg::S1, Reg::S1, 4),
@@ -344,8 +356,16 @@ fn selection(name: &str, mime_type: &str, bytes: &[u8]) -> FileSelection {
 }
 
 #[test]
-fn the_fixture_is_assembled_from_source() {
-    assert_eq!(file_input_program(), FIXTURE);
+#[ignore = "regenerates the shared Rust/browser guest fixture"]
+fn export_file_input_fixture() {
+    std::fs::write(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/file-input.polkavm"
+        ),
+        file_input_program(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -2031,4 +2051,183 @@ fn source_io_failure_releases_its_private_cache_and_drop_closes_retained_caches(
     drop(runtime);
     assert!(replacement.closed.load(SeqCst));
     directory.assert_empty();
+}
+
+#[test]
+fn raw_runtime_traps_release_stream_and_cache_without_waiting_for_drop() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let memory = MemoryMapBuilder::new(64 * 1024)
+        .ro_data_size(STREAM_DESCRIPTOR.len() as u32)
+        .stack_size(4 * 1024)
+        .build()
+        .unwrap();
+    let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+    builder.set_ro_data_size(STREAM_DESCRIPTOR.len() as u32);
+    builder.set_ro_data(STREAM_DESCRIPTOR.as_bytes().to_vec());
+    builder.set_stack_size(4 * 1024);
+    builder.add_import(b"host_file_register");
+    builder.add_export_by_basic_block(0, b"init");
+    builder.add_export_by_basic_block(1, b"update");
+    builder.set_code(
+        &[
+            asm::load_imm(Reg::A0, memory.ro_data_address() as i32),
+            asm::load_imm(Reg::A1, STREAM_DESCRIPTOR.len() as i32),
+            asm::ecalli(0),
+            asm::ret(),
+            asm::trap(),
+        ],
+        &[],
+    );
+    let mut runtime = Runtime::new_with_backend(
+        &builder.into_vec().unwrap(),
+        HashMap::new(),
+        PresentationProfile::Framebuffer,
+        false,
+        10_000_000,
+        BackendKind::Interpreter,
+    )
+    .unwrap();
+    runtime
+        .set_file_input_support(FileInputSupport {
+            stream: true,
+            ..support(false, false)
+        })
+        .unwrap();
+    runtime.init().unwrap();
+    let directory = CacheDirectory::new();
+    let file = DiskFixture::new(b"source");
+    let (source, _, source_closed) = observed_file(&file);
+    let (cache, observation) = observed_cache(&directory);
+    assert_eq!(
+        runtime
+            .send_file_stream(1, stream_selection(6), source, Some(cache))
+            .unwrap(),
+        FileInputDelivery::Ready
+    );
+    assert!(runtime.update().is_err());
+    assert!(source_closed.load(SeqCst));
+    assert!(observation.closed.load(SeqCst));
+    assert_eq!(
+        runtime.take_mediated_input_command(),
+        Some(MediatedInputCommand::Cancel { handle: 1 })
+    );
+    assert_eq!(runtime.file_registrations().len(), 1);
+    assert_eq!(
+        runtime.file_registrations()[0].status,
+        MediatedInputStatus::Registered
+    );
+    let (source, _, rejected_source_closed) = observed_file(&file);
+    let (cache, rejected_cache) = observed_cache(&directory);
+    assert!(runtime
+        .send_file_stream(1, stream_selection(6), source, Some(cache))
+        .is_err());
+    assert!(rejected_source_closed.load(SeqCst));
+    assert!(rejected_cache.closed.load(SeqCst));
+    assert!(runtime.init().unwrap_err().to_string().contains("stopped"));
+    assert!(runtime
+        .update()
+        .unwrap_err()
+        .to_string()
+        .contains("stopped"));
+    directory.assert_empty();
+}
+
+#[test]
+fn paused_stream_delivery_waits_for_resume_without_losing_its_resources() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let mut runtime = launch_stream(&[[1, 1, 0, 6, 0]]);
+    runtime.set_paused(true);
+    let directory = CacheDirectory::new();
+    let file = DiskFixture::new(b"source");
+    let (source, reads, source_closed) = observed_file(&file);
+    let (cache, observation) = observed_cache(&directory);
+    assert_eq!(
+        runtime
+            .send_file_stream(1, stream_selection(6), source, Some(cache))
+            .unwrap(),
+        FileInputDelivery::Ready
+    );
+    runtime.update().unwrap();
+    assert!(runtime.take_save().is_none());
+    assert_eq!(reads.load(SeqCst), 0);
+    assert!(!source_closed.load(SeqCst));
+    assert!(!observation.closed.load(SeqCst));
+    runtime.set_paused(false);
+    let snapshot = stream_update(&mut runtime);
+    assert_eq!(i32_at(&snapshot, 0), 6);
+    assert_eq!(
+        &snapshot[STREAM_DATA_OFFSET..STREAM_DATA_OFFSET + 6],
+        b"source"
+    );
+    assert_eq!(reads.load(SeqCst), 1);
+    runtime.stop();
+    assert!(source_closed.load(SeqCst));
+    assert!(observation.closed.load(SeqCst));
+}
+
+#[test]
+fn picker_command_backpressure_preserves_selection_and_recovers_after_host_drain() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let mut commands = Vec::new();
+    for _ in 0..4 {
+        commands.extend([[3, 1, 0, 0, 0], [2, 1, 0, 0, 0]]);
+    }
+    // Repeated rejected triggers must not enqueue or release a selected file.
+    commands.extend(std::iter::repeat_n([3, 1, 0, 0, 0], 32));
+    commands.push([3, 1, 0, 0, 0]);
+    let mut runtime = launch_stream(&commands);
+    for _ in 0..4 {
+        assert_eq!(
+            i32_at(&stream_update(&mut runtime), 0),
+            MEDIATED_INPUT_TRIGGER_ACCEPTED as i32
+        );
+        assert_eq!(
+            i32_at(&stream_update(&mut runtime), 0),
+            MEDIATED_INPUT_CANCEL_ACCEPTED as i32
+        );
+    }
+    let directory = CacheDirectory::new();
+    let file = DiskFixture::new(b"source");
+    let (source, _, source_closed) = observed_file(&file);
+    let (cache, observation) = observed_cache(&directory);
+    runtime
+        .send_file_stream(1, stream_selection(6), source, Some(cache))
+        .unwrap();
+    for _ in 0..32 {
+        let snapshot = stream_update(&mut runtime);
+        assert_eq!(i32_at(&snapshot, 0), MEDIATED_INPUT_TRIGGER_BUSY as i32);
+        assert_eq!(i32_at(&snapshot, 4), MediatedInputStatus::Ready as i32);
+        assert!(stream_info(&snapshot).is_some());
+        assert!(!source_closed.load(SeqCst));
+        assert!(!observation.closed.load(SeqCst));
+    }
+    for _ in 0..4 {
+        assert!(matches!(
+            runtime.take_mediated_input_command(),
+            Some(MediatedInputCommand::FileRequest(request)) if request.handle == 1
+        ));
+        assert_eq!(
+            runtime.take_mediated_input_command(),
+            Some(MediatedInputCommand::Cancel { handle: 1 })
+        );
+    }
+    assert_eq!(runtime.take_mediated_input_command(), None);
+    assert_eq!(
+        i32_at(&stream_update(&mut runtime), 0),
+        MEDIATED_INPUT_TRIGGER_ACCEPTED as i32
+    );
+    assert!(source_closed.load(SeqCst));
+    assert!(observation.closed.load(SeqCst));
+    assert_eq!(
+        runtime.take_mediated_input_command(),
+        Some(MediatedInputCommand::Cancel { handle: 1 })
+    );
+    assert!(matches!(
+        runtime.take_mediated_input_command(),
+        Some(MediatedInputCommand::FileRequest(request)) if request.handle == 1
+    ));
+    assert_eq!(runtime.take_mediated_input_command(), None);
 }

@@ -2,155 +2,283 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Bounded little-endian GPU command encoding shared by guests and hosts.
 #![no_std]
 
 #[cfg(feature = "tri2d-validation")]
 extern crate std;
 
+/// Tri2D command encoding and optional stateful validation.
 pub mod tri2d;
 
 use core::fmt;
 
+/// Batch discriminator, preceding the version and length fields.
 pub const GPU_WIRE_MAGIC: [u8; 4] = *b"EPG1";
+/// Supported GPU protocol version.
 pub const GPU_WIRE_VERSION: u16 = 1;
+/// Fixed batch header size in bytes.
 pub const GPU_BATCH_HEADER_BYTES: usize = 24;
+/// Fixed command header size in bytes, included in command lengths.
 pub const GPU_COMMAND_HEADER_BYTES: usize = 8;
+/// Maximum encoded size of one batch, including headers, in bytes.
 pub const MAX_GPU_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum commands encoded in one batch.
 pub const MAX_GPU_COMMANDS: u32 = 16_384;
+/// Discriminator for a host capabilities record.
 pub const GPU_CAPABILITIES_MAGIC: [u8; 4] = *b"EGC1";
+/// Fixed capabilities header size in bytes.
 pub const GPU_CAPABILITIES_HEADER_BYTES: usize = 56;
+/// Size in bytes of each key/value capabilities entry.
 pub const GPU_CAPABILITY_ENTRY_BYTES: usize = 16;
+/// Discriminator for a host-to-guest event record.
 pub const GPU_EVENT_MAGIC: [u8; 4] = *b"EGE1";
+/// Fixed event header size in bytes.
 pub const GPU_EVENT_HEADER_BYTES: usize = 24;
+/// Maximum encoded event size in bytes.
 pub const MAX_GPU_EVENT_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 diagnostic payload size in bytes.
 pub const MAX_GPU_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+/// Low-order bits reserved for the resource slot in a packed handle.
 pub const GPU_HANDLE_SLOT_BITS: u32 = 20;
+/// Mask extracting a packed handle's resource slot.
 pub const GPU_HANDLE_SLOT_MASK: u32 = (1 << GPU_HANDLE_SLOT_BITS) - 1;
+/// Largest generation representable in a packed 32-bit handle.
 pub const GPU_HANDLE_MAX_GENERATION: u32 = (1 << (32 - GPU_HANDLE_SLOT_BITS)) - 1;
+/// Maximum accepted submissions per guest update.
 pub const MAX_GPU_SUBMITS_PER_TICK: u32 = 8;
+/// Maximum resource upload bytes per guest update.
 pub const MAX_GPU_UPLOAD_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+/// Maximum batches awaiting host execution.
 pub const MAX_GPU_QUEUED_BATCHES: usize = 4;
+/// Maximum events awaiting guest consumption.
 pub const MAX_GPU_QUEUED_EVENTS: usize = 256;
+/// Maximum live buffer resources.
 pub const MAX_GPU_BUFFERS: usize = 4_096;
+/// Maximum bytes allocated to one buffer.
 pub const MAX_GPU_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum bytes allocated across all live buffers.
 pub const MAX_GPU_TOTAL_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum live texture resources.
 pub const MAX_GPU_TEXTURES: usize = 512;
+/// Maximum bytes allocated across all live textures.
 pub const MAX_GPU_TOTAL_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum width or height of a 2D texture, in texels.
 pub const MAX_GPU_TEXTURE_DIMENSION_2D: u32 = 4_096;
+/// Maximum width, height or depth of a 3D texture, in texels.
 pub const MAX_GPU_TEXTURE_DIMENSION_3D: u32 = 256;
+/// Maximum array layers in a 2D texture.
 pub const MAX_GPU_TEXTURE_ARRAY_LAYERS: u32 = 256;
+/// Maximum samples per texture texel.
 pub const MAX_GPU_TEXTURE_SAMPLE_COUNT: u32 = 1;
+/// Maximum mip levels in one texture.
 pub const MAX_GPU_TEXTURE_MIP_LEVELS: u32 = 13;
+/// Maximum live texture view resources.
 pub const MAX_GPU_TEXTURE_VIEWS: usize = 1_024;
+/// Maximum live sampler resources.
 pub const MAX_GPU_SAMPLERS: usize = 128;
+/// Maximum live shader module resources.
 pub const MAX_GPU_SHADER_MODULES: usize = 128;
+/// Maximum UTF-8 WGSL source bytes in one shader module.
 pub const MAX_GPU_WGSL_BYTES: usize = 1024 * 1024;
+/// Maximum shader and pipeline compilation operations per batch.
 pub const MAX_GPU_COMPILATIONS: usize = 32;
+/// Maximum live bind group layouts.
 pub const MAX_GPU_BIND_GROUP_LAYOUTS: usize = 128;
+/// Maximum live pipeline layouts.
 pub const MAX_GPU_PIPELINE_LAYOUTS: usize = 64;
+/// Maximum live bind groups.
 pub const MAX_GPU_BIND_GROUPS: usize = 512;
+/// Maximum live render pipelines.
 pub const MAX_GPU_RENDER_PIPELINES: usize = 256;
+/// Maximum bind group slots in one pipeline layout.
 pub const MAX_GPU_BIND_GROUPS_PER_PIPELINE: usize = 4;
+/// Maximum bindings in one bind group.
 pub const MAX_GPU_BINDINGS_PER_GROUP: usize = 16;
+/// Maximum vertex buffer slots in one pipeline.
 pub const MAX_GPU_VERTEX_BUFFERS: usize = 8;
+/// Maximum vertex attributes in one pipeline.
 pub const MAX_GPU_VERTEX_ATTRIBUTES: usize = 16;
+/// Maximum color attachment slots in one render pass.
 pub const MAX_GPU_COLOR_ATTACHMENTS: usize = 4;
+/// Maximum render passes encoded in one batch.
 pub const MAX_GPU_RENDER_PASSES_PER_BATCH: usize = 16;
+/// Maximum draw commands encoded in one batch.
 pub const MAX_GPU_DRAWS_PER_BATCH: usize = 8_192;
+/// Maximum compute passes encoded in one batch.
 pub const MAX_GPU_COMPUTE_PASSES_PER_BATCH: usize = 64;
+/// Maximum compute dispatch commands encoded in one batch.
 pub const MAX_GPU_DISPATCHES_PER_BATCH: usize = 8_192;
 /// Bounds each pass's query count and the sum over one batch.
 pub const MAX_GPU_OCCLUSION_QUERIES_PER_BATCH: u32 = 4_096;
 
+/// Submission status: the batch was accepted.
 pub const GPU_SUBMIT_ACCEPTED: i32 = 0;
+/// Submission status: retry after the host drains its queue.
 pub const GPU_SUBMIT_BUSY: i32 = 1;
+/// Submission failure: guest memory range is inaccessible.
 pub const GPU_ERROR_INVALID_GUEST_RANGE: i32 = -1;
+/// Submission failure: batch encoding is invalid.
 pub const GPU_ERROR_MALFORMED_BATCH: i32 = -2;
+/// Submission failure: a resource or per-update quota was exceeded.
 pub const GPU_ERROR_QUOTA_EXCEEDED: i32 = -3;
+/// Submission failure: resource handle is unknown or stale.
 pub const GPU_ERROR_INVALID_HANDLE: i32 = -4;
+/// Submission failure: command is incompatible with current GPU state.
 pub const GPU_ERROR_INVALID_STATE: i32 = -5;
+/// Submission failure: runtime has stopped.
 pub const GPU_ERROR_STOPPED: i32 = -6;
 
+/// Batch rejection reason: surface generation no longer matches.
 pub const GPU_BATCH_ERROR_STALE_SURFACE: u32 = 4;
 
+/// Keys for host-advertised limits; values are unsigned integers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuCapabilityKey {
+    /// Maximum texture width or height, in texels.
     MaxTextureDimension2d = 1,
+    /// Maximum allocation for one buffer, in bytes.
     MaxBufferSize = 2,
+    /// Maximum binding entries in a bind group.
     MaxBindingsPerBindGroup = 3,
+    /// Maximum bind group slots in a pipeline layout.
     MaxBindGroups = 4,
+    /// Maximum vertex buffer slots in a pipeline.
     MaxVertexBuffers = 5,
+    /// Maximum vertex attributes in a pipeline.
     MaxVertexAttributes = 6,
+    /// Maximum color attachments in a render pass.
     MaxColorAttachments = 7,
+    /// Maximum aggregate texture allocation, in bytes.
     MaxTextureBytes = 8,
+    /// Maximum aggregate buffer allocation, in bytes.
     MaxBufferBytes = 9,
+    /// Maximum draw commands per batch.
     MaxDrawsPerBatch = 10,
+    /// Maximum encoded batch length, in bytes.
     MaxBatchBytes = 11,
+    /// Maximum upload payload bytes per guest update.
     MaxUploadBytesPerTick = 12,
+    /// Maximum storage buffer binding range, in bytes.
     MaxStorageBufferBindingSize = 13,
+    /// Maximum storage buffer bindings visible to one shader stage.
     MaxStorageBuffersPerShaderStage = 14,
+    /// Maximum shared storage per compute workgroup, in bytes.
     MaxComputeWorkgroupStorageSize = 15,
+    /// Maximum total invocations in one compute workgroup.
     MaxComputeInvocationsPerWorkgroup = 16,
+    /// Maximum local workgroup size along the X axis.
     MaxComputeWorkgroupSizeX = 17,
+    /// Maximum local workgroup size along the Y axis.
     MaxComputeWorkgroupSizeY = 18,
+    /// Maximum local workgroup size along the Z axis.
     MaxComputeWorkgroupSizeZ = 19,
+    /// Maximum dispatched workgroups along each axis.
     MaxComputeWorkgroupsPerDimension = 20,
+    /// Maximum dispatch commands per batch.
     MaxDispatchesPerBatch = 21,
+    /// Bitmask of supported additive raster features.
     RasterFeatures = 22,
+    /// Maximum dimension of a 3D texture, in texels.
     MaxTextureDimension3d = 23,
+    /// Maximum array layers in a 2D texture.
     MaxTextureArrayLayers = 24,
 }
 
+/// Discriminants for asynchronous host-to-guest GPU events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuEventType {
+    /// The referenced batch was not executed.
     BatchRejected = 1,
+    /// Shader compilation produced a diagnostic.
     ShaderDiagnostic = 2,
+    /// Resource creation failed.
     ResourceFailed = 3,
+    /// A device error was not associated with a specific request.
     UncapturedError = 4,
+    /// The referenced submission finished executing.
     SubmissionComplete = 5,
+    /// Surface dimensions or generation changed.
     SurfaceChanged = 6,
+    /// The GPU device can no longer accept work.
     DeviceLost = 7,
+    /// A replacement GPU device is ready for resource recreation.
     DeviceRestored = 8,
+    /// A render pass's token and ordered 64-bit occlusion results.
     OcclusionResults = 9,
 }
 
+/// Command discriminants in the GPU batch wire protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuOpcode {
+    /// Allocate a buffer with declared size and usage.
     CreateBuffer = 1,
+    /// Upload inline bytes into a buffer range.
     WriteBuffer = 2,
+    /// Allocate a texture with declared format and dimensions.
     CreateTexture = 3,
+    /// Upload inline texels into a texture region.
     WriteTexture = 4,
+    /// Create texture sampling state.
     CreateSampler = 5,
+    /// Compile inline UTF-8 WGSL source.
     CreateShaderWgsl = 6,
+    /// Declare binding types and shader visibility.
     CreateBindGroupLayout = 7,
+    /// Combine bind group layouts into pipeline state.
     CreatePipelineLayout = 8,
+    /// Associate resources with binding slots.
     CreateBindGroup = 9,
+    /// Create a raster pipeline from shader and fixed-function state.
     CreateRenderPipeline = 10,
+    /// Release the resource named by a packed handle.
     DestroyResource = 11,
+    /// Begin a render pass with attachment load/store operations.
     BeginRenderPass = 12,
+    /// Select the active render pipeline.
     SetPipeline = 13,
+    /// Bind a buffer range to a vertex input slot.
     SetVertexBuffer = 14,
+    /// Bind a buffer range and format for indexed draws.
     SetIndexBuffer = 15,
+    /// Bind render resources, including dynamic offsets.
     SetBindGroup = 16,
+    /// Set the raster viewport and depth range.
     SetViewport = 17,
+    /// Set the pixel rectangle permitted to receive fragments.
     SetScissorRect = 18,
+    /// Issue a non-indexed, optionally instanced draw.
     Draw = 19,
+    /// Issue an indexed, optionally instanced draw.
     DrawIndexed = 20,
+    /// End the active render pass.
     EndRenderPass = 21,
+    /// Copy bytes between buffer ranges.
     CopyBufferToBuffer = 22,
+    /// Select a texture's mip range and aspect for binding.
     CreateTextureView = 23,
+    /// Create a compute pipeline from a shader entry point.
     CreateComputePipeline = 24,
+    /// Begin a compute pass.
     BeginComputePass = 25,
+    /// Select the active compute pipeline.
     SetComputePipeline = 26,
+    /// Bind compute resources, including dynamic offsets.
     SetComputeBindGroup = 27,
+    /// Dispatch workgroups along three axes.
     DispatchWorkgroups = 28,
+    /// End the active compute pass.
     EndComputePass = 29,
+    /// Set the active render pass's eight-bit stencil reference.
     SetStencilReference = 30,
+    /// Set the active render pass's constant blend color.
     SetBlendConstant = 31,
+    /// Begin an unused occlusion query declared by the active render pass.
     BeginOcclusionQuery = 32,
+    /// End the active occlusion query.
     EndOcclusionQuery = 33,
 }
 
@@ -197,298 +325,493 @@ impl TryFrom<u16> for GpuOpcode {
     }
 }
 
+/// Texture formats represented by stable wire discriminants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuTextureFormat {
+    /// Four unsigned normalized 8-bit channels in RGBA order.
     Rgba8Unorm = 1,
+    /// RGBA8 with sRGB color transfer.
     Rgba8UnormSrgb = 2,
+    /// Four unsigned normalized 8-bit channels in BGRA order.
     Bgra8Unorm = 3,
+    /// BGRA8 with sRGB color transfer.
     Bgra8UnormSrgb = 4,
+    /// Depth format with at least 24 bits of precision.
     Depth24Plus = 5,
+    /// One 32-bit floating-point depth component.
     Depth32Float = 6,
+    /// One unsigned normalized 8-bit red component.
     R8Unorm = 7,
+    /// Depth with at least 24 bits of precision and an eight-bit stencil.
     Depth24PlusStencil8 = 8,
 }
 
+/// Vertex attribute storage formats.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuVertexFormat {
+    /// One 32-bit floating-point component.
     Float32 = 1,
+    /// Two 32-bit floating-point components.
     Float32x2 = 2,
+    /// Three 32-bit floating-point components.
     Float32x3 = 3,
+    /// Four 32-bit floating-point components.
     Float32x4 = 4,
+    /// One unsigned 32-bit integer component.
     Uint32 = 5,
+    /// Two unsigned 32-bit integer components.
     Uint32x2 = 6,
+    /// Four unsigned 32-bit integer components.
     Uint32x4 = 7,
+    /// Two unsigned 8-bit components normalized to [0, 1].
     Unorm8x2 = 8,
+    /// Four unsigned 8-bit components normalized to [0, 1].
     Unorm8x4 = 9,
+    /// Two signed 8-bit components normalized to [-1, 1].
     Snorm8x2 = 10,
+    /// Four signed 8-bit components normalized to [-1, 1].
     Snorm8x4 = 11,
 }
 
+/// Element width of an index buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuIndexFormat {
+    /// Unsigned 16-bit indices.
     Uint16 = 1,
+    /// Unsigned 32-bit indices.
     Uint32 = 2,
 }
 
+/// Sampling behavior for texture coordinates outside [0, 1].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuAddressMode {
+    /// Use the nearest edge texel.
     ClampToEdge = 1,
+    /// Wrap coordinates modulo one.
     Repeat = 2,
+    /// Wrap coordinates with alternating reflection.
     MirrorRepeat = 3,
 }
 
+/// Texel selection when sampling between texel centers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuFilterMode {
+    /// Select the nearest texel.
     Nearest = 1,
+    /// Interpolate neighboring texels.
     Linear = 2,
 }
 
+/// Comparison of the incoming value against the stored/reference value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuCompareFunction {
+    /// No comparison passes.
     Never = 1,
+    /// Pass when incoming is less than stored.
     Less = 2,
+    /// Pass when incoming equals stored.
     Equal = 3,
+    /// Pass when incoming is less than or equal to stored.
     LessEqual = 4,
+    /// Pass when incoming is greater than stored.
     Greater = 5,
+    /// Pass when incoming differs from stored.
     NotEqual = 6,
+    /// Pass when incoming is greater than or equal to stored.
     GreaterEqual = 7,
+    /// Every comparison passes.
     Always = 8,
 }
 
+/// Operation updating a stored stencil value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuStencilOperation {
+    /// Leave the stored value unchanged.
     Keep = 1,
+    /// Store zero.
     Zero = 2,
+    /// Store the current stencil reference.
     Replace = 3,
+    /// Invert every stencil bit.
     Invert = 4,
+    /// Increment, saturating at the maximum value.
     IncrementClamp = 5,
+    /// Decrement, saturating at zero.
     DecrementClamp = 6,
+    /// Increment, wrapping after the maximum value.
     IncrementWrap = 7,
+    /// Decrement, wrapping below zero.
     DecrementWrap = 8,
 }
 
+/// Operation combining factored source and destination colors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuBlendOperation {
+    /// Add source and destination.
     Add = 1,
+    /// Subtract destination from source.
     Subtract = 2,
+    /// Subtract source from destination.
     ReverseSubtract = 3,
+    /// Select the component-wise minimum.
     Min = 4,
+    /// Select the component-wise maximum.
     Max = 5,
 }
 
+/// Multipliers used in color or alpha blending.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuBlendFactor {
+    /// Multiply by zero.
     Zero = 1,
+    /// Multiply by one.
     One = 2,
+    /// Use source color components.
     Src = 3,
+    /// Use one minus source color components.
     OneMinusSrc = 4,
+    /// Use source alpha for every component.
     SrcAlpha = 5,
+    /// Use one minus source alpha.
     OneMinusSrcAlpha = 6,
+    /// Use destination color components.
     Dst = 7,
+    /// Use one minus destination color components.
     OneMinusDst = 8,
+    /// Use destination alpha for every component.
     DstAlpha = 9,
+    /// Use one minus destination alpha.
     OneMinusDstAlpha = 10,
+    /// Use min(source alpha, one minus destination alpha) for color.
     SrcAlphaSaturated = 11,
+    /// Use the constant blend color.
     Constant = 12,
+    /// Use one minus the constant blend color.
     OneMinusConstant = 13,
 }
 
+/// Assembly of vertex sequences into raster primitives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuPrimitiveTopology {
+    /// Each vertex forms one point.
     PointList = 1,
+    /// Each pair of vertices forms one independent line.
     LineList = 2,
+    /// Consecutive vertices form connected lines.
     LineStrip = 3,
+    /// Each three vertices form one independent triangle.
     TriangleList = 4,
+    /// Each vertex after the first two extends a triangle strip.
     TriangleStrip = 5,
 }
 
+/// Winding identifying a triangle's front side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuFrontFace {
+    /// Counterclockwise vertices face front.
     Ccw = 1,
+    /// Clockwise vertices face front.
     Cw = 2,
 }
 
+/// Triangle side discarded during rasterization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuCullMode {
+    /// Discard front-facing triangles.
     Front = 1,
+    /// Discard back-facing triangles.
     Back = 2,
 }
 
+/// Resource types permitted in a bind group layout entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum GpuBindingKind {
+    /// Read-only uniform buffer binding.
     UniformBuffer = 1,
+    /// Texture sampler binding.
     Sampler = 2,
+    /// Sampled texture view binding.
     Texture = 3,
+    /// Read-only storage buffer binding.
     StorageBuffer = 4,
+    /// Read/write storage buffer binding.
     StorageBufferReadWrite = 5,
 }
 
+/// Sampler restrictions declared by a bind group layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GpuSamplerBindingType {
+    /// Allows filtering texture samples.
     Filtering = 1,
+    /// Only non-filtering texture samples.
     NonFiltering = 2,
+    /// Compares sampled depth with a reference value.
     Comparison = 3,
 }
 
+/// Shader sample type required by a texture binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GpuTextureSampleType {
+    /// Floating-point samples supporting filtering.
     FloatFilterable = 1,
+    /// Floating-point samples without filtering.
     FloatUnfilterable = 2,
+    /// Depth comparison samples.
     Depth = 3,
+    /// Signed integer samples.
     Sint = 4,
+    /// Unsigned integer samples.
     Uint = 5,
 }
 
+/// Rate at which a vertex buffer advances.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuVertexStepMode {
+    /// Advance once per vertex.
     Vertex = 1,
+    /// Advance once per instance.
     Instance = 2,
 }
 
+/// Texture dimensionality supported by this protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuTextureDimension {
+    /// Two-dimensional texture.
     D2 = 1,
+    /// Three-dimensional texture.
     D3 = 2,
 }
 
+/// Dimensionality exposed by a texture view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GpuTextureViewDimension {
+    /// Two-dimensional texture view.
     D2 = 1,
+    /// Array of two-dimensional views.
     D2Array = 2,
+    /// Six square faces forming one cube.
     Cube = 3,
+    /// Array of complete six-face cubes.
     CubeArray = 4,
+    /// Three-dimensional view without array-layer selection.
     D3 = 5,
 }
 
+/// Subset of a texture's components exposed by a view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum GpuTextureAspect {
+    /// All components of the texture format.
     All = 1,
+    /// Only the depth component.
     DepthOnly = 2,
 }
 
+/// Texture descriptor flag appending a depth or array-layer count.
 pub const GPU_TEXTURE_HAS_DEPTH_OR_ARRAY_LAYERS: u8 = 1;
+/// Raster feature bit enabling 3D, array and cube textures.
 pub const GPU_RASTER_FEATURE_LAYERED_TEXTURES: u64 = 1;
+/// Raster feature bit enabling stencil state and depth bias.
 pub const GPU_RASTER_FEATURE_STENCIL_DEPTH_BIAS: u64 = 2;
+/// Raster feature bit enabling constant blend factors and dynamic blend color.
 pub const GPU_RASTER_FEATURE_BLEND_CONSTANT: u64 = 4;
+/// Raster feature bit enabling asynchronous occlusion queries.
 pub const GPU_RASTER_FEATURE_OCCLUSION_QUERIES: u64 = 8;
 
+/// Buffer usage bit permitting copy-source operations.
 pub const GPU_BUFFER_USAGE_COPY_SRC: u32 = 4;
+/// Buffer usage bit permitting copy/upload destinations.
 pub const GPU_BUFFER_USAGE_COPY_DST: u32 = 8;
+/// Buffer usage bit permitting index input.
 pub const GPU_BUFFER_USAGE_INDEX: u32 = 16;
+/// Buffer usage bit permitting vertex input.
 pub const GPU_BUFFER_USAGE_VERTEX: u32 = 32;
+/// Buffer usage bit permitting uniform bindings.
 pub const GPU_BUFFER_USAGE_UNIFORM: u32 = 64;
+/// Buffer usage bit permitting storage bindings.
 pub const GPU_BUFFER_USAGE_STORAGE: u32 = 128;
+/// Texture usage bit permitting copy-source operations.
 pub const GPU_TEXTURE_USAGE_COPY_SRC: u32 = 1;
+/// Texture usage bit permitting copy/upload destinations.
 pub const GPU_TEXTURE_USAGE_COPY_DST: u32 = 2;
+/// Texture usage bit permitting shader sampling.
 pub const GPU_TEXTURE_USAGE_TEXTURE_BINDING: u32 = 4;
+/// Texture usage bit permitting render attachment use.
 pub const GPU_TEXTURE_USAGE_RENDER_ATTACHMENT: u32 = 16;
+/// Binding visibility bit for vertex shaders.
 pub const GPU_SHADER_STAGE_VERTEX: u32 = 1;
+/// Binding visibility bit for fragment shaders.
 pub const GPU_SHADER_STAGE_FRAGMENT: u32 = 2;
+/// Color write mask bit for the red channel.
 pub const GPU_COLOR_WRITE_RED: u16 = 1;
+/// Color write mask bit for the green channel.
 pub const GPU_COLOR_WRITE_GREEN: u16 = 2;
+/// Color write mask bit for the blue channel.
 pub const GPU_COLOR_WRITE_BLUE: u16 = 4;
+/// Color write mask bit for the alpha channel.
 pub const GPU_COLOR_WRITE_ALPHA: u16 = 8;
+/// Render pass bit loading existing color rather than clearing.
 pub const GPU_RENDER_PASS_COLOR_LOAD: u32 = 1;
+/// Render pass bit preserving color after the pass.
 pub const GPU_RENDER_PASS_COLOR_STORE: u32 = 2;
+/// Render pass bit loading existing depth rather than clearing.
 pub const GPU_RENDER_PASS_DEPTH_LOAD: u32 = 4;
+/// Render pass bit preserving depth after the pass.
 pub const GPU_RENDER_PASS_DEPTH_STORE: u32 = 8;
+/// Render pass bit loading existing stencil values rather than clearing.
 pub const GPU_RENDER_PASS_STENCIL_LOAD: u32 = 16;
+/// Render pass bit preserving stencil values after the pass.
 pub const GPU_RENDER_PASS_STENCIL_STORE: u32 = 32;
+/// Render pass bit appending an explicit stencil clear value.
 pub const GPU_RENDER_PASS_HAS_STENCIL_CLEAR: u32 = 64;
+/// Render pass bit appending the occlusion query count and guest token.
 pub const GPU_RENDER_PASS_HAS_OCCLUSION_QUERIES: u32 = 128;
+/// All supported render pass flag bits.
 pub const GPU_RENDER_PASS_FLAGS: u32 = 255;
+/// Fixed render pass payload size before optional trailers.
 pub const GPU_RENDER_PASS_BYTES: usize = 36;
+/// Size of an explicit stencil clear value, in bytes.
 pub const GPU_RENDER_PASS_STENCIL_CLEAR_BYTES: usize = 4;
 /// Query count and guest token, after any stencil clear value.
 pub const GPU_RENDER_PASS_OCCLUSION_BYTES: usize = 8;
 /// Occlusion results: token, query count, then one `u64` per query.
 pub const GPU_OCCLUSION_RESULTS_HEADER_BYTES: usize = 8;
+/// Binding flag requiring a dynamic buffer offset at bind time.
 pub const GPU_BINDING_HAS_DYNAMIC_OFFSET: u16 = 1;
+/// Pipeline flag enabling depth-buffer writes.
 pub const GPU_PIPELINE_DEPTH_WRITE: u16 = 1;
+/// Pipeline flag appending stencil and depth-bias state.
 pub const GPU_PIPELINE_STENCIL_DEPTH_BIAS: u16 = 2;
+/// All supported render pipeline flag bits.
 pub const GPU_PIPELINE_FLAGS: u16 = 3;
+/// Fixed render pipeline payload size before counted arrays and trailers.
 pub const GPU_PIPELINE_HEADER_BYTES: usize = 40;
+/// Size of the stencil and depth-bias trailer, in bytes.
 pub const GPU_PIPELINE_STENCIL_DEPTH_BIAS_BYTES: usize = 24;
+/// Largest stencil reference or clear value.
 pub const MAX_GPU_STENCIL_VALUE: u32 = 255;
 
+/// Structural batch validation failure, before device execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuWireError {
+    /// Encoded batch exceeds the protocol byte limit.
     BatchTooLarge {
+        /// Received byte length.
         actual: usize,
     },
+    /// Input cannot contain the fixed batch header.
     TruncatedBatchHeader {
+        /// Received byte length.
         actual: usize,
     },
+    /// Batch discriminator is not `EPG1`.
     InvalidMagic,
+    /// Batch version is not supported.
     UnsupportedVersion {
+        /// Version found in the header.
         version: u16,
     },
+    /// Reserved batch flag bits were nonzero.
     ReservedBatchFlags {
+        /// Raw flag bits.
         flags: u16,
     },
+    /// Header byte length differs from the supplied slice.
     BatchLengthMismatch {
+        /// Byte length encoded in the header.
         declared: usize,
+        /// Received byte length.
         actual: usize,
     },
+    /// Sequence zero is reserved.
     EmptySequence,
+    /// Declared command count exceeds the protocol limit.
     TooManyCommands {
+        /// Declared number of commands.
         count: u32,
     },
+    /// A command header extends beyond the batch.
     TruncatedCommandHeader {
+        /// Zero-based command index.
         index: u32,
     },
+    /// A command length is too short, unaligned, or out of bounds.
     InvalidCommandLength {
+        /// Zero-based command index.
         index: u32,
+        /// Declared command length in bytes, including its header.
         length: usize,
     },
+    /// Reserved command flag bits were nonzero.
     ReservedCommandFlags {
+        /// Zero-based command index.
         index: u32,
+        /// Raw flag bits.
         flags: u16,
     },
+    /// Reserved flags in a command-specific payload were nonzero.
     ReservedPayloadFlags {
+        /// Zero-based command index.
         index: u32,
+        /// Command containing the flags.
         opcode: GpuOpcode,
+        /// Raw flag bits.
         flags: u32,
     },
+    /// Command discriminant is not supported.
     UnknownOpcode {
+        /// Zero-based command index.
         index: u32,
+        /// Raw command discriminant.
         opcode: u16,
     },
+    /// Payload size does not match the command layout.
     InvalidPayloadLength {
+        /// Zero-based command index.
         index: u32,
+        /// Command whose payload was rejected.
         opcode: GpuOpcode,
+        /// Required payload size in bytes.
         expected: usize,
+        /// Supplied payload size in bytes.
         actual: usize,
     },
+    /// Shader source is not valid UTF-8.
     InvalidWgslUtf8 {
+        /// Zero-based command index.
         index: u32,
     },
+    /// Alignment padding contains nonzero bytes.
     NonZeroPadding {
+        /// Zero-based command index.
         index: u32,
     },
+    /// Bytes remain after the declared commands.
     TrailingCommandBytes {
+        /// Number of trailing bytes.
         actual: usize,
     },
+    /// A payload size calculation overflowed.
     IntegerOverflow {
+        /// Zero-based command index.
         index: u32,
     },
 }
@@ -568,6 +891,7 @@ impl fmt::Display for GpuWireError {
 
 impl core::error::Error for GpuWireError {}
 
+/// Borrowed batch with structurally validated command payloads.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuBatch<'a> {
     sequence: u64,
@@ -576,14 +900,17 @@ pub struct GpuBatch<'a> {
 }
 
 impl<'a> GpuBatch<'a> {
+    /// Nonzero guest-assigned sequence used to correlate events.
     pub fn sequence(self) -> u64 {
         self.sequence
     }
 
+    /// Number of encoded commands.
     pub fn command_count(self) -> u32 {
         self.command_count
     }
 
+    /// Iterate validated commands in submission order without copying.
     pub fn commands(self) -> GpuCommands<'a> {
         GpuCommands {
             bytes: self.command_bytes,
@@ -592,12 +919,16 @@ impl<'a> GpuBatch<'a> {
     }
 }
 
+/// One command borrowed from a validated batch.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuCommand<'a> {
+    /// Command layout identifying the payload.
     pub opcode: GpuOpcode,
+    /// Encoded payload bytes, excluding the command header.
     pub payload: &'a [u8],
 }
 
+/// Exact-size iterator over commands in a validated batch.
 pub struct GpuCommands<'a> {
     bytes: &'a [u8],
     remaining: u32,
@@ -626,6 +957,9 @@ impl<'a> Iterator for GpuCommands<'a> {
 
 impl ExactSizeIterator for GpuCommands<'_> {}
 
+/// Validate framing, payload sizes, UTF-8, and padding without allocating.
+///
+/// Resource validity and GPU execution state must still be checked by the host.
 pub fn decode_gpu_batch(bytes: &[u8]) -> Result<GpuBatch<'_>, GpuWireError> {
     if bytes.len() > MAX_GPU_BATCH_BYTES {
         return Err(GpuWireError::BatchTooLarge {

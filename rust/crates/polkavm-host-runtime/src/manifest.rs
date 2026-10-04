@@ -29,9 +29,12 @@ pub struct AppDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FileTypeHint {
+    /// User-facing description of the suggested file type.
     pub label: String,
+    /// Lowercase filename extensions including their leading dots.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Lowercase MIME types associated with the suggested file type.
     #[serde(default)]
     pub mime_types: Vec<String>,
     /// The runtime registration `id` for these files.
@@ -205,6 +208,13 @@ mod tests {
 
     const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
     const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"audio":{"abiVersion":1}}}"#;
+
+    const FILE_INPUT: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer"},"fileInput":{"abiVersion":1,"handlers":[{"id":"snes-rom","label":"SNES cartridge image","extensions":[".sfc",".smc"],"mediaTypes":["application/x-snes-rom"],"maxBytes":16777216,"mountPath":"game/cartridge.sfc"}]}}}"#;
+
+    #[test]
+    fn rejects_removed_manifest_file_input_capability() {
+        assert!(AppDescriptor::parse_exact(FILE_INPUT, FILE_INPUT).is_err());
+    }
 
     #[test]
     fn omitted_required_features_default_to_empty() {

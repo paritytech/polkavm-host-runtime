@@ -175,6 +175,9 @@ function descriptors(records) {
       header.setUint32(4, payload.byteLength, true);
     } else if (record.camera) {
       header.setUint32(0, 2, true);
+    } else if (record.cancelNow !== undefined) {
+      header.setUint32(0, 5, true);
+      header.setUint32(4, record.cancelNow, true);
     } else if (record.cancel !== undefined) {
       header.setUint32(0, 4, true);
       header.setUint32(4, record.cancel, true);
@@ -1491,4 +1494,258 @@ test("direct translated stop awaits asynchronous disk cleanup and reports its fa
       assert.equal(existsSync(disk.path), false);
     }
   }
+});
+
+test("a new guest request invalidates an older idle cache selection", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  for (const forceInterpreter of BACKENDS) {
+    const disk = diskCache(t);
+    const opening = deferred();
+    const started = deferred();
+    const closed = deferred();
+    t.after(() => opening.resolve());
+    const close = disk.cache.close;
+    disk.cache.close = () => { close(); closed.resolve(); };
+    const live = await launchStream(t, [[3, 1], [0, 1]], forceInterpreter, {
+      fileCache: true,
+      async createFileCache() { started.resolve(); await opening.promise; return disk.cache; },
+    });
+    const from = live.messages.length;
+    live.receiver.onmessage({
+      data: { type: "file-input", handle: 1, name: "source.bin", mimeType: "", file: new DiskBlob(original) },
+    });
+    await started.promise;
+    assert.equal((await live.step()).status, 2);
+    opening.resolve();
+    await closed.promise;
+    const saved = await live.step();
+    assert.equal(saved.status, 2);
+    assert.equal(saved.info, 0);
+    assert.equal(live.messages.slice(from).some((message) => message.type === "file-input-delivery"), false);
+    assert.equal(disk.state.closes, 1);
+    assert.deepEqual(original.reads, []);
+    await stop(live.receiver, live.messages);
+  }
+});
+
+test("cache creation failure completes the active request and permits another picker", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  for (const forceInterpreter of BACKENDS) {
+    const live = await launchStream(t, [[3, 1], [0, 1], [3, 1]], forceInterpreter, {
+      fileCache: true,
+      async createFileCache() { throw new Error("disk unavailable"); },
+    });
+    assert.equal((await live.step()).status, 2);
+    const from = live.messages.length;
+    live.receiver.onmessage({
+      data: { type: "file-input", handle: 1, name: "source.bin", mimeType: "", file: new DiskBlob(original) },
+    });
+    assert.equal((await nextMessage(live.messages, from, "file-input-delivery")).outcome, "error");
+    assert.equal((await nextMessage(live.messages, from, "error")).fatal, false);
+    assert.equal((await streamSnapshotAfter(live.messages, from)).status, 6);
+    const retriggered = await live.step();
+    assert.equal(retriggered.result, 0);
+    assert.equal(retriggered.status, 2);
+    assert.deepEqual(original.reads, []);
+    await stop(live.receiver, live.messages);
+  }
+});
+
+test("retired browser caches keep their disk reservation until deletion completes", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  const maximum = 512 * 1024 * 1024;
+  for (const forceInterpreter of BACKENDS) {
+    const disks = [diskCache(t), diskCache(t)];
+    const deletion = deferred();
+    t.after(() => deletion.resolve());
+    const close = disks[0].cache.close;
+    disks[0].cache.close = async () => { await deletion.promise; close(); };
+    let next = 0;
+    const live = await launchStream(t, [
+      [11, 1, 0], [0, 1], [5, 1, maximum], [2, 1], [5, 2, 1], [1, 2, 0, 6],
+    ], forceInterpreter, {
+      fileCache: true, createFileCache: async () => disks[next++].cache,
+    });
+    assert.equal((await live.select(new DiskBlob(original))).result, 2);
+    await live.select(new DiskBlob(original), "ready", 2);
+    assert.equal((await live.step()).result, 0);
+    assert.equal((await live.step()).status, 1);
+    assert.equal(existsSync(disks[0].path), true);
+    // The guest reservation was released, but the Host cannot allocate more
+    // physical storage while the previous reservation is still being deleted.
+    const blocked = await live.step();
+    assert.equal(blocked.result, -4);
+    assert.equal(blocked.status, 3);
+    assert.deepEqual(disks[1].state.resets, []);
+    assert.equal(decoder.decode((await live.step()).bytes), "source");
+    deletion.resolve();
+    await stop(live.receiver, live.messages);
+    assert.equal(existsSync(disks[0].path), false);
+  }
+});
+
+test("direct translated cache quota includes asynchronous retired reservations", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  const maximum = 512 * 1024 * 1024;
+  const live = await translatedStream(t, [
+    [11, 1, 0], [5, 1, maximum], [2, 1], [5, 2, 1], [5, 2, 1],
+  ]);
+  assert.equal(live.step().result, 2);
+  const disks = [diskCache(t), diskCache(t)];
+  const deletion = deferred();
+  t.after(() => deletion.resolve());
+  const close = disks[0].cache.close;
+  disks[0].cache.close = async () => { await deletion.promise; close(); };
+  for (let index = 0; index < 2; index++) {
+    const source = diskSource(original);
+    assert.equal(live.translated.sendFileStream(
+      index + 1, "source.bin", "", 6, source.source, disks[index].cache,
+    ).outcome, "ready");
+  }
+  assert.equal(live.step().result, 0);
+  assert.equal(live.step().status, 1);
+  assert.equal(live.step().result, -2);
+  assert.deepEqual(disks[1].state.resets, []);
+  deletion.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(live.step().result, 0);
+  assert.deepEqual(disks[1].state.resets, [1]);
+  await live.translated.stop();
+});
+
+test("cached file delivery while paused retains the source without reading until resume", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  for (const forceInterpreter of BACKENDS) {
+    const disk = diskCache(t);
+    const live = await launchStream(t, [[1, 1, 0, 6]], forceInterpreter, {
+      fileCache: true, createFileCache: async () => disk.cache,
+    });
+    live.receiver.onmessage({ data: { type: "pause", paused: true } });
+    const from = live.messages.length;
+    live.receiver.onmessage({
+      data: { type: "file-input", handle: 1, name: "source.bin", mimeType: "", file: new DiskBlob(original) },
+    });
+    assert.equal((await nextMessage(live.messages, from, "file-input-delivery")).outcome, "ready");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(live.messages.slice(from).some((message) => message.type === "save"), false);
+    assert.deepEqual(original.reads, []);
+    live.receiver.onmessage({ data: { type: "pause", paused: false } });
+    assert.equal(decoder.decode((await streamSnapshotAfter(live.messages, from)).bytes), "source");
+    original.reads.length = 0;
+    await stop(live.receiver, live.messages);
+  }
+});
+
+test("Wasm file metadata is consumed on parse and stream-staging failures", async () => {
+  const closed = [];
+  const unavailable = () => assert.fail("metadata validation must not perform file or cache I/O");
+  const { instance } = await WebAssembly.instantiate(runtime, {
+    polkavm_browser: {
+      clock_wall_ms: () => 0,
+      random_fill: () => -5,
+      file_read: unavailable,
+      file_close: (token) => closed.push(token),
+      file_cache_reset: unavailable,
+      file_cache_write: unavailable,
+      file_cache_read: unavailable,
+      file_cache_flush: unavailable,
+      file_cache_close: unavailable,
+    },
+  });
+  const pvm = instance.exports;
+  const stage = (bytes) => {
+    const pointer = pvm.polkavm_browser_staging_reserve(bytes.byteLength);
+    assert.notEqual(pointer, 0);
+    new Uint8Array(pvm.memory.buffer, pointer, bytes.byteLength).set(bytes);
+  };
+  const error = () => decoder.decode(new Uint8Array(
+    pvm.memory.buffer, pvm.polkavm_browser_error_pointer(), pvm.polkavm_browser_error_length(),
+  ));
+  try {
+    stage(streamProgram);
+    assert.equal(pvm.polkavm_browser_launch_begin_v2(10_000_000_000n, 0, 0), 0);
+    assert.equal(pvm.polkavm_browser_launch_start(), 0);
+    stage(encoder.encode(ENTRYPOINT));
+    assert.equal(pvm.polkavm_browser_set_file_input_support(0, 0, 1), 0);
+    assert.equal(pvm.polkavm_browser_init(), 0);
+    const metadata = encoder.encode(JSON.stringify({ name: "source.bin", mimeType: "" }));
+    stage(metadata);
+    assert.equal(pvm.polkavm_browser_stage_file_metadata(), 0);
+    stage(encoder.encode("{"));
+    assert.equal(pvm.polkavm_browser_stage_file_metadata(), 1);
+    assert.equal(pvm.polkavm_browser_send_file_stream(1, 6, 1, 0), 1);
+    assert.match(error(), /metadata was not staged/);
+    stage(metadata);
+    assert.equal(pvm.polkavm_browser_stage_file_metadata(), 0);
+    stage(new Uint8Array([1]));
+    assert.equal(pvm.polkavm_browser_send_file_stream(1, 6, 2, 0), 1);
+    assert.match(error(), /must not stage file bytes/);
+    assert.equal(pvm.polkavm_browser_send_file_stream(1, 6, 3, 0), 1);
+    assert.match(error(), /metadata was not staged/);
+    stage(metadata);
+    assert.equal(pvm.polkavm_browser_stage_file_metadata(), 0);
+    assert.equal(pvm.polkavm_browser_send_file_stream(1, 6, 4, 0), 0);
+  } finally {
+    pvm.polkavm_browser_reset();
+  }
+  assert.deepEqual(closed, [1, 2, 3, 4]);
+});
+
+test("a translated source close failure does not skip other selected files or cache cleanup", async (t) => {
+  const original = diskFile(t, encoder.encode("source"));
+  const live = await translatedStream(t, [[11, 1, 0]]);
+  assert.equal(live.step().result, 2);
+  const sources = [diskSource(original), diskSource(original)];
+  const disks = [diskCache(t), diskCache(t)];
+  const close = sources[0].source.close;
+  sources[0].source.close = () => {
+    close();
+    throw new Error("selected file close failed");
+  };
+  for (let index = 0; index < 2; index++) {
+    assert.equal(live.translated.sendFileStream(
+      index + 1, "source.bin", "", 6, sources[index].source, disks[index].cache,
+    ).outcome, "ready");
+  }
+  assert.deepEqual(await live.translated.stop(), { cleanupFailed: true });
+  assert.ok(sources.every(({ state }) => state.closes === 1));
+  assert.ok(disks.every(({ state, path }) => state.closes === 1 && !existsSync(path)));
+  const error = live.messages.find((message) => message.type === "error");
+  assert.equal(error.fatal, false);
+  assert.match(error.message, /selected file cleanup failed/);
+  assert.deepEqual(
+    live.messages.filter((message) => message.type === "mediated-input-cancel")
+      .map((message) => message.handle),
+    [1, 2],
+  );
+});
+
+test("both browser backends bound trigger/cancel output from one guest slice", async (t) => {
+  for (const forceInterpreter of BACKENDS) {
+    const live = await launch({
+      records: [INLINE, ...Array.from({ length: 7 }, () => [
+        { trigger: 0 }, { cancelNow: 0 },
+      ]).flat()],
+      forceInterpreter,
+    });
+    t.after(() => stop(live.receiver, live.messages));
+    assert.equal((await nextMessage(live.messages, 0, "ready")).backend,
+      forceInterpreter ? "interpreter" : "compiler");
+    assert.deepEqual(live.results.slice(0, 15), [
+      1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2,
+    ]);
+    assert.equal(live.messages.filter((message) => message.type === "file-input-request").length, 4);
+    assert.equal(live.messages.filter((message) => message.type === "mediated-input-cancel").length, 4);
+  }
+});
+
+test("direct translated stop cancels an active file picker", async (t) => {
+  const live = await translatedStream(t, [[3, 1]]);
+  assert.equal(live.step().status, 2);
+  await live.translated.stop();
+  assert.deepEqual(
+    live.messages.filter((message) => ["file-input-request", "mediated-input-cancel"].includes(message.type))
+      .map((message) => [message.type, message.handle]),
+    [["file-input-request", 1], ["mediated-input-cancel", 1]],
+  );
 });

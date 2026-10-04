@@ -11,32 +11,56 @@ use crate::file_input::{
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+/// Maximum UTF-8 bytes in a mediated-input kind token.
 pub const MAX_MEDIATED_INPUT_KIND_BYTES: usize = 32;
+/// Maximum UTF-8 bytes in a mediated-input media type token.
 pub const MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES: usize = 64;
+/// Maximum bytes returned by a mediated-input request.
 pub const MAX_MEDIATED_INPUT_BYTES: usize = 1024 * 1024;
+/// Maximum simultaneous registrations and supported kinds.
 pub const MAX_MEDIATED_INPUT_REGISTRATIONS: usize = 8;
 
+// Admission reserves one cancellation per registration in addition to queued work.
+const MAX_PENDING_MEDIATED_INPUT_COMMANDS: usize = 2 * MAX_MEDIATED_INPUT_REGISTRATIONS;
+
+/// Registration failed because its arguments were invalid.
 pub const MEDIATED_INPUT_REGISTER_INVALID: i32 = -1;
+/// Registration failed because the host does not support the kind.
 pub const MEDIATED_INPUT_REGISTER_UNAVAILABLE: i32 = -2;
+/// Registration failed because the registration or handle quota was exhausted.
 pub const MEDIATED_INPUT_REGISTER_QUOTA_EXCEEDED: i32 = -3;
 
+/// The request was queued for the host.
 pub const MEDIATED_INPUT_TRIGGER_ACCEPTED: u32 = 0;
+/// The trigger referred to an unknown registration.
 pub const MEDIATED_INPUT_TRIGGER_INVALID_HANDLE: u32 = 1;
+/// Another request is active, or pending host commands are backpressured.
 pub const MEDIATED_INPUT_TRIGGER_BUSY: u32 = 2;
 
+/// Cancellation was queued for the host.
 pub const MEDIATED_INPUT_CANCEL_ACCEPTED: u32 = 0;
+/// Cancellation referred to an unknown registration.
 pub const MEDIATED_INPUT_CANCEL_INVALID_HANDLE: u32 = 1;
+/// Cancellation referred to a registration without an active request.
 pub const MEDIATED_INPUT_CANCEL_NOT_ACTIVE: u32 = 2;
 
+/// Guest-visible lifecycle state of a mediated-input registration.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediatedInputStatus {
+    /// The handle does not identify a registration.
     Invalid = 0,
+    /// Registered and idle, with no result available.
     Registered = 1,
+    /// Waiting for the host to complete the request.
     Active = 2,
+    /// Result bytes are available for the guest to consume.
     Ready = 3,
+    /// The request was cancelled.
     Cancelled = 4,
+    /// Host policy or the user denied the request.
     PermissionDenied = 5,
+    /// The host could not complete the request.
     Failed = 6,
 }
 
@@ -56,19 +80,31 @@ impl TryFrom<u32> for MediatedInputStatus {
     }
 }
 
+/// Bounded request for host-mediated input, subject to host consent policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediatedInputRequest {
+    /// Registration handle used to complete or cancel this request.
     pub handle: u32,
+    /// Registered host-supported input kind.
     pub kind: String,
+    /// Requested result media type.
     pub media_type: String,
+    /// Maximum number of result bytes accepted by this registration.
     pub max_bytes: u32,
 }
 
+/// Pending action that the host must process outside guest execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MediatedInputCommand {
+    /// Present or otherwise fulfill a consented input request.
     Request(MediatedInputRequest),
+    /// Present a file picker for a runtime registration.
     FileRequest(FileInputRequest),
-    Cancel { handle: u32 },
+    /// Cancel the outstanding host interaction for a registration.
+    Cancel {
+        /// Registration whose active interaction should be cancelled.
+        handle: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -449,6 +485,12 @@ impl MediatedInputState {
         let Some(registration) = self.registrations.get_mut(&handle) else {
             return MEDIATED_INPUT_TRIGGER_INVALID_HANDLE;
         };
+        let command_count = 1 + usize::from(selected_stream);
+        if self.commands.len() + command_count + MAX_MEDIATED_INPUT_REGISTRATIONS
+            > MAX_PENDING_MEDIATED_INPUT_COMMANDS
+        {
+            return MEDIATED_INPUT_TRIGGER_BUSY;
+        }
         if selected_stream {
             self.commands
                 .push_back(MediatedInputCommand::Cancel { handle });

@@ -764,6 +764,21 @@ impl Vm {
         fd.position
     }
 
+    fn read_iovec(&mut self, address: u64) -> Result<Option<(u64, u64)>, String> {
+        // The translated ABI wraps each descriptor-field address to 32 bits.
+        let result = self.instance.read_u64(address as u32).and_then(|buffer| {
+            self.instance
+                .read_u64(address.wrapping_add(8) as u32)
+                .map(|length| (buffer, length))
+        });
+        match result {
+            Ok(vector) => Ok(Some(vector)),
+            Err(MemoryAccessError::Error(error)) => Err(error.into()),
+            Err(MemoryAccessError::OutOfRangeAccess { .. })
+            | Err(MemoryAccessError::MemoryLimitReached) => Ok(None),
+        }
+    }
+
     fn handle_read(&mut self, fd: u64, address: u64, length: u64) -> Result<u64, String> {
         log::trace!("Read: fd={fd}, address=0x{address:x}, length={length}");
 
@@ -1135,6 +1150,9 @@ impl Vm {
                         continue;
                     }
                     let mut buffer = vec![0i16; sample_count];
+                    // SAFETY: i16 has no padding or invalid bit patterns. The initialized
+                    // allocation covers this bounded byte length and is uniquely borrowed.
+                    #[allow(unsafe_code)]
                     self.instance.read_memory_into(address, unsafe {
                         core::slice::from_raw_parts_mut(
                             buffer.as_mut_ptr().cast::<u8>(),
@@ -1156,6 +1174,9 @@ impl Vm {
                             continue;
                         }
                         let address = input_destination(address, written)?;
+                        // SAFETY: repr(C) InputEvent contains only two u8 fields, with
+                        // no padding. This byte view stays within the initialized slice.
+                        #[allow(unsafe_code)]
                         self.instance.write_memory(address, unsafe {
                             core::slice::from_raw_parts(
                                 events.as_ptr().cast::<u8>(),
@@ -1195,6 +1216,10 @@ impl Vm {
                     let address = u32::try_from(address)
                         .map_err(|_| "audio address is out of range".to_owned())?;
                     let mut buffer: Vec<i16> = Vec::with_capacity(length);
+                    // SAFETY: the bounded spare capacity covers `length` i16 values.
+                    // PolkaVM initializes the entire byte range on success; only then
+                    // is the length published. Every i16 bit pattern is valid.
+                    #[allow(unsafe_code)]
                     unsafe {
                         self.instance.read_memory_into(
                             address,
@@ -1237,14 +1262,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_read = self.handle_read(a1, address, length)?;
                                 if (bytes_read as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_read);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_read
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 
@@ -1267,14 +1307,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_written = self.handle_write(a1, address, length)?;
                                 if (bytes_written as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_written);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_written
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 

@@ -6,29 +6,47 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 
+/// Maximum UTF-8 bytes in a guest file-registration descriptor.
 pub const MAX_FILE_DESCRIPTOR_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 bytes in a registration identifier.
 pub const MAX_FILE_ID_BYTES: usize = 64;
+/// Maximum UTF-8 bytes in a user-facing file-type label.
 pub const MAX_FILE_LABEL_BYTES: usize = 80;
+/// Maximum filename extensions per registration.
 pub const MAX_FILE_EXTENSIONS: usize = 16;
+/// Maximum ASCII bytes after an extension's leading dot.
 pub const MAX_FILE_EXTENSION_BYTES: usize = 16;
+/// Maximum MIME types per registration.
 pub const MAX_FILE_MIME_TYPES: usize = 16;
+/// Maximum ASCII bytes in a MIME type.
 pub const MAX_FILE_MIME_TYPE_BYTES: usize = 127;
+/// Maximum UTF-8 bytes in a relaunch asset path.
 pub const MAX_FILE_MOUNT_PATH_BYTES: usize = 1_024;
 /// Longest base name the runtime hands to the guest through `host_file_info`.
 pub const MAX_FILE_NAME_BYTES: usize = 1_024;
+/// Largest file delivered as a mediated-input byte result.
 pub const MAX_INLINE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest file delivered as a fresh execution's asset.
 pub const MAX_RELAUNCH_FILE_BYTES: usize = 128 * 1024 * 1024;
+/// Largest retained stream representable by ABI 1 offsets.
 pub const MAX_STREAM_FILE_BYTES: u32 = u32::MAX;
+/// Maximum bytes transferred by one stream or cache operation.
 pub const MAX_FILE_READ_BYTES: u32 = 65_536;
 /// Aggregate private working-cache reservation for one execution.
 pub const MAX_FILE_CACHE_BYTES: u32 = 512 * 1024 * 1024;
 
+/// The handle has no selected source or usable cache.
 pub const FILE_READ_INVALID_HANDLE: i32 = -1;
+/// The requested offset, size, or cache state is invalid.
 pub const FILE_READ_INVALID_RANGE: i32 = -2;
+/// The guest memory range is not accessible for the requested transfer.
 pub const FILE_READ_INVALID_DESTINATION: i32 = -3;
+/// The retained source or private cache failed its I/O operation.
 pub const FILE_READ_IO_ERROR: i32 = -4;
 
+/// The host supports file input, but not the requested delivery.
 pub const FILE_REGISTER_DELIVERY_UNAVAILABLE: i32 = -4;
+/// File metadata was requested for an invalid handle or destination.
 pub const FILE_INFO_INVALID: i32 = -1;
 
 /// How a selected file reaches the guest.
@@ -47,12 +65,19 @@ pub enum FileDelivery {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileDescriptor {
+    /// Stable identifier unique within this execution.
     pub id: String,
+    /// User-facing description for the host picker.
     pub label: String,
+    /// Lowercase filename extensions including their leading dots.
     pub extensions: Vec<String>,
+    /// Lowercase MIME types accepted by the picker.
     pub mime_types: Vec<String>,
+    /// How the host delivers the selected file.
     pub delivery: FileDelivery,
+    /// Maximum accepted selection size in bytes.
     pub max_bytes: u32,
+    /// Asset path used only by relaunch delivery.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_path: Option<String>,
 }
@@ -63,8 +88,11 @@ pub struct FileDescriptor {
 /// registration returns `-2`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileInputSupport {
+    /// Permit bounded inline byte results.
     pub inline: bool,
+    /// Permit fresh-execution asset delivery.
     pub relaunch: bool,
+    /// Permit retained read-only range sources.
     pub stream: bool,
     /// The manifest's `runtime.entrypoint`, which no mount path may replace.
     pub entrypoint: String,
@@ -73,15 +101,20 @@ pub struct FileInputSupport {
 /// One file registration of the current execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRegistration {
+    /// Execution-local guest registration handle.
     pub handle: u32,
+    /// Validated runtime descriptor.
     pub descriptor: FileDescriptor,
+    /// Current guest-visible request or selection state.
     pub status: crate::MediatedInputStatus,
 }
 
 /// A guest-triggered request for the Host to open its file picker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileInputRequest {
+    /// Registration whose picker the host should present.
     pub handle: u32,
+    /// Validated picker and delivery constraints.
     pub descriptor: FileDescriptor,
 }
 
@@ -93,20 +126,26 @@ pub struct FileSelection {
     pub name: String,
     /// The lowercase `type/subtype` the Host resolved, or empty.
     pub mime_type: String,
+    /// Selected file contents for inline or relaunch delivery.
     pub bytes: Vec<u8>,
 }
 
 /// Metadata of a selected stream. The Host retains the file, not its bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileStreamSelection {
+    /// Host-received name, sanitized to a bounded base name by the runtime.
     pub name: String,
+    /// Lowercase MIME type, or empty when unknown.
     pub mime_type: String,
+    /// Exact retained source length, checked against its registration.
     pub size: u64,
 }
 
 /// A retained read-only selection. Dropping the source releases its resources.
 pub trait FileReadSource: Send {
+    /// Length of the retained source in bytes.
     fn size(&self) -> u64;
+    /// Fill the complete bounded destination or return an I/O error.
     fn read_exact_at(&mut self, offset: u32, destination: &mut [u8]) -> Result<()>;
 }
 
@@ -115,8 +154,11 @@ pub trait FileReadSource: Send {
 /// The runtime exposes only bounded sequential writes followed by sealed reads.
 /// Dropping the cache must close and delete its temporary backing storage.
 pub trait FileCache: FileReadSource {
+    /// Discard old contents and reserve exactly this many bytes.
     fn reset(&mut self, size: u32) -> Result<()>;
+    /// Write the complete bounded chunk or return an I/O error.
     fn write_exact_at(&mut self, offset: u32, bytes: &[u8]) -> Result<()>;
+    /// Flush completed writes before the runtime seals the cache.
     fn flush(&mut self) -> Result<()>;
 }
 
@@ -167,7 +209,9 @@ pub struct FileRelaunch {
     pub mount_path: String,
     /// The sanitized base name reported by `host_file_info`.
     pub name: String,
+    /// Lowercase MIME type, or empty when unknown.
     pub mime_type: String,
+    /// Selected file contents to mount before initialization.
     pub bytes: Vec<u8>,
 }
 

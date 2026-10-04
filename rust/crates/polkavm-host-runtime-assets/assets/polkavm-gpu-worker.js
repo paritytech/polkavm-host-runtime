@@ -1176,6 +1176,7 @@ class GpuEngine {
     // Occlusion results resolve after their batch, in submission order.
     this.occlusionDelivery = Promise.resolve();
     this.occlusionEpoch = 0;
+    this.occlusionReadbacks = new Set();
     this.pendingBatches = 0;
     this.testReadbacksRemaining = testReadback ? 8 : 0;
     this.testDeviceLossPending = testDeviceLoss;
@@ -1193,6 +1194,7 @@ class GpuEngine {
    */
   observeDevice(device) {
     device.addEventListener("uncapturederror", event => {
+      if (this.stopped || this.disposed || this.device !== device) return;
       this.emitTextEvent(
         4,
         0,
@@ -1205,7 +1207,7 @@ class GpuEngine {
         return;
       }
       this.stopped = true;
-      this.occlusionEpoch++;
+      this.abandonOcclusionResults();
       this.destroyBackgroundTexture();
       this.emitTextEvent(7, 0, 1, info.message || "WebGPU device lost");
       void this.restore();
@@ -1264,6 +1266,9 @@ class GpuEngine {
     this.lastSequence = 0;
     this.pendingBatches = 0;
     this.pendingResize = null;
+    this.resizeScheduled = false;
+    this.foregroundScheduled = false;
+    this.backgrounded = this.backgroundRequested;
     this.queue = Promise.resolve();
     this.stopped = false;
     this.configureSurface();
@@ -1469,8 +1474,10 @@ class GpuEngine {
       return;
     }
     this.foregroundScheduled = true;
+    const device = this.device;
     this.queue = this.queue
       .then(() => {
+        if (this.device !== device || this.disposed) return;
         this.foregroundScheduled = false;
         if (this.backgroundRequested) {
           return;
@@ -1498,8 +1505,10 @@ class GpuEngine {
         this.destroyBackgroundTexture();
       })
       .catch(error => {
+        if (this.device !== device || this.disposed) return;
         postMessage({ type: "error", message: error.message || String(error) });
         this.stopped = true;
+        this.abandonOcclusionResults();
       });
   }
 
@@ -1529,8 +1538,10 @@ class GpuEngine {
       return;
     }
     this.resizeScheduled = true;
+    const device = this.device;
     this.queue = this.queue
       .then(() => {
+        if (this.device !== device || this.disposed) return;
         const latest = this.pendingResize;
         this.pendingResize = null;
         this.resizeScheduled = false;
@@ -1539,8 +1550,10 @@ class GpuEngine {
         }
       })
       .catch(error => {
+        if (this.device !== device || this.disposed) return;
         postMessage({ type: "error", message: error.message || String(error) });
         this.stopped = true;
+        this.abandonOcclusionResults();
       });
   }
 
@@ -1568,19 +1581,24 @@ class GpuEngine {
   }
 
   submit(bytes) {
+    const device = this.device;
     if (this.pendingBatches >= MAX_PENDING_BATCHES) {
       this.emitBatchRejected(0xffffffff, 3, 0, "GPU submission queue is full");
       return;
     }
     this.pendingBatches++;
     this.queue = this.queue
-      .then(() => this.execute(bytes))
+      .then(() => {
+        if (this.device === device) return this.execute(bytes);
+      })
       .catch(error => {
+        if (this.device !== device || this.disposed) return;
         postMessage({ type: "error", message: error.message || String(error) });
         this.stopped = true;
+        this.abandonOcclusionResults();
       })
       .finally(() => {
-        this.pendingBatches--;
+        if (this.device === device) this.pendingBatches--;
       });
   }
 
@@ -1603,6 +1621,9 @@ class GpuEngine {
     };
     let renderPasses = 0;
     let occlusionQueries = 0;
+    let pendingQueries = 0;
+    for (const entry of this.occlusionReadbacks) pendingQueries += entry.count;
+    let pendingQueryPasses = this.occlusionReadbacks.size;
     let queries = null;
     let draws = 0;
     let computePasses = 0;
@@ -1803,6 +1824,12 @@ class GpuEngine {
             occlusionQueries += command.queryCount;
             if (occlusionQueries > MAX_OCCLUSION_QUERIES_PER_BATCH) {
               throw new ProtocolError("occlusion query count exceeds the batch limit", index);
+            }
+            pendingQueries += command.queryCount;
+            pendingQueryPasses++;
+            if (pendingQueries > MAX_OCCLUSION_QUERIES_PER_BATCH * MAX_PENDING_BATCHES ||
+                pendingQueryPasses > MAX_RENDER_PASSES_PER_BATCH * MAX_PENDING_BATCHES) {
+              throw new ProtocolError("GPU occlusion readback queue is full", index, 3);
             }
             queries = { count: command.queryCount, used: new Set(), open: false };
           }
@@ -2023,6 +2050,8 @@ class GpuEngine {
     if (this.stopped) {
       return;
     }
+    const device = this.device;
+    const epoch = this.occlusionEpoch;
     let batch;
     let validated;
     try {
@@ -2298,6 +2327,7 @@ class GpuEngine {
                 used: new Uint8Array(command.queryCount),
               };
               occlusionReadbacks.push(occlusion);
+              this.occlusionReadbacks.add(occlusion);
               descriptor.occlusionQuerySet = occlusion.querySet;
             }
             pass = encoder.beginRenderPass(descriptor);
@@ -2401,7 +2431,7 @@ class GpuEngine {
               "texture",
               command.index
             ).value.createView({
-              format: command.format,
+              // Derive the aspect-specific format from the validated backing texture.
               dimension: command.dimension,
               aspect: command.aspect,
               baseMipLevel: command.baseMipLevel,
@@ -2495,21 +2525,34 @@ class GpuEngine {
     } catch (error) {
       created.forEach(entry => entry.value?.destroy?.());
       readback?.destroy();
-      destroyOcclusionReadbacks(occlusionReadbacks);
-      void this.device.popErrorScope();
-      void this.device.popErrorScope();
+      destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
+      await Promise.allSettled([device.popErrorScope(), device.popErrorScope()]);
       throw error;
     }
-    const outOfMemoryPromise = this.device.popErrorScope();
-    const validationPromise = this.device.popErrorScope();
-    const [outOfMemory, validation] = await Promise.all([
-      outOfMemoryPromise,
-      validationPromise,
-    ]);
+    let outOfMemory;
+    let validation;
+    try {
+      [outOfMemory, validation] = await Promise.all([
+        device.popErrorScope(),
+        device.popErrorScope(),
+      ]);
+    } catch (error) {
+      readback?.destroy();
+      destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
+      created.forEach(entry => entry.value?.destroy?.());
+      if (this.stopped || this.device !== device || epoch !== this.occlusionEpoch) return;
+      throw error;
+    }
+    if (this.stopped || this.device !== device || epoch !== this.occlusionEpoch) {
+      readback?.destroy();
+      destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
+      created.forEach(entry => entry.value?.destroy?.());
+      return;
+    }
     const gpuError = outOfMemory || validation;
     if (gpuError) {
       readback?.destroy();
-      destroyOcclusionReadbacks(occlusionReadbacks);
+      destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
       created.forEach(entry => entry.value?.destroy?.());
       this.emitBatchRejected(
         0xffffffff,
@@ -2531,7 +2574,19 @@ class GpuEngine {
       this.watchShader(entry, handle, batch.sequence)
     );
     if (readback) {
-      await readback.mapAsync(GPUMapMode.READ);
+      try {
+        await readback.mapAsync(GPUMapMode.READ);
+      } catch (error) {
+        readback.destroy();
+        destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
+        if (this.stopped || this.device !== device || epoch !== this.occlusionEpoch) return;
+        throw error;
+      }
+      if (this.stopped || this.device !== device || epoch !== this.occlusionEpoch) {
+        readback.destroy();
+        destroyOcclusionReadbacks(occlusionReadbacks, this.occlusionReadbacks);
+        return;
+      }
       const readbackBytes = new Uint8Array(readback.getMappedRange());
       const samples = [0, 256, 512].map(offset =>
         Array.from(readbackBytes.subarray(offset, offset + 4))
@@ -2567,8 +2622,10 @@ class GpuEngine {
       entry.resolved.destroy();
     }
     this.occlusionDelivery = this.occlusionDelivery.then(async () => {
-      for (const { token, count, results } of readbacks) {
+      for (const entry of readbacks) {
+        const { token, count, results } = entry;
         try {
+          if (epoch !== this.occlusionEpoch) continue;
           await results.mapAsync(GPUMapMode.READ);
           if (epoch === this.occlusionEpoch) {
             const payload = new Uint8Array(8 + count * 8);
@@ -2582,14 +2639,24 @@ class GpuEngine {
           // A lost or destroyed device abandons its in-flight results.
         } finally {
           results.destroy();
+          this.occlusionReadbacks.delete(entry);
         }
       }
     });
   }
 
+  abandonOcclusionResults() {
+    this.occlusionEpoch++;
+    destroyOcclusionReadbacks(this.occlusionReadbacks, this.occlusionReadbacks);
+    // A lost map must not hold up results produced by the replacement device.
+    this.occlusionDelivery = Promise.resolve();
+  }
+
   async watchShader(entry, handle, sequence) {
+    const epoch = this.occlusionEpoch;
     try {
       const info = await entry.value.getCompilationInfo();
+      if (this.stopped || epoch !== this.occlusionEpoch) return;
       for (const message of info.messages) {
         let severity = 3;
         if (message.type === "error") {
@@ -2646,9 +2713,10 @@ class GpuEngine {
   }
 
   reset() {
+    const device = this.device;
     this.queue = this.queue
       .then(() => {
-        if (this.stopped) {
+        if (this.stopped || this.device !== device) {
           return;
         }
         for (const entry of this.resources.values()) {
@@ -2657,20 +2725,22 @@ class GpuEngine {
         this.resources.clear();
         this.handleSlots.clear();
         this.destroyBackgroundTexture();
-        this.occlusionEpoch++;
+        this.abandonOcclusionResults();
         this.pendingResize = null;
         this.lastSequence = 0;
       })
       .catch(error => {
+        if (this.device !== device || this.disposed) return;
         postMessage({ type: "error", message: error.message || String(error) });
         this.stopped = true;
+        this.abandonOcclusionResults();
       });
   }
 
   stop() {
     this.stopped = true;
     this.disposed = true;
-    this.occlusionEpoch++;
+    this.abandonOcclusionResults();
     for (const entry of this.resources.values()) {
       entry.value?.destroy?.();
     }
@@ -2682,11 +2752,12 @@ class GpuEngine {
   }
 }
 
-function destroyOcclusionReadbacks(readbacks) {
+function destroyOcclusionReadbacks(readbacks, pending) {
   for (const entry of readbacks) {
     entry.querySet.destroy();
     entry.resolved?.destroy();
     entry.results?.destroy();
+    pending.delete(entry);
   }
 }
 

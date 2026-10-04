@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Pointer-capture capability, request, and state-transition conformance.
+
 use polkavm::ProgramBlob;
 use polkavm_host_runtime::{
     BackendKind, PresentationProfile, Runtime, POINTER_CAPTURE_ACTIVE, POINTER_CAPTURE_ARMED,

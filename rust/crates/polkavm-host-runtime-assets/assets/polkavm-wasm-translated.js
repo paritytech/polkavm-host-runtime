@@ -25,6 +25,7 @@
   const MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES = 64;
   const MAX_MEDIATED_INPUT_BYTES = 1024 * 1024;
   const MAX_MEDIATED_INPUT_REGISTRATIONS = 8;
+  const MAX_MEDIATED_INPUT_COMMANDS = 2 * MAX_MEDIATED_INPUT_REGISTRATIONS;
   const MEDIATED_INPUT_STATUS_REGISTERED = 1;
   const MEDIATED_INPUT_STATUS_ACTIVE = 2;
   const MEDIATED_INPUT_STATUS_READY = 3;
@@ -1000,6 +1001,7 @@
       this.fileCacheStopped = null;
       this.nextMediatedInputHandle = 0;
       this.activeMediatedInputHandle = null;
+      this.mediatedInputCommands = 0;
       this.tri2dSubmitted = false;
       this.uiSemanticsSubmitted = false;
       this.uiOutputSubmitted = false;
@@ -1656,11 +1658,8 @@
         return { outcome: "ready" };
       } finally {
         if (!installed) {
-          try {
-            source?.close?.();
-          } finally {
-            if (typeof cache?.close === "function") this.#releaseFileCache(cache);
-          }
+          this.#releaseFileSource(source);
+          if (typeof cache?.close === "function") this.#releaseFileCache(cache);
         }
       }
     }
@@ -1668,10 +1667,20 @@
     #closeFileStream(registration) {
       const source = registration.source;
       registration.source = null;
+      this.#releaseFileSource(source);
+      this.#closeFileCache(registration);
+    }
+
+    #releaseFileSource(source) {
       try {
-        source?.close();
-      } finally {
-        this.#closeFileCache(registration);
+        source?.close?.();
+      } catch (error) {
+        this.fileCacheCleanupFailed = true;
+        this.emit({
+          type: "error",
+          fatal: false,
+          message: `PolkaVM selected file cleanup failed: ${error?.message ?? error}`,
+        });
       }
     }
 
@@ -1679,25 +1688,29 @@
       const cache = registration.cache;
       registration.cache = null;
       if (cache !== null) {
-        this.fileCacheBytes -= cache.size;
-        this.#releaseFileCache(cache.backend);
+        this.#releaseFileCache(cache.backend, cache.size);
       }
     }
 
-    #releaseFileCache(cache) {
+    #releaseFileCache(cache, reservedBytes = 0) {
       const failed = (error) => {
         this.fileCacheCleanupFailed = true;
         this.emit({
           type: "error",
+          fatal: false,
           message: `PolkaVM private cache cleanup failed: ${error?.message ?? error}`,
         });
       };
       try {
         const closing = cache.close();
         if (closing?.then) {
-          const pending = Promise.resolve(closing).catch(failed);
+          const pending = Promise.resolve(closing).then(() => {
+            this.fileCacheBytes -= reservedBytes;
+          }).catch(failed);
           this.fileCacheCleanups.add(pending);
           void pending.then(() => this.fileCacheCleanups.delete(pending));
+        } else {
+          this.fileCacheBytes -= reservedBytes;
         }
       } catch (error) {
         failed(error);
@@ -1722,6 +1735,9 @@
           this.fileCacheBytes - cache.size + size > MAX_FILE_CACHE_BYTES) {
         return -2;
       }
+      const reservation = Math.max(cache.size, size);
+      this.fileCacheBytes += reservation - cache.size;
+      cache.size = reservation;
       try {
         cache.backend.reset(size);
         if (cache.backend.size() !== size) {
@@ -1853,7 +1869,7 @@
         registration.file = null;
         registration.status = MEDIATED_INPUT_STATUS_FAILED;
         this.#closeFileStream(registration);
-        this.emit({ type: "mediated-input-cancel", handle });
+        this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
         return -4;
       }
     }
@@ -1900,6 +1916,11 @@
       };
     }
 
+    #emitMediatedInputCommand(command) {
+      this.mediatedInputCommands++;
+      this.emit(command);
+    }
+
     #triggerMediatedInput(handle) {
       const registration = this.mediatedInputRegistrations.get(handle);
       if (this.activeMediatedInputHandle !== null) {
@@ -1908,7 +1929,15 @@
       if (!registration) {
         return 1;
       }
-      if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
+      const replacingStream =
+        registration.descriptor?.delivery === "stream" && registration.file !== null;
+      // Like the native pending queue, bound each guest slice's output while
+      // retaining room to cancel every live registration during teardown.
+      if (this.mediatedInputCommands + 1 + Number(replacingStream) +
+          MAX_MEDIATED_INPUT_REGISTRATIONS > MAX_MEDIATED_INPUT_COMMANDS) {
+        return 2;
+      }
+      if (replacingStream) {
         this.#cancelMediatedInput(handle);
       }
       registration.status = MEDIATED_INPUT_STATUS_ACTIVE;
@@ -1916,14 +1945,14 @@
       registration.result = null;
       registration.file = null;
       if (registration.descriptor) {
-        this.emit({
+        this.#emitMediatedInputCommand({
           type: "file-input-request",
           handle,
           descriptor: structuredClone(registration.descriptor),
         });
         return 0;
       }
-      this.emit({
+      this.#emitMediatedInputCommand({
         type: "mediated-input-request",
         handle,
         kind: registration.kind,
@@ -1944,7 +1973,7 @@
         registration.file = null;
         if (registration.descriptor?.delivery === "stream") {
           this.#closeFileStream(registration);
-          this.emit({ type: "mediated-input-cancel", handle });
+          this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
         }
         return 0;
       }
@@ -1955,7 +1984,7 @@
       registration.result = null;
       registration.file = null;
       this.activeMediatedInputHandle = null;
-      this.emit({ type: "mediated-input-cancel", handle });
+      this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
       return 0;
     }
 
@@ -1967,7 +1996,9 @@
       for (const [handle, registration] of this.mediatedInputRegistrations) {
         if (registration.descriptor?.delivery === "stream" && registration.file !== null) {
           this.#closeFileStream(registration);
-          this.emit({ type: "mediated-input-cancel", handle });
+          this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
+        } else if (registration.status === MEDIATED_INPUT_STATUS_ACTIVE) {
+          this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
         }
       }
       this.input.length = 0;
@@ -1993,6 +2024,7 @@
       this.hostcalls = hostcalls;
       this.hostcallBytes = MAX_HOSTCALL_BYTES;
       this.tri2dSubmitted = false;
+      this.mediatedInputCommands = 0;
       this.pvm.pvm_set_gas(gas);
     }
 
@@ -3075,7 +3107,7 @@
             address = this.#readU64(this.#u32(a2 + index * 16n));
             length = this.#readU64(this.#u32(a2 + index * 16n + 8n));
           } catch {
-            this.#setReg(7, errno(EFAULT));
+            this.#setReg(7, total || errno(EFAULT));
             return false;
           }
           const result =
@@ -3083,10 +3115,11 @@
               ? this.#readFile(a1, address, length)
               : this.#writeFile(a1, address, length);
           if (BigInt.asIntN(64, result) < 0n) {
-            this.#setReg(7, result);
+            this.#setReg(7, total || result);
             return false;
           }
-          total += length;
+          total += result;
+          if (result < length) break;
         }
         this.#setReg(7, total);
       } else if (syscall === SYS_EXIT) {

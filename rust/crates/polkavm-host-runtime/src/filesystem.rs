@@ -12,9 +12,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FilesystemMetadata {
+    /// Metadata format version.
     pub version: u32,
+    /// Next inode identifier, encoded as a decimal string for lossless transport.
     pub next_inode: String,
+    /// Filesystem clock in nanoseconds, encoded as a decimal string.
     pub clock_ns: String,
+    /// Complete set of file and directory metadata records.
     pub entries: Vec<FilesystemMetadataEntry>,
 }
 
@@ -22,9 +26,13 @@ pub struct FilesystemMetadata {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FilesystemMetadataEntry {
+    /// Canonical guest-visible path.
     pub path: String,
+    /// Entry kind: `1` for a file, `2` for a directory.
     pub kind: u32,
+    /// Modification time in nanoseconds, encoded as a decimal string.
     pub mtime_ns: String,
+    /// Stable inode identifier, encoded as a decimal string.
     pub inode: String,
 }
 

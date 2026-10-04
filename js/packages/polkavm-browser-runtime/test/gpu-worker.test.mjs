@@ -202,6 +202,13 @@ function validationEngine() {
     resources: new Map(),
     handleSlots: new Map(),
     lastSequence: 0n,
+    occlusionReadbacks: new Set(),
+    occlusionEpoch: 0,
+    occlusionDelivery: Promise.resolve(),
+    queue: Promise.resolve(),
+    pendingBatches: 0,
+    stopped: false,
+    disposed: false,
     limits: [
       4096,
       16 * 1024 * 1024,
@@ -1072,6 +1079,38 @@ test("stencil pass operations need a stencil attachment and one stencil byte", a
   ], /incompatible texture binding/, 3));
 });
 
+test("depth-only stencil views derive their aspect format before sampling", async () => {
+  const engine = validationEngine();
+  let viewDescriptor;
+  let boundView;
+  const textureView = {};
+  engine.device = {
+    pushErrorScope() {},
+    popErrorScope: async () => null,
+    createTexture: () => ({
+      createView(descriptor) {
+        viewDescriptor = descriptor;
+        return textureView;
+      },
+    }),
+    createBindGroupLayout: () => ({}),
+    createBindGroup({ entries }) {
+      boundView = entries[0].resource;
+      return {};
+    },
+  };
+  engine.emitBatchRejected = (...args) => assert.fail(args[3]);
+  await engine.execute(commands([
+    ...depthAttachment({ aspect: 2 }),
+    ...textureBindingCommands(1, 3),
+  ]));
+  assert.equal(viewDescriptor.aspect, "depth-only");
+  assert.equal(viewDescriptor.format, undefined,
+    "WebGPU must derive depth24plus, not receive the combined depth24plus-stencil8 format");
+  assert.equal(boundView, textureView);
+  assert.equal(engine.lastSequence, 1);
+});
+
 function f32s(values) {
   const bytes = new Uint8Array(values.length * 4);
   const view = new DataView(bytes.buffer);
@@ -1136,6 +1175,7 @@ function occlusionEngine() {
   const engine = validationEngine();
   const gates = [];
   const passCalls = [];
+  const buffers = [];
   const bytes = buffer => new Uint8Array(buffer.storage);
   Object.assign(engine, {
     occlusionDelivery: Promise.resolve(),
@@ -1145,14 +1185,19 @@ function occlusionEngine() {
       pushErrorScope() {},
       popErrorScope: async () => null,
       createQuerySet: ({ count }) => ({ samples: new Array(count).fill(0n), destroy() {} }),
-      createBuffer: ({ size }) => ({
-        storage: new ArrayBuffer(size),
-        mapAsync() {
-          return new Promise(resolvePromise => gates.push(resolvePromise));
-        },
-        getMappedRange() { return this.storage; },
-        destroy() {},
-      }),
+      createBuffer: ({ size }) => {
+        const buffer = {
+          storage: new ArrayBuffer(size),
+          destroyed: false,
+          mapAsync() {
+            return new Promise(resolvePromise => gates.push(resolvePromise));
+          },
+          getMappedRange() { return this.storage; },
+          destroy() { this.destroyed = true; },
+        };
+        buffers.push(buffer);
+        return buffer;
+      },
       createCommandEncoder: () => ({
         beginRenderPass({ occlusionQuerySet }) {
           let open = null;
@@ -1174,12 +1219,13 @@ function occlusionEngine() {
         finish: () => ({}),
       }),
       queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+      destroy() {},
     },
     emitBatchRejected(...args) {
       assert.fail(`valid occlusion batch was rejected: ${args[3]}`);
     },
   });
-  return { engine, gates, passCalls };
+  return { engine, gates, passCalls, buffers };
 }
 
 function decodeOcclusion(message) {
@@ -1229,6 +1275,182 @@ test("occlusion results follow their batch in submission order without blocking 
       { type: 9, sequence: 1, token: 0xabcd, samples: [3, 0, 6] },
       { type: 9, sequence: 2, token: 7, samples: [9] },
     ]);
+  } finally {
+    capture.restore();
+  }
+});
+
+test("in-flight occlusion results have bounded query and pass counts", async t => {
+  for (const [name, count, passes] of [["queries", 4096, 1], ["passes", 1, 16]]) {
+    await t.test(name, async () => {
+      const { engine, buffers, gates } = occlusionEngine();
+      const [, end] = renderPass(0);
+      const items = Array.from({ length: passes }, () => [occlusionPass(count), end]).flat();
+      for (let sequence = 1n; sequence <= 4n; sequence++) {
+        await engine.execute(commands(items, sequence));
+      }
+      const allocated = buffers.length;
+      const rejected = [];
+      engine.emitBatchRejected = (...args) => rejected.push(args);
+      await engine.execute(commands([occlusionPass(1), end], 5n));
+      assert.equal(buffers.length, allocated, "reject before allocating more GPU readbacks");
+      assert.equal(rejected.length, 1);
+      assert.equal(rejected[0][1], 3);
+      assert.match(rejected[0][3], /readback queue is full/);
+      assert.equal(engine.lastSequence, 4);
+      gates[0]();
+      await new Promise(setImmediate);
+      await engine.execute(commands([occlusionPass(1), end], 5n));
+      assert.equal(rejected.length, 1, "completed results release quota for later submissions");
+      engine.stop();
+      assert.equal(engine.occlusionReadbacks.size, 0);
+      assert.ok(buffers.every(buffer => buffer.destroyed));
+    });
+  }
+});
+
+test("reset destroys pending query buffers and fresh results bypass an abandoned map", async () => {
+  const { engine, gates, buffers } = occlusionEngine();
+  const capture = captureMessages();
+  try {
+    const [, end] = renderPass(0);
+    await engine.execute(commands([occlusionPass(1, 10), end]));
+    const oldDelivery = engine.occlusionDelivery;
+    engine.reset();
+    await engine.queue;
+    assert.ok(buffers.every(buffer => buffer.destroyed), "reset releases results before the map settles");
+    assert.equal(engine.occlusionReadbacks.size, 0);
+    await engine.execute(commands([occlusionPass(1, 20), end]));
+    assert.equal(gates.length, 2, "the fresh map starts despite the unresolved old map");
+    gates[1]();
+    await engine.occlusionDelivery;
+    gates[0]();
+    await oldDelivery;
+    const results = capture.messages.filter(message =>
+      message.type === "event" && eventType(message.bytes) === 9);
+    assert.deepEqual(results.map(decodeOcclusion), [
+      { type: 9, sequence: 1, token: 20, samples: [0] },
+    ]);
+    assert.ok(buffers.every(buffer => buffer.destroyed));
+  } finally {
+    engine.stop();
+    capture.restore();
+  }
+});
+
+test("backend rejection releases all query resources without emitting results", async () => {
+  const { engine, buffers } = occlusionEngine();
+  let scopes = 0;
+  engine.device.popErrorScope = async () => ++scopes === 2 ? { message: "invalid pass" } : null;
+  const rejected = [];
+  engine.emitBatchRejected = (...args) => rejected.push(args);
+  const [, end] = renderPass(0);
+  await engine.execute(commands([occlusionPass(1), end]));
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0][3], /invalid pass/);
+  assert.equal(engine.occlusionReadbacks.size, 0);
+  assert.ok(buffers.every(buffer => buffer.destroyed));
+  assert.equal(engine.lastSequence, 0n);
+  engine.stop();
+});
+
+test("device restoration fences old batches waiting for backend validation", async () => {
+  const { engine, buffers } = occlusionEngine();
+  const replacement = occlusionEngine().engine;
+  const scopes = [];
+  engine.device.popErrorScope = () => new Promise(resolveScope => scopes.push(resolveScope));
+  engine.configureSurface = () => {};
+  engine.observeDevice = () => {};
+  engine.capabilities = () => new Uint8Array();
+  engine.deviceGeneration = 1;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => ({
+    device: replacement.device,
+    context: replacement.context,
+    format: "rgba8unorm",
+    limits: replacement.limits,
+  });
+  const capture = captureMessages();
+  try {
+    const [, end] = renderPass(0);
+    engine.submit(commands([
+      [1, u32s([handle(9), 8, 4, 0])], occlusionPass(1), end,
+    ]));
+    engine.reset();
+    const oldQueue = engine.queue;
+    await Promise.resolve();
+    assert.equal(scopes.length, 2);
+    engine.stopped = true;
+    engine.abandonOcclusionResults();
+    await engine.restore();
+    await engine.execute(commands([[1, u32s([handle(10), 8, 4, 0])]]));
+    scopes.forEach(resolveScope => resolveScope(null));
+    await oldQueue;
+    assert.deepEqual([...engine.resources.keys()], [handle(10)],
+      "old commits and queued resets cannot overwrite the replacement catalog");
+    assert.equal(engine.lastSequence, 1);
+    assert.equal(engine.pendingBatches, 0, "old finalizers cannot decrement the replacement queue");
+    assert.equal(engine.stopped, false);
+    assert.ok(buffers.every(buffer => buffer.destroyed));
+    assert.deepEqual(capture.messages.filter(message => message.type === "event")
+      .map(message => eventType(message.bytes)), [8, 5], "only the replacement batch completes");
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    engine.stop();
+    capture.restore();
+  }
+});
+
+test("device loss and fatal batches immediately release pending occlusion buffers", async t => {
+  for (const failure of ["device loss", "malformed batch"]) {
+    await t.test(failure, async () => {
+      const { engine, buffers, gates } = occlusionEngine();
+      let loseDevice;
+      engine.device.addEventListener = () => {};
+      engine.device.lost = new Promise(resolveLoss => { loseDevice = resolveLoss; });
+      engine.restore = async () => {};
+      engine.observeDevice(engine.device);
+      const capture = captureMessages();
+      try {
+        const [, end] = renderPass(0);
+        await engine.execute(commands([occlusionPass(1), end]));
+        const oldDelivery = engine.occlusionDelivery;
+        if (failure === "device loss") {
+          loseDevice({ message: "test loss" });
+          await Promise.resolve();
+        } else {
+          engine.submit(new Uint8Array());
+          await engine.queue;
+        }
+        assert.equal(engine.stopped, true);
+        assert.equal(engine.occlusionReadbacks.size, 0);
+        assert.ok(buffers.every(buffer => buffer.destroyed));
+        gates[0]();
+        await oldDelivery;
+        assert.equal(capture.messages.some(message =>
+          message.type === "event" && eventType(message.bytes) === 9), false);
+      } finally {
+        engine.stop();
+        capture.restore();
+      }
+    });
+  }
+});
+
+test("reset discards shader diagnostics belonging to the old resource catalog", async () => {
+  const engine = validationEngine();
+  let finishCompilation;
+  const entry = { value: { getCompilationInfo: () =>
+    new Promise(resolveInfo => { finishCompilation = resolveInfo; }) } };
+  const capture = captureMessages();
+  try {
+    const pending = engine.watchShader(entry, handle(1), 1);
+    engine.reset();
+    await engine.queue;
+    finishCompilation({ messages: [{ type: "error", message: "old shader" }] });
+    await pending;
+    assert.equal(capture.messages.length, 0);
+    assert.equal(entry.failed, undefined);
   } finally {
     capture.restore();
   }

@@ -21,6 +21,7 @@ pub struct LocalFileSource {
 }
 
 impl LocalFileSource {
+    /// Retain an already-open regular file and capture its current length.
     pub fn new(file: File) -> Result<Self> {
         let metadata = file.metadata().context("inspect selected stream file")?;
         if !metadata.is_file() {
@@ -74,6 +75,7 @@ pub struct LocalFileCache {
 }
 
 impl LocalFileCache {
+    /// Create a private temporary cache in a host-selected directory.
     pub fn new(directory: &Path) -> Result<Self> {
         for _ in 0..16 {
             let mut random = [0u8; 16];

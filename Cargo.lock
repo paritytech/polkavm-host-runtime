@@ -859,6 +859,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "polkavm"
 version = "0.37.0"
+source = "git+https://github.com/paritytech/polkavm.git?rev=642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5#642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5"
 dependencies = [
  "libc",
  "log",
@@ -871,7 +872,7 @@ dependencies = [
 [[package]]
 name = "polkavm-assembler"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
+source = "git+https://github.com/paritytech/polkavm.git?rev=642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5#642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5"
 dependencies = [
  "log",
 ]
@@ -886,7 +887,7 @@ dependencies = [
 [[package]]
 name = "polkavm-common"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
+source = "git+https://github.com/paritytech/polkavm.git?rev=642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5#642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5"
 dependencies = [
  "log",
  "picosimd",
@@ -909,12 +910,12 @@ dependencies = [
  "polkavm-gpu-wire",
  "polkavm-motion-wire",
  "polkavm-ui-wire",
+ "polkavm-wasm-compiler",
  "pollster",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "uniffi",
- "wasm-encoder",
  "wasmi",
  "wasmparser 0.240.0",
  "wgpu",
@@ -930,7 +931,7 @@ dependencies = [
 [[package]]
 name = "polkavm-linux-raw"
 version = "0.37.0"
-source = "git+https://github.com/paritytech/polkavm.git?rev=c160c13c3c29bf3219ce1404ec95976000235a94#c160c13c3c29bf3219ce1404ec95976000235a94"
+source = "git+https://github.com/paritytech/polkavm.git?rev=642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5#642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5"
 
 [[package]]
 name = "polkavm-motion-wire"
@@ -939,6 +940,18 @@ version = "0.3.1"
 [[package]]
 name = "polkavm-ui-wire"
 version = "0.3.1"
+
+[[package]]
+name = "polkavm-wasm-compiler"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "polkavm",
+ "polkavm-common",
+ "wasm-encoder",
+ "wasmi",
+ "wasmparser 0.240.0",
+]
 
 [[package]]
 name = "pollster"

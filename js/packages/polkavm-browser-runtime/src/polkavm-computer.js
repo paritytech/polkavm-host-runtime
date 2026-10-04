@@ -70,7 +70,7 @@
   const FS_OPEN_EXCLUSIVE = 16;
   const FS_OPEN_APPEND = 32;
   const FAULTED_CHILD_STATUS = 139;
-  const MAX_FAULT_POPS_PER_RUN = 32;
+  const MAX_INTERRUPTS_PER_RUN = 8192;
   const MAX_DRIVE_STEPS = 1024;
   const MAX_WORKSPACE_DRIVE_STEPS = 64;
   const AT_PAGESZ = 6n;
@@ -2224,10 +2224,15 @@
     }
 
     /** Runs the foreground process until the system yields or the root
-     * exits; child faults fail only the child (status 139). */
+     * exits; child faults fail only the child (status 139). All processes,
+     * including workspace supervisors, share one guest-resumption budget. */
     run() {
+      return this.#runWithBudget({ remaining: MAX_INTERRUPTS_PER_RUN });
+    }
+
+    #runWithBudget(budget) {
       try {
-        return this.#run();
+        return this.#run(budget);
       } catch (error) {
         this.dispose();
         throw error;
@@ -2235,14 +2240,14 @@
     }
 
 
-    #run() {
+    #run(budget) {
       if (this.pendingResolution !== null) {
         // Idempotent while suspended: the embedder must provide or reject
         // the pending package before execution can continue.
         return { kind: "package", package: this.pendingPackage() };
       }
-      let faultPops = 0;
-      for (;;) {
+      while (budget.remaining > 0) {
+        budget.remaining--;
         let status;
         try {
           status = this.#foreground().run();
@@ -2250,29 +2255,11 @@
           if (this.stack.length === 1) {
             throw error;
           }
-          faultPops++;
-          if (faultPops > MAX_FAULT_POPS_PER_RUN) {
-            throw new Error(`children faulted repeatedly: ${error.message}`);
-          }
           this.#popForeground(FAULTED_CHILD_STATUS);
           continue;
         }
         if (status.kind === "yielded") {
-          // Surface a suspended workspace child's resolution once the
-          // workspace guest has yielded; the embedder resolves it before
-          // execution continues anywhere in the tree.
-          const suspended = this.workspaceChildren.find(
-            (child) =>
-              child.exit === null && child.supervisor.pendingPackage() !== null,
-          );
-          if (suspended !== undefined) {
-            this.pendingResolution = {
-              mode: "childRoute",
-              handle: suspended.handle,
-            };
-            return { kind: "package", package: this.pendingPackage() };
-          }
-          return { kind: "yielded" };
+          return this.#yieldStatus();
         }
         if (status.kind === "spawn") {
           const request = this.#foreground().takeSpawnRequest();
@@ -2295,7 +2282,7 @@
           if (!request) {
             throw new Error("child-request status without a pending request");
           }
-          this.#handleChildRequest(request);
+          this.#handleChildRequest(request, budget);
           if (this.pendingResolution !== null) {
             return { kind: "package", package: this.pendingPackage() };
           }
@@ -2308,6 +2295,23 @@
         }
         this.#popForeground(status.code & 0xff);
       }
+      return this.#yieldStatus();
+    }
+
+    #yieldStatus() {
+      // Surface suspended package resolution on guest and budget yields.
+      const suspended = this.workspaceChildren.find(
+        (child) =>
+          child.exit === null && child.supervisor.pendingPackage() !== null,
+      );
+      if (suspended !== undefined) {
+        this.pendingResolution = {
+          mode: "childRoute",
+          handle: suspended.handle,
+        };
+        return { kind: "package", package: this.pendingPackage() };
+      }
+      return { kind: "yielded" };
     }
 
     /** Host-authority cancellation of the foreground process. */
@@ -2398,7 +2402,7 @@
       );
     }
 
-    #handleChildRequest(request) {
+    #handleChildRequest(request, budget) {
       const resolve = (value) => this.#foreground().resolveSpawn(value);
       if (request.kind.startsWith("workspace")) {
         // Only the root computer holding the workspace grant may manage
@@ -2407,7 +2411,7 @@
           resolve(STATUS_DENIED);
           return;
         }
-        this.#handleWorkspaceRequest(request, resolve);
+        this.#handleWorkspaceRequest(request, resolve, budget);
         return;
       }
       if (request.kind === "spawn") {
@@ -2442,7 +2446,7 @@
       }
       const entry = this.background[index];
       if (request.kind === "wait") {
-        this.#driveBackground(entry);
+        this.#driveBackground(entry, budget);
         if (entry.exit !== null) {
           this.background.splice(index, 1);
           resolve(entry.exit & 0xff);
@@ -2461,13 +2465,13 @@
         if (written > 0) {
           entry.process.sendTerminalInput(request.bytes.subarray(0, written));
         }
-        this.#driveBackground(entry);
+        this.#driveBackground(entry, budget);
         resolve(written);
         return;
       }
       if (request.kind === "pipeRead") {
         if (entry.output.length === 0) {
-          this.#driveBackground(entry);
+          this.#driveBackground(entry, budget);
         }
         if (entry.output.length > 0) {
           const count = Math.min(entry.output.length, request.capacity);
@@ -2483,15 +2487,16 @@
       }
       // pipeClose
       entry.process.closeTerminalInput();
-      this.#driveBackground(entry);
+      this.#driveBackground(entry, budget);
       resolve(0);
     }
 
-    #driveBackground(entry) {
+    #driveBackground(entry, budget) {
       for (let step = 0; step < MAX_DRIVE_STEPS; step++) {
-        if (entry.exit !== null) {
+        if (entry.exit !== null || budget.remaining === 0) {
           return;
         }
+        budget.remaining--;
         let status = null;
         try {
           status = entry.process.run();
@@ -2533,7 +2538,7 @@
 
     /** Executes one workspace operation and resolves it into the root
      * guest (mirror of handle_workspace_request). */
-    #handleWorkspaceRequest(request, resolve) {
+    #handleWorkspaceRequest(request, resolve, budget) {
       if (request.kind === "workspaceSpawn") {
         if (this.workspaceChildren.length >= MAX_WORKSPACE_CHILDREN) {
           resolve(STATUS_LIMIT);
@@ -2571,13 +2576,13 @@
             request.bytes.subarray(0, written),
           );
         }
-        this.#driveWorkspaceChild(index);
+        this.#driveWorkspaceChild(index, budget);
         resolve(written);
         return;
       }
       if (request.kind === "workspaceRead") {
         if (child.output.length === 0) {
-          this.#driveWorkspaceChild(index);
+          this.#driveWorkspaceChild(index, budget);
         }
         if (child.output.length > 0) {
           const count = Math.min(child.output.length, request.capacity);
@@ -2606,7 +2611,7 @@
         return;
       }
       if (request.kind === "workspaceWait") {
-        this.#driveWorkspaceChild(index);
+        this.#driveWorkspaceChild(index, budget);
         // The handle stays valid after exit so remaining output can be
         // drained; workspace_close reclaims the slot.
         resolve(child.exit !== null ? child.exit & 0xff : STATUS_WOULD_BLOCK);
@@ -2630,17 +2635,17 @@
      *
      * Cooperative scheduling: workspace children only execute while the
      * workspace guest is suspended inside a workspace hostcall. */
-    #driveWorkspaceChild(index) {
+    #driveWorkspaceChild(index, budget) {
       for (let step = 0; step < MAX_WORKSPACE_DRIVE_STEPS; step++) {
         const child = this.workspaceChildren[index];
-        if (child.exit !== null) {
+        if (child.exit !== null || budget.remaining === 0) {
           return;
         }
         // A faulted child fails alone; the workspace observes the fault
         // status through wait. Its final output and writes still land.
         let outcome = null;
         try {
-          outcome = child.supervisor.run();
+          outcome = child.supervisor.#runWithBudget(budget);
         } catch {
           // Fault: reported below as FAULTED_CHILD_STATUS.
         }
