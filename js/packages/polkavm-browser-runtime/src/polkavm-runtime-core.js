@@ -22,6 +22,8 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   const LEGACY_FRAME_INTERVAL_MS = 1000 / 60;
   const MAX_GAS_PER_UPDATE = 10_000_000_000;
   const MAX_TRANSLATED_LOOPS_PER_UPDATE = 50_000_000;
+  const MAX_TRANSLATED_GAS_SLICES_PER_UPDATE =
+    MAX_GAS_PER_UPDATE / MAX_TRANSLATED_LOOPS_PER_UPDATE;
   const MAX_PROGRAM_BYTES = 64 * 1024 * 1024;
   const MAX_ASSET_FILES = 2048;
   const MAX_ASSET_NAME_BYTES = 1024;
@@ -854,6 +856,10 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       }
       return;
     }
+    if (translated?.hasPendingContinuation()) {
+      scheduleTick(0);
+      return;
+    }
     const requestedDelay = requestedUpdateDelay(completedAt);
     if (requestedDelay !== null) {
       scheduleTick(requestedDelay);
@@ -1304,6 +1310,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         motionAvailability,
         message.mediatedInputKinds ?? [],
         message.fileInput ?? null,
+        MAX_TRANSLATED_GAS_SLICES_PER_UPDATE,
       );
       const relaunch = relaunchFile(message);
       if (relaunch !== null) {

@@ -16,7 +16,7 @@ function bytesBuffer(bytes) {
   );
 }
 
-function partitionedGuestBytes() {
+function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
   const uleb = (value) => {
     const bytes = [];
     do {
@@ -94,7 +94,7 @@ function partitionedGuestBytes() {
         [0x60, 1, 0x7e, 0], // set_gas(i64)
       ]),
     ),
-    section(3, [3, 0, 1, 2]),
+    section(3, outOfGasOnBegin ? [4, 0, 1, 2, 0] : [3, 0, 1, 2]),
     section(4, [1, 0x70, 0, 2]),
     section(5, [1, 0, 1]),
     section(
@@ -110,6 +110,7 @@ function partitionedGuestBytes() {
         exportEntry("__helper0", 0, 0),
         exportEntry("pvm_begin", 0, 1),
         exportEntry("pvm_set_gas", 0, 2),
+        ...(outOfGasOnBegin ? [exportEntry("pvm_resume", 0, 3)] : []),
         ...Array.from({ length: 13 }, (_, index) =>
           exportEntry(`r${index}`, 3, index),
         ),
@@ -119,8 +120,11 @@ function partitionedGuestBytes() {
       10,
       vector([
         body([0x41, 0, 0x28, 2, 0]), // helper reads memory[0]
-        body([0x20, 1, 0x24, 13, 0x20, 0, 0x13, 0, 0]),
+        body(outOfGasOnBegin
+          ? [0x41, 0x7c] // STATUS_OUT_OF_GAS
+          : [0x20, 1, 0x24, 13, 0x20, 0, 0x13, 0, 0]),
         body([0x20, 0, 0x24, 13]),
+        ...(outOfGasOnBegin ? [body([0x41, 0, 0x13, 0, 0])] : []),
       ]),
     ),
   ];
@@ -166,6 +170,44 @@ test("translated code parts share guest memory, registers, helpers and control f
   assert.deepEqual(state(), { register: 14n, memory: [10, 24] });
   translated.stop();
   other.stop();
+});
+
+test("translated execution resumes after exhausting a gas slice", async () => {
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const { partitioned } = partitionedGuestBytes({ outOfGasOnBegin: true });
+  const program = await Runtime.compile(partitioned);
+  const translated = new Runtime(
+    program, [], () => {}, 1_000_000, false, "framebuffer", null, 0, [], null,
+    2,
+  );
+  const state = () => ({
+    register: translated.pvm.r0.value,
+    memory: [...new Uint32Array(translated.memory.buffer, 0, 2)],
+  });
+
+  translated.initialize();
+  assert.equal(translated.hasPendingContinuation(), true);
+  assert.deepEqual(state(), { register: 0n, memory: [0, 0] });
+
+  translated.update(1);
+  assert.equal(translated.hasPendingContinuation(), false);
+  assert.deepEqual(state(), { register: 7n, memory: [5, 12] });
+
+  translated.update(2);
+  assert.equal(translated.hasPendingContinuation(), true);
+  translated.update(3);
+  assert.equal(translated.hasPendingContinuation(), false);
+  assert.deepEqual(state(), { register: 14n, memory: [10, 24] });
+  translated.stop();
+
+  const bounded = new Runtime(
+    program, [], () => {}, 1_000_000, false, "framebuffer",
+  );
+  assert.throws(
+    () => bounded.initialize(),
+    /translated PolkaVM guest ran out of gas/,
+  );
+  bounded.stop();
 });
 
 test("compiled programs accept root-only modules but reject malformed parts and bare modules", async () => {
