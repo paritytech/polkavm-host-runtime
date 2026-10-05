@@ -47,10 +47,12 @@ const STATUS_TRAP: i32 = -3;
 const STATUS_OUT_OF_GAS: i32 = -4;
 const REGISTER_COUNT: u32 = 13;
 
-// Keep both the dispatch nesting and the worst-case function body bounded. A
-// PolkaVM block can be arbitrarily long; splitting it must not add gas charges.
+// Keep both dispatch nesting and worst-case function bodies bounded. A PolkaVM
+// block can be arbitrarily long; splitting it must not add gas charges. Sixty-
+// four instructions amortize the indirect tail dispatch on CPU-heavy guests
+// without increasing the 128-block group used to bound generated functions.
 const BLOCKS_PER_FUNCTION: usize = 128;
-const INSTRUCTIONS_PER_BLOCK: usize = 16;
+const INSTRUCTIONS_PER_BLOCK: usize = 64;
 const RESOLVERS_PER_FUNCTION: usize = 128;
 // Bound each native compilation unit without splitting a block-group function.
 const CODE_PART_BYTES: usize = 8 * 1024 * 1024;
