@@ -299,10 +299,14 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-Development versions are currently Rust `0.3.1` and browser
-`0.3.2-background.0`; this checkout is not a tagged release. The release generator
-deliberately refuses inconsistent versions, development-only `SOURCE` records,
-dirty source, stale embedded files, or mismatched compiler/engine provenance.
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.2`.
+This candidate is based on merged main `1e28810136a0e4c3cb1b00dd59bd5b1aa2e22798`
+and retains PolkaVM engine `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5`.
+Compared with `0.3.2-rc.1`, it adds runtime-registered file handlers, streamed
+Blob reads and private OPFS caches, and bounded GPU raster extensions.
+It remains a prerelease, not a stable compatibility promise. The release generator
+deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
+files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
 
 ## Security

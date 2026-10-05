@@ -45,8 +45,11 @@ checksum and embedded copy, with no extra files or symlinks.
 Generate and review assets and embedded Rust digests before preparing the tagged
 source commit. The manifest command only verifies them; it does not repair
 release inputs. Output belongs in ignored `artifacts/`, not the tagged source.
-The current `0.3.2-background.0` browser development version and `0.3.1` Rust
-versions are intentionally not a releasable version set.
+The `0.3.2-rc.2` candidate aligns the workspace, all Rust crates, browser package,
+and npm lockfile. Regenerate attribution after updating `Cargo.lock`, then build
+the browser distribution and refresh embedded assets and their Rust digests before
+committing and tagging. SemVer prerelease tags are published with
+`--prerelease --latest=false`, leaving the stable release as latest.
 
 Release-integrity regressions use isolated temporary Git repositories and run
 through `node --test scripts/release-manifest.test.mjs`, included in `npm test`.
