@@ -32,7 +32,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "73976b3114c75376ec1f29639e8598606066e6153228b4acb572b7bc75ee2199",
+        sha256: "be9a0285186b281c6ae2e307a1aed9d2366ae81dd74403da5da852a8e2eed8c4",
     },
     BrowserAsset {
         path: "THIRD_PARTY_LICENSES.txt",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "8d48cde41c2505e56c0d4eebde0c9d9c4bd32bb92ef3916e32ae63b7856cedee",
+        sha256: "dc224c5d1f4cc109af7747ddae03abd73217031c982123d75f186aa4cb7a15fc",
     },
     BrowserAsset {
         path: "polkavm-computer.js",
