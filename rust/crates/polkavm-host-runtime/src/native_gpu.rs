@@ -17,6 +17,19 @@ const MAX_COMPUTE_WORKGROUP_STORAGE_SIZE: u32 = 16 * 1024;
 const MAX_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 8;
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
+#[derive(Debug)]
+struct StaleSurface {
+    command_index: u32,
+}
+
+impl std::fmt::Display for StaleSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale render attachment")
+    }
+}
+
+impl std::error::Error for StaleSurface {}
+
 // Match the browser worker's resource and per-batch allocation budgets. Charges
 // outlive guest handles when a dependent object or an encoded batch retains them.
 const RESOURCE_LIMITS: [usize; 10] = [
@@ -372,7 +385,7 @@ impl NativeGpuRenderer {
                 // Invalid submissions must not publish apparently valid query results.
                 self.occlusion_results.truncate(previous_readbacks);
                 NativeGpuOutput {
-                    events: vec![batch_rejected(sequence, &format!("{error:#}"))],
+                    events: vec![batch_rejected(sequence, &error)],
                     frame: None,
                 }
             }
@@ -421,7 +434,7 @@ impl NativeGpuRenderer {
         let mut budget = BatchBudget::default();
         // Keep destroyed resources charged until all submitted work has completed.
         let mut retained = Vec::new();
-        for command in batch.commands() {
+        for (command_index, command) in batch.commands().enumerate() {
             let creation = self.reserve_creation(command.opcode, command.payload, &mut budget)?;
             let mut reader = Reader::new(command.payload);
             push_error_scopes(&self.device);
@@ -669,8 +682,11 @@ impl NativeGpuRenderer {
                             None
                         };
                         reader.finish()?;
-                        if generation != self.generation {
-                            bail!("stale render attachment");
+                        if color_view == 0 && generation != self.generation {
+                            return Err(StaleSurface {
+                                command_index: command_index as u32,
+                            }
+                            .into());
                         }
                         if color_view != 0 {
                             self.texture_view(color_view)?;
@@ -2635,7 +2651,12 @@ fn occlusion_results(sequence: u64, token: u32, count: u32, results: &[u8]) -> V
     bytes
 }
 
-fn batch_rejected(sequence: u64, message: &str) -> Vec<u8> {
+fn batch_rejected(sequence: u64, error: &anyhow::Error) -> Vec<u8> {
+    let (command_index, error_code) = error
+        .downcast_ref::<StaleSurface>()
+        .map(|stale| (stale.command_index, gpu_wire::GPU_BATCH_ERROR_STALE_SURFACE))
+        .unwrap_or((u32::MAX, 1));
+    let message = format!("{error:#}");
     let mut end = message.len().min(gpu_wire::MAX_GPU_DIAGNOSTIC_BYTES);
     while !message.is_char_boundary(end) {
         end -= 1;
@@ -2649,8 +2670,8 @@ fn batch_rejected(sequence: u64, message: &str) -> Vec<u8> {
     let len = bytes.len() as u32;
     bytes[8..12].copy_from_slice(&len.to_le_bytes());
     bytes[16..24].copy_from_slice(&sequence.to_le_bytes());
-    bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
-    bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..28].copy_from_slice(&command_index.to_le_bytes());
+    bytes[28..32].copy_from_slice(&error_code.to_le_bytes());
     bytes[32..36].copy_from_slice(&(text.len() as u32).to_le_bytes());
     bytes[36..40].copy_from_slice(&u32::from(message.len() > text.len()).to_le_bytes());
     bytes[40..40 + text.len()].copy_from_slice(text);
@@ -2818,7 +2839,7 @@ mod tests {
     #[test]
     fn rejection_diagnostic_is_bounded_valid_utf8() {
         let message = format!("{}é", "x".repeat(gpu_wire::MAX_GPU_DIAGNOSTIC_BYTES - 1));
-        let event = batch_rejected(7, &message);
+        let event = batch_rejected(7, &anyhow!("{message}"));
         let length = u32::from_le_bytes(event[32..36].try_into().unwrap()) as usize;
         assert_eq!(length, gpu_wire::MAX_GPU_DIAGNOSTIC_BYTES - 1);
         assert_eq!(u32::from_le_bytes(event[36..40].try_into().unwrap()), 1);
@@ -2859,6 +2880,22 @@ mod tests {
             kind as u16,
             "event: {:?}",
             String::from_utf8_lossy(&output.events[0])
+        );
+    }
+
+    fn assert_rejection(output: &NativeGpuOutput, command_index: u32, error_code: u32) {
+        assert_event(output, gpu_wire::GpuEventType::BatchRejected);
+        assert!(output.frame.is_none());
+        assert_eq!(output.events.len(), 1);
+        let event = &output.events[0];
+        assert_eq!(u64::from_le_bytes(event[16..24].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(event[24..28].try_into().unwrap()),
+            command_index
+        );
+        assert_eq!(
+            u32::from_le_bytes(event[28..32].try_into().unwrap()),
+            error_code
         );
     }
 
@@ -3052,7 +3089,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a native WebGPU adapter"]
-    fn gpu_offscreen_attachment_larger_than_surface_keeps_its_pixels() {
+    fn gpu_offscreen_attachment_survives_resize_and_stale_presentation() {
         let mut renderer = NativeGpuRenderer::new(1, 1).unwrap();
         let mut texture = vec![0; 24];
         texture[..4].copy_from_slice(&1u32.to_le_bytes());
@@ -3087,7 +3124,7 @@ mod tests {
         let output = renderer.execute(&wire_batch(&[
             (GpuOpcode::CreateTexture, texture),
             (GpuOpcode::CreateTextureView, view),
-            (GpuOpcode::BeginRenderPass, pass),
+            (GpuOpcode::BeginRenderPass, pass.clone()),
             (GpuOpcode::SetScissorRect, scissor),
             (GpuOpcode::EndRenderPass, vec![]),
         ]));
@@ -3095,6 +3132,68 @@ mod tests {
         assert!(output.frame.is_none());
 
         renderer.resize(2, 1).unwrap();
+        // The retained view belongs to its texture, not the resized default surface.
+        pass[16..20].copy_from_slice(&0f32.to_le_bytes());
+        pass[24..28].copy_from_slice(&1f32.to_le_bytes());
+        let mut upload = vec![0; 28];
+        upload[..4].copy_from_slice(&3u32.to_le_bytes());
+        upload[16..20].copy_from_slice(&4u32.to_le_bytes());
+        upload[24..28].copy_from_slice(&[1, 2, 3, 4]);
+        let output = renderer.execute(&wire_batch(&[
+            buffer_command(
+                3,
+                (wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ).bits(),
+            ),
+            (GpuOpcode::WriteBuffer, upload.clone()),
+            (GpuOpcode::BeginRenderPass, pass.clone()),
+            (GpuOpcode::EndRenderPass, vec![]),
+        ]));
+        assert_event(&output, gpu_wire::GpuEventType::SubmissionComplete);
+        assert!(output.frame.is_none());
+
+        // Old generations do not bypass validation of explicit attachment handles.
+        for offset in [0, 4] {
+            let mut invalid = pass.clone();
+            invalid[offset..offset + 4].copy_from_slice(&99u32.to_le_bytes());
+            assert_rejection(
+                &renderer.execute(&wire_batch(&[
+                    (GpuOpcode::BeginRenderPass, invalid),
+                    (GpuOpcode::EndRenderPass, vec![]),
+                ])),
+                u32::MAX,
+                1,
+            );
+        }
+
+        let mut surface_pass = pass.clone();
+        surface_pass[..4].copy_from_slice(&0u32.to_le_bytes());
+        let stale = renderer.execute(&wire_batch(&[
+            (GpuOpcode::BeginRenderPass, surface_pass.clone()),
+            // Staleness must reject before this invalid operation is visited.
+            (GpuOpcode::SetPipeline, 99u32.to_le_bytes().to_vec()),
+            (GpuOpcode::EndRenderPass, vec![]),
+        ]));
+        assert_rejection(&stale, 0, gpu_wire::GPU_BATCH_ERROR_STALE_SURFACE);
+
+        // Rejection remains nontransactional: a preceding upload is not rolled back.
+        upload[24..28].copy_from_slice(&[5, 6, 7, 8]);
+        let stale = renderer.execute(&wire_batch(&[
+            (GpuOpcode::WriteBuffer, upload),
+            (GpuOpcode::BeginRenderPass, surface_pass.clone()),
+            (GpuOpcode::EndRenderPass, vec![]),
+        ]));
+        assert_rejection(&stale, 1, gpu_wire::GPU_BATCH_ERROR_STALE_SURFACE);
+        let (buffer, _) = renderer.buffer(3).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        renderer.device.poll(wgpu::Maintain::Wait);
+        receiver.recv().unwrap().unwrap();
+        assert_eq!(&*buffer.slice(..).get_mapped_range(), &[5, 6, 7, 8]);
+        buffer.unmap();
+
+        // Neither rejection undoes the separately submitted offscreen render.
         let mut encoder = renderer.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -3120,7 +3219,20 @@ mod tests {
         renderer.queue.submit([encoder.finish()]);
         assert_eq!(
             renderer.read_frame().unwrap().rgba,
-            [255, 0, 0, 255, 255, 0, 0, 255]
+            [0, 0, 255, 255, 0, 0, 255, 255]
+        );
+
+        surface_pass[8..12].copy_from_slice(&renderer.generation.to_le_bytes());
+        surface_pass[20..24].copy_from_slice(&1f32.to_le_bytes());
+        surface_pass[24..28].copy_from_slice(&0f32.to_le_bytes());
+        let output = renderer.execute(&wire_batch(&[
+            (GpuOpcode::BeginRenderPass, surface_pass),
+            (GpuOpcode::EndRenderPass, vec![]),
+        ]));
+        assert_event(&output, gpu_wire::GpuEventType::SubmissionComplete);
+        assert_eq!(
+            output.frame.unwrap().rgba,
+            [0, 255, 0, 255, 0, 255, 0, 255]
         );
     }
 

@@ -433,6 +433,9 @@ function backgroundEngine() {
       };
     },
     queue: {
+      writeBuffer(buffer, offset, data) {
+        buffer.bytes.set(data, offset);
+      },
       submit(batches) {
         for (const operations of batches) {
           for (const operation of operations) operation();
@@ -678,7 +681,7 @@ test("rejects missing, wrong-type and deleted color attachments before any GPU m
         setup.push([11, u32s([handle(2)])]);
       }
 
-      await engine.execute(commands([...setup, ...renderPass(colorView)]));
+      await engine.execute(commands([...setup, ...renderPass(colorView, 2, 2)]));
 
       assert.equal(rejected.length, 1);
       assert.equal(rejected[0][0], setup.length);
@@ -691,16 +694,85 @@ test("rejects missing, wrong-type and deleted color attachments before any GPU m
   }
 });
 
-test("requires the current surface generation for both texture and surface attachments", () => {
-  for (const colorView of [0, handle(2)]) {
-    const engine = validationEngine();
-    assert.throws(
-      () => engine.validate(parseCommands(commands([
-        ...offscreenTextureCommands(),
-        ...renderPass(colorView, 2, 2),
-      ]))),
-      error => error.commandIndex === 2 && error.errorCode === 4,
+test("resize retains offscreen updates and rejects only stale default-surface passes", async () => {
+  const { engine, textures, visibleFrames } = backgroundEngine();
+  const capture = captureMessages();
+  try {
+    engine.submit(commands([
+      ...offscreenTextureCommands(),
+      [1, u32s([handle(3), 0x08, 4, 0])],
+      ...renderPass(handle(2)),
+    ]));
+    await engine.queue;
+    const texture = textures[0];
+    const buffer = engine.resources.get(handle(3)).value;
+    const generation = engine.surfaceGeneration;
+    const greenOffscreen = renderPass(handle(2), 2, generation);
+    new DataView(greenOffscreen[0][1].buffer).setFloat32(20, 1, true);
+    const pendingOffscreen = commands([
+      [2, u32s([handle(3), 0, 0, 0, 4, 0, 0x44332211])],
+      ...greenOffscreen,
+    ], 2n);
+    const pendingPresentation = commands(renderPass(0, 2, generation), 3n);
+
+    engine.scheduleResize({
+      physicalWidth: 128, physicalHeight: 96, logicalWidth: 128, logicalHeight: 96, scale: 1,
+    });
+    engine.submit(pendingOffscreen);
+    engine.submit(pendingPresentation);
+    await engine.queue;
+
+    assert.equal(engine.surfaceGeneration, generation + 1);
+    assert.equal(texture.destroyed, false, "resize must not invalidate explicit attachments");
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255], "old-generation offscreen work still executes");
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44]);
+    assert.equal(visibleFrames.length, 0, "stale presentation never acquires a surface");
+    assert.equal(engine.lastSequence, 2);
+
+    // A stale surface following an explicit pass must report that surface's
+    // exact index, not reject the earlier offscreen pass for its generation.
+    engine.submit(commands([
+      ...renderPass(handle(2), 2, generation),
+      ...renderPass(0, 2, generation),
+    ], 4n));
+    await engine.queue;
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255], "browser validation rejects before GPU mutation");
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44], "completed uploads survive rejection");
+    assert.equal(visibleFrames.length, 0);
+
+    const currentPresentation = renderPass(0, 2, engine.surfaceGeneration);
+    new DataView(currentPresentation[0][1].buffer).setFloat32(20, 1, true);
+    engine.submit(commands([
+      ...renderPass(handle(2), 3, generation),
+      ...currentPresentation,
+    ], 5n));
+    await engine.queue;
+
+    assert.equal(engine.lastSequence, 5);
+    assert.equal(engine.resources.get(handle(1)).value, texture);
+    assert.equal(engine.resources.get(handle(3)).value, buffer);
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255]);
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44]);
+    assert.equal(visibleFrames.length, 1);
+    assert.deepEqual(visibleFrames[0].descriptor.size, [128, 96, 1]);
+    assert.deepEqual(visibleFrames[0].pixel, [0, 255, 0, 255]);
+    const events = capture.messages.filter(message => message.type === "event");
+    assert.deepEqual(events.map(message => [
+      eventType(message.bytes),
+      new DataView(message.bytes.buffer).getBigUint64(16, true),
+    ]), [[5, 1n], [6, 0n], [5, 2n], [1, 3n], [1, 4n], [5, 5n]]);
+    assert.deepEqual(events.filter(message => eventType(message.bytes) === 1).map(message => {
+      const view = new DataView(message.bytes.buffer);
+      return [view.getUint32(24, true), view.getUint32(28, true)];
+    }), [[0, 4], [2, 4]], "stale rejections retain error code and exact command index");
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "presented").map(message => message.sequence),
+      [5],
+      "resource/offscreen batches and obsolete blits must not inflate presented-frame metrics",
     );
+  } finally {
+    capture.restore();
+    engine.stop();
   }
 });
 

@@ -451,6 +451,29 @@ are described with the occlusion-query extension.
      GPU error defined by the selected WebGPU contract
 ```
 
+#### Surface resize
+
+`SurfaceChanged` (event `6`) publishes new capabilities without invalidating
+guest-owned resources or abandoning previously submitted work. The surface
+generation in `BeginRenderPass` applies only to color view `0`, the Host's
+default surface. Explicit color/depth views retain their own handle lifetimes
+and attachment validation across a resize; their pass does not depend on the
+default surface's generation.
+
+A default-surface pass with an obsolete generation is rejected with
+`BatchRejected` error code `4` and the offending command index. The browser
+validates the whole batch before mutation; native execution may already have
+applied commands preceding the rejection. Guests MUST NOT blindly replay or
+discard resource-bearing batches on this error. A guest can isolate its final
+resource-free screen blit in a separate batch, retire that submission on a
+stale-surface rejection at command `0`, and present the next frame using fresh
+dimensions. Keep the generation and dimensions from the same snapshot; do not
+retag an old viewport or depth attachment with a new generation.
+
+Queued batches deliver terminal completion/rejection events in submission order.
+Offscreen and resource-only batches still complete, but do not count as
+presented frames. A discarded obsolete blit does not count as a presentation.
+
 #### Device loss and restoration
 
 A browser or driver may take the GPU device away at any time — a driver reset,
