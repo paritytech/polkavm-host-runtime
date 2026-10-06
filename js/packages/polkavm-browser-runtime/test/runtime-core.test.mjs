@@ -1194,7 +1194,7 @@ for (const bitness of [32, 64]) {
     t.mock.method(performance, "now", () => now++);
     const samples = [];
     const translated = new globalThis.TranslatedPolkaVmRuntime(
-      compiled.module,
+      compiled.program,
       [],
       (output) => {
         if (output.type === "save") {
