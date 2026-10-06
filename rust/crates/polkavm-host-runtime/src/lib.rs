@@ -2,9 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Bounded PolkaVM application execution and host-neutral presentation/input APIs.
+
 mod application;
 mod computer;
 mod corevm;
+mod file_input;
 mod filesystem;
 pub use polkavm_gpu_wire as gpu_wire;
 pub use polkavm_motion_wire as motion_wire;
@@ -13,6 +16,8 @@ mod manifest;
 mod mediated_input;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod native_ffi;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_file_input;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
 mod native_gpu;
 mod quake_keys;
@@ -20,11 +25,11 @@ mod tri2d;
 mod ui;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
-#[cfg(any(target_arch = "wasm32", test))]
-mod wasm_codegen;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 pub use native_ffi::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_file_input::{LocalFileCache, LocalFileSource};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-gpu"))]
 pub use native_gpu::*;
 
@@ -38,11 +43,19 @@ pub use computer::{
     FS_OPEN_READ, FS_OPEN_TRUNCATE, FS_OPEN_WRITE, MAX_BACKGROUND_PROCESSES,
     MAX_COMPUTER_CONTEXT_BYTES, MAX_COMPUTER_CONTEXT_ENTRIES, MAX_COMPUTER_DIRECTORIES,
     MAX_COMPUTER_FILES, MAX_COMPUTER_FILE_BYTES, MAX_COMPUTER_PATH_BYTES, MAX_COMPUTER_PROCESSES,
-    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_TTY_INPUT_BYTES,
-    MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
+    MAX_NET_ADDRESS_BYTES, MAX_OPEN_COMPUTER_FILES, MAX_OPEN_SOCKETS, MAX_RANDOM_BYTES,
+    MAX_TTY_INPUT_BYTES, MAX_TTY_OUTPUT_BYTES, MAX_WORKSPACE_CHILDREN, TTY_MODE_ECHO, TTY_MODE_RAW,
+};
+pub use file_input::{
+    FileCache, FileDelivery, FileDescriptor, FileInputDelivery, FileInputRequest, FileInputSupport,
+    FileReadSource, FileRegistration, FileRelaunch, FileSelection, FileStreamSelection,
+    FILE_INFO_INVALID, FILE_READ_INVALID_DESTINATION, FILE_READ_INVALID_HANDLE,
+    FILE_READ_INVALID_RANGE, FILE_READ_IO_ERROR, FILE_REGISTER_DELIVERY_UNAVAILABLE,
+    MAX_FILE_CACHE_BYTES, MAX_FILE_DESCRIPTOR_BYTES, MAX_FILE_NAME_BYTES, MAX_FILE_READ_BYTES,
+    MAX_INLINE_FILE_BYTES, MAX_RELAUNCH_FILE_BYTES, MAX_STREAM_FILE_BYTES,
 };
 pub use filesystem::{FilesystemMetadata, FilesystemMetadataEntry};
-pub use manifest::AppDescriptor;
+pub use manifest::{AppDescriptor, FileTypeHint};
 pub use mediated_input::{
     MediatedInputCommand, MediatedInputRequest, MediatedInputStatus, MAX_MEDIATED_INPUT_BYTES,
     MAX_MEDIATED_INPUT_KIND_BYTES, MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES,
@@ -59,7 +72,7 @@ use polkavm::{CallError, Config, Engine, Instance, Linker, Module, ProgramBlob};
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub use tri2d::{
     Tri2dFrame, MAX_TRI2D_BYTES, MAX_TRI2D_COMMANDS, MAX_TRI2D_DRAWS, MAX_TRI2D_INDICES,
     MAX_TRI2D_SURFACE_SIZE, MAX_TRI2D_TEXTURES, MAX_TRI2D_TEXTURE_BYTES, MAX_TRI2D_TEXTURE_SIZE,
@@ -75,21 +88,28 @@ pub use ui::{
     MAX_UI_TEXT_BYTES,
 };
 
+/// Version of the cooperative guest host-call ABI.
 pub const ABI_VERSION: u32 = 1;
 /// Optional application import used by guests to choose their next update.
 pub const UPDATE_AFTER_IMPORT: &str = "host_update_after";
 /// Wait for Host input or another external event before updating again.
 pub const UPDATE_AFTER_IDLE: u32 = u32::MAX;
 
+/// Presentation contract selected by the verified application manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationProfile {
+    /// Guest submits packed CPU-rendered pixels.
     Framebuffer,
+    /// Guest submits validated textured-triangle command streams.
     Tri2d,
+    /// Guest submits WebGPU raster commands without compute.
     WebGpuRaster,
+    /// Guest submits WebGPU raster and compute commands.
     WebGpu,
 }
 
 impl PresentationProfile {
+    /// Parse an exact manifest profile name, rejecting unsupported values.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "framebuffer" => Ok(Self::Framebuffer),
@@ -100,6 +120,7 @@ impl PresentationProfile {
         }
     }
 
+    /// Return the canonical manifest profile name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Framebuffer => "framebuffer",
@@ -117,19 +138,33 @@ impl PresentationProfile {
         matches!(self, Self::WebGpu)
     }
 }
+/// Bytes per packed framebuffer pixel.
 pub const BYTES_PER_PIXEL: usize = 4;
+/// Maximum encoded PolkaVM program size in bytes.
 pub const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum framebuffer payload in bytes.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum bytes read from guest memory by one bounded host operation.
 pub const MAX_GUEST_READ: usize = MAX_FRAME_BYTES;
+/// Maximum initial writable guest data size in bytes.
 pub const MAX_GUEST_RW_DATA_BYTES: u32 = 64 * 1024 * 1024;
+/// Maximum declared guest stack size in bytes.
 pub const MAX_GUEST_STACK_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum guest heap size in bytes.
 pub const MAX_GUEST_HEAP_BYTES: u32 = 128 * 1024 * 1024;
+/// Maximum launch asset count.
 pub const MAX_ASSET_FILES: usize = 2_048;
+/// Maximum bytes in a single launch asset.
 pub const MAX_ASSET_FILE_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum aggregate bytes across launch assets.
 pub const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
+/// Encoded size of each fixed or extended input record in bytes.
 pub const INPUT_EVENT_BYTES: usize = 8;
+/// PCM playback sample rate in samples per second per channel.
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+/// Number of interleaved PCM channels.
 pub const AUDIO_CHANNELS: u32 = 2;
+/// Maximum interleaved sample values accepted in one audio host call.
 pub const MAX_AUDIO_SAMPLES_PER_CALL: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS as usize;
 const MAX_ASSET_NAME_BYTES: usize = 1_024;
 const MAX_ASSET_READ_BYTES: usize = 16 * 1024 * 1024;
@@ -141,12 +176,15 @@ const MAX_SLEEP_MS_PER_UPDATE: u32 = 50;
 const MAX_QUEUED_AUDIO_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS as usize * 2;
 const MAX_QUEUED_INPUT_EVENTS: usize = 4_096;
 const MAX_SAVE_BYTES: usize = 1024 * 1024;
+const MAX_RANDOM_BYTES_PER_CALL: usize = 4 * 1024;
+const RANDOM_BYTES_PER_EXECUTION: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 4 * 1024;
 const MAX_QUEUED_LOGS: usize = 64;
 const MAX_QUEUED_GPU_BATCHES: usize = 4;
 const MAX_QUEUED_GPU_EVENTS: usize = 256;
 const MAX_GPU_SUBMITS_PER_TICK: u32 = 8;
 const MAX_GPU_UPLOAD_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+/// Maximum bytes in one host-service request or response frame.
 pub const MAX_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_HOST_FRAMES: usize = 32;
 const MAX_QUEUED_HOST_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -242,19 +280,31 @@ pub(crate) fn validate_blob(blob: &ProgramBlob) -> Result<()> {
     Ok(())
 }
 
+/// Fixed input record discriminants in the guest ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum InputEventType {
+    /// Press a USB HID keyboard usage code.
     KeyDown = 1,
+    /// Release a USB HID keyboard usage code.
     KeyUp = 2,
+    /// Press a pointer button.
     ButtonDown = 3,
+    /// Release a pointer button.
     ButtonUp = 4,
+    /// Set absolute pointer coordinates on the surface.
     PointerMove = 5,
+    /// Report relative pointer displacement using signed i16 bit patterns.
     PointerDelta = 6,
+    /// Report surface width and height through the coordinate fields.
     SurfaceMetrics = 7,
+    /// Begin a touch contact at the supplied surface coordinates.
     TouchStart = 18,
+    /// Move an active touch contact.
     TouchMove = 19,
+    /// End a touch contact normally.
     TouchEnd = 20,
+    /// Cancel a touch contact without completing its gesture.
     TouchCancel = 21,
 }
 
@@ -330,11 +380,16 @@ impl PointerCaptureState {
     }
 }
 
+/// One fixed-size input event queued for the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputEvent {
+    /// Interpretation of the code and coordinate fields.
     pub event_type: InputEventType,
+    /// HID key usage, pointer button, or event-specific code.
     pub code: u8,
+    /// Horizontal position/size in surface units, or signed i16 delta bits.
     pub x: u16,
+    /// Vertical position/size in surface units, or signed i16 delta bits.
     pub y: u16,
 }
 
@@ -355,24 +410,32 @@ impl InputEvent {
     }
 }
 
+/// Latest CPU-rendered framebuffer awaiting host presentation.
 #[derive(Debug)]
 pub struct Frame {
+    /// Surface width in pixels.
     pub width: u32,
+    /// Surface height in pixels.
     pub height: u32,
     /// Packed 0xAARRGGBB pixels. On little-endian guests these bytes are BGRA.
     pub argb: Vec<u8>,
 }
 
+/// One queued block of interleaved signed 16-bit PCM audio.
 #[derive(Debug)]
 pub struct AudioChunk {
     /// Interleaved little-endian signed 16-bit samples.
     pub samples: Vec<i16>,
+    /// Samples per second per channel.
     pub sample_rate: u32,
+    /// Number of interleaved channels.
     pub channels: u32,
 }
 
+/// Structurally validated GPU commands awaiting host execution.
 #[derive(Debug)]
 pub struct GpuBatch {
+    /// Complete encoded batch, including the wire header.
     pub bytes: Vec<u8>,
 }
 
@@ -386,6 +449,9 @@ pub struct UiOutputFrame {
 struct HostClock {
     #[cfg(not(target_arch = "wasm32"))]
     started: Instant,
+    #[cfg(not(target_arch = "wasm32"))]
+    paused_at: Option<Instant>,
+    paused: bool,
     #[cfg(target_arch = "wasm32")]
     now_ms: u64,
 }
@@ -395,6 +461,9 @@ impl HostClock {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             started: Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
+            paused_at: None,
+            paused: false,
             #[cfg(target_arch = "wasm32")]
             now_ms: 0,
         }
@@ -403,7 +472,10 @@ impl HostClock {
     fn elapsed_ms(&self) -> u64 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.started.elapsed().as_millis() as u64
+            self.paused_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_millis() as u64
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -411,7 +483,41 @@ impl HostClock {
         }
     }
 
+    fn elapsed_ns(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.paused_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.now_ms.saturating_mul(1_000_000)
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = Instant::now();
+            if paused {
+                self.paused_at = Some(now);
+            } else if let Some(paused_at) = self.paused_at.take() {
+                self.started += now.duration_since(paused_at);
+            }
+        }
+        self.paused = paused;
+    }
+
     fn sleep_ms(&mut self, duration_ms: u32) {
+        if self.paused {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::sleep(Duration::from_millis(duration_ms.into()));
         #[cfg(target_arch = "wasm32")]
@@ -422,7 +528,38 @@ impl HostClock {
 
     #[cfg(target_arch = "wasm32")]
     fn set_time_ms(&mut self, time_ms: u64) {
-        self.now_ms = self.now_ms.max(time_ms);
+        if !self.paused {
+            self.now_ms = self.now_ms.max(time_ms);
+        }
+    }
+}
+
+fn wall_clock_ns() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX.into()) as u64
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::wall_clock_ns()
+    }
+}
+
+fn fill_random(bytes: &mut [u8]) -> i32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match getrandom::fill(bytes) {
+            Ok(()) => 0,
+            Err(_) => computer::STATUS_DENIED,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm::fill_random(bytes)
     }
 }
 
@@ -495,6 +632,20 @@ pub(crate) fn preferred_backend() -> BackendKind {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn execution_random_bytes() -> Vec<u8> {
+    let mut bytes = vec![0; RANDOM_BYTES_PER_EXECUTION];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes.clear();
+    }
+    bytes
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execution_random_bytes() -> Vec<u8> {
+    Vec::new()
+}
+
 struct HostState {
     frame: Option<Frame>,
     tri2d: Option<Tri2dFrame>,
@@ -513,6 +664,8 @@ struct HostState {
     clock: HostClock,
     logs: VecDeque<String>,
     save: Option<Vec<u8>>,
+    random: Vec<u8>,
+    random_offset: usize,
     hostcall_bytes_remaining: usize,
     hostcalls_remaining: u32,
     sleep_ms_remaining: u32,
@@ -530,6 +683,8 @@ struct HostState {
     host_frame_responses: VecDeque<Vec<u8>>,
     host_frame_response_bytes: usize,
     mediated_input: mediated_input::MediatedInputState,
+    file_sources: HashMap<u32, file_input::SelectedFileStream>,
+    file_read_buffer: Option<Box<[u8]>>,
     gpu_last_sequence: u64,
     gpu_submits_remaining: u32,
     gpu_upload_bytes_remaining: usize,
@@ -561,6 +716,8 @@ impl HostState {
             clock: HostClock::new(),
             logs: VecDeque::new(),
             save: None,
+            random: execution_random_bytes(),
+            random_offset: 0,
             hostcall_bytes_remaining: 0,
             hostcalls_remaining: 0,
             sleep_ms_remaining: 0,
@@ -578,6 +735,8 @@ impl HostState {
             host_frame_responses: VecDeque::new(),
             host_frame_response_bytes: 0,
             mediated_input: mediated_input::MediatedInputState::default(),
+            file_sources: HashMap::new(),
+            file_read_buffer: None,
             gpu_last_sequence: 0,
             gpu_submits_remaining: 0,
             gpu_upload_bytes_remaining: 0,
@@ -816,6 +975,12 @@ fn is_discardable_input(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
     )
 }
 
+/// Retain releases and viewport state at a pause boundary, never queued actions.
+pub(crate) fn input_survives_pause(record: &[u8; INPUT_EVENT_BYTES]) -> bool {
+    matches!(record[0], 2 | 4 | 7 | 12 | 16 | 17 | 20 | 21)
+        || (matches!(record[0], ui::INPUT_FOCUS | ui::INPUT_POINTER_CAPTURE) && record[1] == 0)
+}
+
 /// Classifies a batch that carries viewport insets.
 ///
 /// Returns the inset event type when `records` is exactly one well-formed
@@ -845,16 +1010,22 @@ fn inset_pair_type(records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<Option<u8>> {
     }
 }
 
+/// Cooperative guest exposing `init` and `update` entry points.
 pub struct Runtime {
     instance: Instance<HostState, anyhow::Error>,
     state: HostState,
     max_gas_per_update: u64,
     last_gas_used: u64,
     backend: polkavm::BackendKind,
+    initialized: bool,
     stopped: bool,
 }
 
 impl Runtime {
+    /// Validate launch inputs and instantiate with the platform-preferred backend.
+    ///
+    /// `max_gas_per_update` must be nonzero and also bounds `init`; call `init`
+    /// before the first update. Assets are owned immutable guest-visible files.
     pub fn new(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -872,6 +1043,9 @@ impl Runtime {
         )
     }
 
+    /// Instantiate with an explicit sandboxed backend and nonzero per-call gas limit.
+    ///
+    /// Rejects invalid programs, asset paths, and resource quotas before execution.
     pub fn new_with_backend(
         program: &[u8],
         assets: HashMap<String, Vec<u8>>,
@@ -1323,7 +1497,11 @@ impl Runtime {
                 "host_input_trigger",
                 |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
                     caller.user_data.charge_hostcall(0)?;
-                    Ok(caller.user_data.mediated_input.trigger(handle))
+                    let result = caller.user_data.mediated_input.trigger(handle);
+                    if result == MEDIATED_INPUT_TRIGGER_ACCEPTED {
+                        caller.user_data.file_sources.remove(&handle);
+                    }
+                    Ok(result)
                 },
             )
             .context("define host_input_trigger")?;
@@ -1353,6 +1531,10 @@ impl Runtime {
                         .result(handle)
                         .map(<[u8]>::len)
                     else {
+                        caller
+                            .user_data
+                            .mediated_input
+                            .acknowledge_mounted_file(handle);
                         return Ok(0);
                     };
                     if (capacity as usize) < required {
@@ -1377,10 +1559,312 @@ impl Runtime {
 
         linker
             .define_typed(
+                "host_file_register",
+                |caller: polkavm::Caller<'_, HostState>,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let length = length as usize;
+                    if length > MAX_FILE_DESCRIPTOR_BYTES {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    }
+                    caller.user_data.charge_hostcall_bytes(length)?;
+                    let Ok(descriptor) = read_guest_memory(caller.instance, pointer, length) else {
+                        return Ok(MEDIATED_INPUT_REGISTER_INVALID);
+                    };
+                    Ok(caller.user_data.mediated_input.register_file(&descriptor))
+                },
+            )
+            .context("define host_file_register")?;
+
+        linker
+            .define_typed(
+                "host_file_info",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 pointer: u32,
+                 capacity: u32|
+                 -> Result<i32> {
+                    caller.user_data.charge_hostcall(0)?;
+                    let Ok(info) = caller.user_data.mediated_input.file_info(handle) else {
+                        return Ok(FILE_INFO_INVALID);
+                    };
+                    let Some(info) = info else {
+                        return Ok(0);
+                    };
+                    let required = i32::try_from(info.len())
+                        .map_err(|_| anyhow!("file info length overflow"))?;
+                    if (capacity as usize) < info.len() {
+                        return Ok(-required);
+                    }
+                    caller.user_data.charge_hostcall_bytes(info.len())?;
+                    if caller.instance.write_memory(pointer, &info).is_err() {
+                        return Ok(FILE_INFO_INVALID);
+                    }
+                    Ok(required)
+                },
+            )
+            .context("define host_file_info")?;
+
+        linker
+            .define_typed(
+                "host_file_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let length = match state
+                        .mediated_input
+                        .file_read_length(handle, offset, length)
+                    {
+                        Ok(length) => length,
+                        Err(error) => return Ok(error),
+                    };
+                    if !caller.instance.is_memory_accessible(
+                        destination,
+                        length as u32,
+                        polkavm::MemoryProtection::ReadWrite,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length)?;
+                    if length == 0 {
+                        return Ok(0);
+                    }
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    let read = match state.file_sources.get_mut(&handle) {
+                        Some(stream) => stream.source.read_exact_at(offset, &mut buffer[..length]),
+                        None => Err(anyhow!("selected file source is unavailable")),
+                    };
+                    if read.is_err() {
+                        state.file_sources.remove(&handle);
+                        state.mediated_input.fail_file_read(handle);
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    if caller
+                        .instance
+                        .write_memory(destination, &buffer[..length])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_read")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_reset",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32, size: u32| -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(previous) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    let reserved: u64 = state
+                        .file_sources
+                        .values()
+                        .filter_map(|stream| stream.cache.as_ref())
+                        .map(|cache| u64::from(cache.size))
+                        .sum();
+                    if size == 0
+                        || size > MAX_FILE_CACHE_BYTES
+                        || reserved - u64::from(previous.size) + u64::from(size)
+                            > u64::from(MAX_FILE_CACHE_BYTES)
+                    {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache.backend.reset(size).is_err() || cache.backend.size() != u64::from(size)
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.size = size;
+                    cache.written = 0;
+                    cache.sealed = false;
+                    Ok(0)
+                },
+            )
+            .context("define host_file_cache_reset")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_write",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 pointer: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(cache) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if cache.sealed
+                        || !(1..=MAX_FILE_READ_BYTES).contains(&length)
+                        || offset != cache.written
+                        || u64::from(offset) + u64::from(length) > u64::from(cache.size)
+                    {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    if !caller.instance.is_memory_accessible(
+                        pointer,
+                        length,
+                        polkavm::MemoryProtection::Read,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length as usize)?;
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    if caller
+                        .instance
+                        .read_memory_into(pointer, &mut buffer[..length as usize])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache
+                        .backend
+                        .write_exact_at(offset, &buffer[..length as usize])
+                        .is_err()
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.written += length;
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_cache_write")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_commit",
+                |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(stream) = state.file_sources.get_mut(&handle) else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    let Some(cache) = stream.cache.as_mut() else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if cache.sealed || cache.size == 0 || cache.written != cache.size {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    if cache.backend.flush().is_err() {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    cache.sealed = true;
+                    Ok(0)
+                },
+            )
+            .context("define host_file_cache_commit")?;
+
+        linker
+            .define_typed(
+                "host_file_cache_read",
+                |caller: polkavm::Caller<'_, HostState>,
+                 handle: u32,
+                 offset: u32,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let state = caller.user_data;
+                    state.charge_hostcall(0)?;
+                    let Some(cache) = state
+                        .file_sources
+                        .get(&handle)
+                        .and_then(|s| s.cache.as_ref())
+                    else {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    };
+                    if !cache.sealed {
+                        return Ok(FILE_READ_INVALID_HANDLE);
+                    }
+                    if !(1..=MAX_FILE_READ_BYTES).contains(&length) || offset > cache.size {
+                        return Ok(FILE_READ_INVALID_RANGE);
+                    }
+                    let length = length.min(cache.size - offset) as usize;
+                    if !caller.instance.is_memory_accessible(
+                        destination,
+                        length as u32,
+                        polkavm::MemoryProtection::ReadWrite,
+                    ) {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    state.charge_hostcall_bytes(length)?;
+                    if length == 0 {
+                        return Ok(0);
+                    }
+                    let buffer = state.file_read_buffer.get_or_insert_with(|| {
+                        vec![0; MAX_FILE_READ_BYTES as usize].into_boxed_slice()
+                    });
+                    let stream = state
+                        .file_sources
+                        .get_mut(&handle)
+                        .expect("selected stream");
+                    let cache = stream.cache.as_mut().expect("selected cache");
+                    if cache
+                        .backend
+                        .read_exact_at(offset, &mut buffer[..length])
+                        .is_err()
+                    {
+                        stream.cache = None;
+                        return Ok(FILE_READ_IO_ERROR);
+                    }
+                    if caller
+                        .instance
+                        .write_memory(destination, &buffer[..length])
+                        .is_err()
+                    {
+                        return Ok(FILE_READ_INVALID_DESTINATION);
+                    }
+                    Ok(length as i32)
+                },
+            )
+            .context("define host_file_cache_read")?;
+
+        linker
+            .define_typed(
                 "host_input_cancel",
                 |caller: polkavm::Caller<'_, HostState>, handle: u32| -> Result<u32> {
                     caller.user_data.charge_hostcall(0)?;
-                    Ok(caller.user_data.mediated_input.cancel(handle))
+                    let result = caller.user_data.mediated_input.cancel(handle);
+                    if result == MEDIATED_INPUT_CANCEL_ACCEPTED {
+                        caller.user_data.file_sources.remove(&handle);
+                    }
+                    Ok(result)
                 },
             )
             .context("define host_input_cancel")?;
@@ -1445,6 +1929,95 @@ impl Runtime {
                 },
             )
             .context("define host_time_ms")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_monotonic",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    let nanoseconds = caller.user_data.clock.elapsed_ns().to_le_bytes();
+                    caller
+                        .instance
+                        .write_memory(destination, &nanoseconds)
+                        .map_err(|error| anyhow!("write monotonic clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_monotonic")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_clock_wall",
+                |caller: polkavm::Caller<'_, HostState>, destination: u32| -> Result<i32> {
+                    caller.user_data.charge_hostcall(8)?;
+                    caller
+                        .instance
+                        .write_memory(destination, &wall_clock_ns().to_le_bytes())
+                        .map_err(|error| anyhow!("write wall clock: {error:?}"))?;
+                    Ok(0)
+                },
+            )
+            .context("define polkadot_host_0_1_core_clock_wall")?;
+
+        linker
+            .define_typed(
+                "polkadot_host_0_1_core_random",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<i32> {
+                    let length = length as usize;
+                    caller.user_data.charge_hostcall(0)?;
+                    if length == 0 {
+                        return Ok(computer::STATUS_INVALID);
+                    }
+                    if length > MAX_RANDOM_BYTES {
+                        return Ok(computer::STATUS_LIMIT);
+                    }
+                    caller.user_data.charge_hostcall_bytes(length)?;
+                    let mut bytes = [0; MAX_RANDOM_BYTES];
+                    let status = fill_random(&mut bytes[..length]);
+                    if status == 0 {
+                        caller
+                            .instance
+                            .write_memory(destination, &bytes[..length])
+                            .map_err(|error| anyhow!("write random bytes: {error:?}"))?;
+                    }
+                    Ok(status)
+                },
+            )
+            .context("define polkadot_host_0_1_core_random")?;
+
+        linker
+            .define_typed(
+                "host_random_fill",
+                |caller: polkavm::Caller<'_, HostState>,
+                 destination: u32,
+                 length: u32|
+                 -> Result<u32> {
+                    let length = length as usize;
+                    if length == 0
+                        || length > MAX_RANDOM_BYTES_PER_CALL
+                        || caller
+                            .user_data
+                            .random_offset
+                            .checked_add(length)
+                            .is_none_or(|end| end > caller.user_data.random.len())
+                    {
+                        return Ok(1);
+                    }
+                    caller.user_data.charge_hostcall(length)?;
+                    let start = caller.user_data.random_offset;
+                    let end = start + length;
+                    caller
+                        .instance
+                        .write_memory(destination, &caller.user_data.random[start..end])
+                        .map_err(|error| anyhow!("write guest random bytes: {error:?}"))?;
+                    caller.user_data.random_offset = end;
+                    Ok(0)
+                },
+            )
+            .context("define host_random_fill")?;
 
         linker
             .define_typed(
@@ -1598,6 +2171,7 @@ impl Runtime {
             max_gas_per_update,
             last_gas_used: 0,
             backend,
+            initialized: false,
             stopped: false,
         })
     }
@@ -1608,16 +2182,40 @@ impl Runtime {
         }
         self.stopped = true;
         self.state.clear_host_frame_queues();
+        self.state.mediated_input.close_streams();
+        self.state.file_sources.clear();
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped
     }
 
+    /// Freezes guest updates and monotonic time. The Host releases held input
+    /// before pausing and owns suspension of its audio output device.
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.stopped || self.state.clock.paused == paused {
+            return;
+        }
+        if paused {
+            self.pause_input();
+        }
+        self.state.clock.set_paused(paused);
+    }
+
+    pub(crate) fn pause_input(&mut self) {
+        self.state.input.retain(input_survives_pause);
+        self.state.motion.consume();
+        self.state.audio.clear();
+        self.state.audio_samples = 0;
+    }
+
+    /// Invoke guest `init` with fresh gas and initialization host-call quotas.
+    /// A failed guest call stops execution and releases retained file resources.
     pub fn init(&mut self) -> Result<()> {
         if self.stopped {
             bail!("runtime is stopped");
         }
+        self.initialized = true;
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
         self.state
@@ -1628,6 +2226,7 @@ impl Runtime {
         self.record_gas_used(gas);
         let program_counter = self.instance.program_counter();
         map_call_result(result, "init").map_err(|error| {
+            self.stop();
             let error = if let Some(log) = self.state.logs.back() {
                 error.context(format!("last guest log: {log}"))
             } else {
@@ -1641,9 +2240,14 @@ impl Runtime {
         })
     }
 
+    /// Invoke guest `update` with fresh gas and per-update host-call quotas.
+    /// A failed guest call stops execution and releases retained file resources.
     pub fn update(&mut self) -> Result<()> {
         if self.stopped {
             bail!("runtime is stopped");
+        }
+        if self.state.clock.paused {
+            return Ok(());
         }
         let gas = self.max_gas_per_update.min(i64::MAX as u64) as i64;
         self.instance.set_gas(gas);
@@ -1655,6 +2259,7 @@ impl Runtime {
         self.record_gas_used(gas);
         let program_counter = self.instance.program_counter();
         map_call_result(result, "update").map_err(|error| {
+            self.stop();
             let error = if let Some(log) = self.state.logs.back() {
                 error.context(format!("last guest log: {log}"))
             } else {
@@ -1672,14 +2277,17 @@ impl Runtime {
         self.last_gas_used = (budget - remaining.min(budget)) as u64;
     }
 
+    /// Gas consumed by the most recent `init` or `update`, including failed calls.
     pub fn last_gas_used(&self) -> u64 {
         self.last_gas_used
     }
 
+    /// Backend actually selected by the PolkaVM engine.
     pub fn backend(&self) -> polkavm::BackendKind {
         self.backend
     }
 
+    /// Whether the guest imports the motion-sample host call.
     pub fn uses_motion(&self) -> bool {
         self.state.uses_motion
     }
@@ -1696,25 +2304,56 @@ impl Runtime {
             .filter(|delay_ms| *delay_ms != UPDATE_AFTER_IDLE)
     }
 
+    /// Queue a fixed event, coalescing pointer/metrics updates where possible.
+    ///
+    /// Drops the new event if the full queue contains no discardable movement.
     pub fn send_input(&mut self, event: InputEvent) {
+        if self.state.clock.paused && !input_survives_pause(&event.encode()) {
+            return;
+        }
         self.state.queue_input(event);
     }
 
+    /// Validate and queue one extended record; reject malformed or overflowing input.
     pub fn send_input_record(&mut self, record: [u8; INPUT_EVENT_BYTES]) -> Result<()> {
+        if self.state.clock.paused && !input_survives_pause(&record) {
+            return Ok(());
+        }
         self.state.queue_input_record(record)
     }
 
     /// Queues one logical input event encoded as multiple records without
     /// exposing a partial event to the guest.
     pub fn send_input_records(&mut self, records: &[[u8; INPUT_EVENT_BYTES]]) -> Result<()> {
+        if self.state.clock.paused && records.iter().any(|record| !input_survives_pause(record)) {
+            return Ok(());
+        }
         self.state.queue_input_records(records)
     }
 
+    /// Encode and atomically queue a bounded UTF-8 text operation.
     pub fn send_text_input(&mut self, kind: TextInputKind, text: &str) -> Result<()> {
+        if self.state.clock.paused {
+            return Ok(());
+        }
         let records = ui::encode_text_input(kind, text)?;
         self.state.queue_input_records(&records)
     }
 
+    /// Supplies the CSPRNG output pool used by `host_random_fill` on Hosts
+    /// that cannot access operating-system entropy from inside this runtime.
+    pub fn set_random_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() != RANDOM_BYTES_PER_EXECUTION {
+            bail!(
+                "application random pool must contain exactly {RANDOM_BYTES_PER_EXECUTION} bytes"
+            );
+        }
+        self.state.random = bytes;
+        self.state.random_offset = 0;
+        Ok(())
+    }
+
+    /// Update sensor availability, clearing pending samples when unavailable or denied.
     pub fn set_motion_availability(&mut self, availability: motion_wire::MotionAvailability) {
         self.state.motion.set_availability(availability);
     }
@@ -1755,14 +2394,20 @@ impl Runtime {
         self.state.pointer_capture.request.take()
     }
 
+    /// Validate and replace the latest motion sample, marking motion available.
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.state.clock.paused {
+            return Ok(());
+        }
         self.state.motion.set_sample(bytes)
     }
 
+    /// Whether execution has no outstanding GPU capabilities prerequisite.
     pub fn gpu_ready(&self) -> bool {
         !self.state.presentation.supports_gpu() || self.state.gpu_capabilities.is_some()
     }
 
+    /// Validate and install host capabilities; reject non-GPU applications.
     pub fn set_gpu_capabilities(&mut self, bytes: Vec<u8>) -> Result<()> {
         if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU capabilities sent to a non-GPU application"));
@@ -1772,6 +2417,7 @@ impl Runtime {
         Ok(())
     }
 
+    /// Validate and queue a host GPU event; reject a full queue or non-GPU profile.
     pub fn send_gpu_event(&mut self, bytes: Vec<u8>) -> Result<()> {
         if !self.state.presentation.supports_gpu() {
             return Err(anyhow!("GPU event sent to a non-GPU application"));
@@ -1784,19 +2430,27 @@ impl Runtime {
         Ok(())
     }
 
+    /// Remove the oldest pending GPU batch for host execution.
     pub fn take_gpu_batch(&mut self) -> Option<GpuBatch> {
         self.state.gpu_batches.pop_front()
     }
 
+    /// Remove the oldest pending guest host-service request.
     pub fn take_host_frame_request(&mut self) -> Option<Vec<u8>> {
         self.state.take_host_frame_request()
     }
 
+    /// Queue a nonempty bounded host-service response; report backpressure without dropping it.
     pub fn send_host_frame_response(
         &mut self,
         bytes: Vec<u8>,
     ) -> Result<(), HostFrameResponseError> {
         self.state.queue_host_frame_response(bytes)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        self.state.host_frame_responses.len()
     }
 
     #[cfg(test)]
@@ -1807,14 +2461,17 @@ impl Runtime {
             && self.state.host_frame_response_bytes == 0
     }
 
+    /// Set supported mediated-input kinds; reject invalid kinds or an active request.
     pub fn set_mediated_input_kinds(&mut self, kinds: &[String]) -> Result<()> {
         self.state.mediated_input.set_supported_kinds(kinds)
     }
 
+    /// Remove the oldest request or cancellation for the host to process.
     pub fn take_mediated_input_command(&mut self) -> Option<MediatedInputCommand> {
         self.state.mediated_input.take_command()
     }
 
+    /// Complete an active mediated-input request with a validated terminal status and bounded bytes.
     pub fn send_mediated_input_result(
         &mut self,
         handle: u32,
@@ -1824,19 +2481,115 @@ impl Runtime {
         self.state.mediated_input.complete(handle, status, bytes)
     }
 
+    /// Declares the file deliveries this Host serves. Without support,
+    /// `host_file_register` returns `-2`; without the requested delivery, `-4`.
+    /// Existing registrations are unaffected.
+    pub fn set_file_input_support(&mut self, support: FileInputSupport) -> Result<()> {
+        self.state.mediated_input.set_file_support(support)
+    }
+
+    /// Every file registration of this execution, including after it stopped
+    /// or failed, so the Host can offer another file.
+    pub fn file_registrations(&self) -> Vec<FileRegistration> {
+        self.state.mediated_input.file_registrations()
+    }
+
+    /// The file registrations when the guest added one since the last take.
+    pub fn take_file_registrations(&mut self) -> Option<Vec<FileRegistration>> {
+        self.state.mediated_input.take_file_registrations()
+    }
+
+    /// Delivers a file the user selected in Host UI, either for the guest's
+    /// active request or onto an idle registration. A file that is empty or
+    /// above `maxBytes` is rejected with status 6 before any byte reaches the
+    /// guest. A relaunch delivery stops this execution; the Host obtains any
+    /// confirmation first and starts the returned file in a fresh execution.
+    pub fn send_file_input(
+        &mut self,
+        handle: u32,
+        selection: FileSelection,
+    ) -> Result<FileInputDelivery> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
+        let delivery = self.state.mediated_input.deliver_file(handle, selection)?;
+        if matches!(delivery, FileInputDelivery::Relaunch(_)) {
+            self.stop();
+        }
+        Ok(delivery)
+    }
+
+    /// Installs a read-only source and optional private cache only on Ready.
+    /// Cancel, replacement, source I/O failure, and teardown drop both resources.
+    pub fn send_file_stream(
+        &mut self,
+        handle: u32,
+        selection: FileStreamSelection,
+        source: Box<dyn FileReadSource>,
+        cache: Option<Box<dyn FileCache>>,
+    ) -> Result<FileInputDelivery> {
+        if self.stopped {
+            bail!("runtime is stopped");
+        }
+        if selection.size != source.size() {
+            bail!("file selection size does not match its retained source");
+        }
+        let delivery = self
+            .state
+            .mediated_input
+            .deliver_stream(handle, selection)?;
+        if delivery == FileInputDelivery::Ready {
+            self.state.file_sources.insert(
+                handle,
+                file_input::SelectedFileStream {
+                    source,
+                    cache: cache.map(file_input::SelectedFileCache::new),
+                },
+            );
+        }
+        Ok(delivery)
+    }
+
+    /// Mounts a relaunch-delivered file in place of the asset at its mount
+    /// path before `init`. The handler that registers the same `id` and mount
+    /// path reports status 3 until the guest reads the selection.
+    pub fn set_file_relaunch(&mut self, relaunch: FileRelaunch) -> Result<()> {
+        if self.initialized || self.stopped {
+            bail!("relaunch files are mounted before init");
+        }
+        relaunch.validate()?;
+        let assets = &self.state.assets;
+        let replaced = assets.get(&relaunch.mount_path).map_or(0, Vec::len);
+        let count = assets.len() + usize::from(!assets.contains_key(&relaunch.mount_path));
+        let total = assets.values().map(Vec::len).sum::<usize>() - replaced + relaunch.bytes.len();
+        validate_asset_count(count)?;
+        if total > MAX_ASSET_BYTES {
+            bail!("guest assets exceed {MAX_ASSET_BYTES} bytes");
+        }
+        self.state.mediated_input.set_mounted_file(&relaunch);
+        self.state
+            .assets
+            .insert(relaunch.mount_path, relaunch.bytes);
+        Ok(())
+    }
+
+    /// Advance the browser clock in monotonic milliseconds; earlier times are ignored.
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
         self.state.clock.set_time_ms(time_ms);
     }
 
+    /// Take the newest framebuffer, clearing the pending presentation.
     pub fn take_frame(&mut self) -> Option<Frame> {
         self.state.frame.take()
     }
 
+    /// Take the pending validated Tri2D frame.
     pub fn take_tri2d(&mut self) -> Option<Tri2dFrame> {
         self.state.tri2d.take()
     }
 
+    /// Take the newest accessibility snapshot.
     pub fn take_ui_semantics(&mut self) -> Option<UiSemanticsFrame> {
         self.state.ui_semantics.take()
     }
@@ -1846,16 +2599,19 @@ impl Runtime {
         self.state.ui_output.take()
     }
 
+    /// Remove the oldest queued audio chunk.
     pub fn take_audio(&mut self) -> Option<AudioChunk> {
         let chunk = self.state.audio.pop_front()?;
         self.state.audio_samples -= chunk.samples.len();
         Some(chunk)
     }
 
+    /// Remove the oldest queued guest log message.
     pub fn take_log(&mut self) -> Option<String> {
         self.state.logs.pop_front()
     }
 
+    /// Take the latest guest save payload, clearing the pending save.
     pub fn take_save(&mut self) -> Option<Vec<u8>> {
         self.state.save.take()
     }
@@ -1913,14 +2669,16 @@ fn validate_gpu_capabilities(bytes: &[u8]) -> Result<()> {
         return Err(anyhow!("invalid GPU capabilities scale"));
     }
     let count = gpu_u32(bytes, 44).unwrap() as usize;
-    if count > 21 || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES {
+    if count > gpu_wire::GpuCapabilityKey::MaxTextureArrayLayers as usize
+        || bytes.len() != HEADER_BYTES + count * ENTRY_BYTES
+    {
         return Err(anyhow!("invalid GPU capabilities limit table"));
     }
     let mut previous = 0;
     for entry in bytes[HEADER_BYTES..].as_chunks::<ENTRY_BYTES>().0 {
         let key = gpu_u16(entry, 0).unwrap();
         if key <= previous
-            || key > 21
+            || key > gpu_wire::GpuCapabilityKey::MaxTextureArrayLayers as u16
             || gpu_u16(entry, 2) != Some(0)
             || gpu_u64(entry, 4) == Some(0)
             || gpu_u32(entry, 12) != Some(0)
@@ -1937,7 +2695,7 @@ fn validate_gpu_event(bytes: &[u8]) -> Result<()> {
         || bytes.len() > gpu_wire::MAX_GPU_EVENT_BYTES
         || bytes[..4] != gpu_wire::GPU_EVENT_MAGIC
         || gpu_u16(bytes, 4) != Some(gpu_wire::GPU_WIRE_VERSION)
-        || !matches!(gpu_u16(bytes, 6), Some(1..=7))
+        || !matches!(gpu_u16(bytes, 6), Some(1..=9))
         || gpu_u32(bytes, 8) != Some(bytes.len() as u32)
         || gpu_u32(bytes, 12) != Some(0)
     {
@@ -1956,7 +2714,7 @@ fn validate_gpu_event(bytes: &[u8]) -> Result<()> {
             }
             validate_gpu_text(payload, 24, 6, 32)
         }
-        4 | 7 => validate_gpu_text(payload, 4, 8, 12),
+        4 | 7 | 8 => validate_gpu_text(payload, 4, 8, 12),
         5 if payload.is_empty() => Ok(()),
         6 => {
             if payload.len() != 28
@@ -1971,6 +2729,17 @@ fn validate_gpu_event(bytes: &[u8]) -> Result<()> {
                 || gpu_u16(payload, 26) != Some(0)
             {
                 return Err(anyhow!("invalid GPU surface-change event"));
+            }
+            Ok(())
+        }
+        9 => {
+            let count = gpu_u32(payload, 4).unwrap_or(0);
+            if count == 0
+                || count > gpu_wire::MAX_GPU_OCCLUSION_QUERIES_PER_BATCH
+                || payload.len()
+                    != gpu_wire::GPU_OCCLUSION_RESULTS_HEADER_BYTES + count as usize * 8
+            {
+                return Err(anyhow!("invalid GPU occlusion results"));
             }
             Ok(())
         }
@@ -2063,6 +2832,191 @@ mod tests {
     use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::{asm, InstructionSetKind};
     use polkavm_common::writer::ProgramBlobBuilder;
+
+    fn resident_stack_program(stack_bytes: u32, touch_guard: bool) -> Vec<u8> {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(stack_bytes);
+        builder.add_import(b"host_log");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        let deep = -(stack_bytes as i32) + 32;
+        let mut code = vec![
+            asm::store_imm_indirect_u32(Reg::SP, -4, i32::from_le_bytes(*b"root")),
+            asm::store_imm_indirect_u32(Reg::SP, deep, i32::from_le_bytes(*b"deep")),
+        ];
+        if touch_guard {
+            code.push(asm::store_imm_indirect_u32(
+                Reg::SP,
+                -(stack_bytes as i32) - 4,
+                1,
+            ));
+        } else {
+            code.extend([
+                asm::add_imm_32(Reg::A0, Reg::SP, -4),
+                asm::load_imm(Reg::A1, 4),
+                asm::ecalli(0),
+                asm::add_imm_32(Reg::A0, Reg::SP, deep),
+                asm::load_imm(Reg::A1, 4),
+                asm::ecalli(0),
+            ]);
+        }
+        code.push(asm::ret());
+        builder.set_code(&code, &[]);
+        builder.into_vec().unwrap()
+    }
+
+    #[test]
+    fn host_reads_preserve_non_power_of_two_stack_contents_after_growth() {
+        for backend in [BackendKind::Compiler, BackendKind::Interpreter] {
+            for stack_bytes in [192 * 1024, 384 * 1024, 768 * 1024] {
+                let mut runtime = Runtime::new_with_backend(
+                    &resident_stack_program(stack_bytes, false),
+                    HashMap::new(),
+                    PresentationProfile::Framebuffer,
+                    false,
+                    100_000,
+                    backend,
+                )
+                .unwrap();
+                runtime.init().unwrap();
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("root"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("deep"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                runtime.update().unwrap();
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("root"),
+                    "{backend:?}, {stack_bytes}"
+                );
+                assert_eq!(
+                    runtime.take_log().as_deref(),
+                    Some("deep"),
+                    "{backend:?}, {stack_bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_stack_growth_does_not_expose_the_lower_guard() {
+        for backend in [BackendKind::Compiler, BackendKind::Interpreter] {
+            for stack_bytes in [192 * 1024, 384 * 1024, 768 * 1024] {
+                let mut runtime = Runtime::new_with_backend(
+                    &resident_stack_program(stack_bytes, true),
+                    HashMap::new(),
+                    PresentationProfile::Framebuffer,
+                    false,
+                    100_000,
+                    backend,
+                )
+                .unwrap();
+                assert!(
+                    runtime.init().is_err(),
+                    "{backend:?}, {stack_bytes}: guest wrote below stack"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn native_pause_freezes_monotonic_time_without_resume_catchup() {
+        let mut clock = HostClock::new();
+        clock.set_paused(true);
+        let frozen = clock.elapsed_ns();
+        std::thread::sleep(Duration::from_millis(2));
+        clock.set_paused(true);
+        assert_eq!(clock.elapsed_ns(), frozen);
+        clock.sleep_ms(10);
+        assert_eq!(clock.elapsed_ns(), frozen);
+        let resuming = Instant::now();
+        clock.set_paused(false);
+        let resumed = clock.elapsed_ns();
+        assert!(resumed >= frozen);
+        assert!(u128::from(resumed - frozen) <= resuming.elapsed().as_nanos());
+    }
+
+    #[test]
+    fn native_pause_discards_actions_but_preserves_releases_for_the_guest() {
+        let rw_size = 64 * 1024;
+        let stack_size = 4 * 1024;
+        let output = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(rw_size)
+            .stack_size(stack_size)
+            .build()
+            .unwrap()
+            .rw_data_address();
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(rw_size);
+        builder.set_stack_size(stack_size);
+        builder.add_import(b"host_poll_input");
+        builder.add_import(b"host_save_submit");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(1, b"update");
+        builder.set_code(
+            &[
+                asm::ret(),
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, INPUT_EVENT_BYTES as i32),
+                asm::ecalli(0),
+                asm::load_imm(Reg::A0, output as i32),
+                asm::load_imm(Reg::A1, INPUT_EVENT_BYTES as i32),
+                asm::ecalli(1),
+                asm::ret(),
+            ],
+            &[],
+        );
+        let program = builder.into_vec().unwrap();
+        let mut runtime = ApplicationRuntime::new_with_backend(
+            &program,
+            HashMap::new(),
+            PresentationProfile::Framebuffer,
+            false,
+            1_000_000,
+            BackendKind::Interpreter,
+        )
+        .unwrap();
+        runtime.init().unwrap();
+        let press = [1, 4, 0, 0, 0, 0, 0, 0];
+        let release = [2, 4, 0, 0, 0, 0, 0, 0];
+        runtime.send_input_record(press).unwrap();
+        runtime.send_input_record(release).unwrap();
+        runtime.send_input_record(focus_record(true)).unwrap();
+        runtime.send_input_record(focus_record(false)).unwrap();
+        runtime.set_paused(true);
+        runtime.send_input_record([1, 5, 0, 0, 0, 0, 0, 0]).unwrap();
+        runtime.update().unwrap();
+        assert!(
+            runtime.take_save().is_none(),
+            "a paused update cannot execute the guest"
+        );
+        runtime.set_paused(false);
+        runtime.update().unwrap();
+        assert_eq!(runtime.take_save().unwrap(), release);
+        runtime.update().unwrap();
+        assert_eq!(runtime.take_save().unwrap(), focus_record(false));
+        let fresh = [1, 6, 0, 0, 0, 0, 0, 0];
+        runtime.send_input_record(fresh).unwrap();
+        runtime.update().unwrap();
+        assert_eq!(
+            runtime.take_save().unwrap(),
+            fresh,
+            "paused presses must not replay"
+        );
+        runtime.stop();
+        runtime.set_paused(false);
+        assert!(
+            runtime.update().is_err(),
+            "resume cannot revive a stopped runtime"
+        );
+    }
 
     fn motion_test_program() -> (Vec<u8>, u32) {
         let rw_size = 64 * 1024;
@@ -2412,7 +3366,6 @@ mod tests {
         .unwrap();
         idle_runtime.init().unwrap();
         assert_eq!(idle_runtime.update_after_ms(), None);
-
         let legacy = Runtime::new_with_backend(
             &no_motion_test_program(),
             HashMap::new(),
@@ -2696,6 +3649,44 @@ mod tests {
             assert!(
                 validate_gpu_event(&event).is_err(),
                 "invalid scale {scale:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_device_events_require_valid_diagnostics() {
+        let mut event = vec![0; gpu_wire::GPU_EVENT_HEADER_BYTES + 12];
+        event[..4].copy_from_slice(&gpu_wire::GPU_EVENT_MAGIC);
+        event[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+        event[6..8].copy_from_slice(&(gpu_wire::GpuEventType::DeviceRestored as u16).to_le_bytes());
+        let event_len = event.len() as u32;
+        event[8..12].copy_from_slice(&event_len.to_le_bytes());
+        validate_gpu_event(&event).unwrap();
+        // A restored device still uses the bounded diagnostic payload contract.
+        event[gpu_wire::GPU_EVENT_HEADER_BYTES + 4..gpu_wire::GPU_EVENT_HEADER_BYTES + 8]
+            .copy_from_slice(&1u32.to_le_bytes());
+        assert!(validate_gpu_event(&event).is_err());
+    }
+
+    #[test]
+    fn occlusion_results_carry_exactly_one_count_per_declared_query() {
+        let event = |count: u32, results: usize| {
+            let mut event = vec![0; gpu_wire::GPU_EVENT_HEADER_BYTES + 8 + results * 8];
+            event[..4].copy_from_slice(&gpu_wire::GPU_EVENT_MAGIC);
+            event[4..6].copy_from_slice(&gpu_wire::GPU_WIRE_VERSION.to_le_bytes());
+            event[6..8]
+                .copy_from_slice(&(gpu_wire::GpuEventType::OcclusionResults as u16).to_le_bytes());
+            let event_len = event.len() as u32;
+            event[8..12].copy_from_slice(&event_len.to_le_bytes());
+            event[28..32].copy_from_slice(&count.to_le_bytes());
+            event
+        };
+        validate_gpu_event(&event(3, 3)).unwrap();
+        validate_gpu_event(&event(4_096, 4_096)).unwrap();
+        for (count, results) in [(3, 2), (3, 4), (0, 0), (4_097, 4_097)] {
+            assert!(
+                validate_gpu_event(&event(count, results)).is_err(),
+                "{count} queries with {results} results"
             );
         }
     }

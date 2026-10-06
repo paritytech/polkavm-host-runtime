@@ -74,10 +74,36 @@ a returned status for that condition.
 
 ## Capability gating
 
-The App manifest selects exactly one graphics profile and may enable device
-input and audio. A Host call made outside its declared capability MUST fail
+The App manifest selects exactly one graphics profile and may enable audio.
+A Host call made outside its declared graphics or audio capability MUST fail
 with that call's unavailable or invalid-state result. The Host MUST NOT
-silently reinterpret a submission as another graphics profile.
+silently reinterpret a submission as another graphics profile. Application
+input and file input are part of the base ABI and are never enabled by a
+manifest capability.
+
+## File-type hint
+
+An App manifest MAY carry a top-level `fileTypes` list naming the files the App
+opens:
+
+```json
+{
+  "fileTypes": [
+    {
+      "label": "SNES cartridge image",
+      "extensions": [".sfc", ".smc"],
+      "handler": "snes-rom"
+    }
+  ]
+}
+```
+
+Each entry has a `label`, at least one of `extensions` or `mimeTypes`, and an
+optional `handler`, each following the rules for the matching §File input
+descriptor field; `handler` names the `id` the App registers for those files.
+The list holds at most 16 entries. A Host MAY use it to suggest the App for a
+file before the App runs. The list is not a capability and grants nothing: a
+Host delivers a file only to a runtime registration.
 
 ## Host imports
 
@@ -104,6 +130,46 @@ guest. Every such event MUST wake an opted-in guest promptly.
 A guest that does not import this call retains Host-defined continuous
 scheduling for compatibility. Scheduling does not weaken per-update gas or
 Host-call budgets.
+
+A Host may hard-pause execution. It MUST release held input before pausing,
+discard queued gameplay actions and audio, and prevent new gameplay presses
+from accumulating. Releases and viewport state may remain pending until the
+first resumed update. Hard-paused execution does not process updates or
+external-event wakes. Execution-scoped monotonic time excludes the pause; wall
+time does not. Resume MUST NOT replay missed update ticks or buffered audio.
+
+The browser endpoint distinguishes this hard pause (`pause` / `pause-state`,
+with boolean `paused`) from presentation inactivity (`background` /
+`background-state`, with boolean `backgrounded`). A background request MAY carry
+a nonnegative safe-integer `seq`, echoed by its acknowledgment before resumed
+presentation. Both states are retained before and during startup, allowing
+initialization but withholding ordinary updates. Hard pause takes precedence.
+Overlapping inactive intervals freeze elapsed update time once, not once per
+reason, and both states discard gameplay input, motion, and audio.
+
+Background mode is **not simulation suspension**. Host-frame responses wake
+bounded service updates for legacy as well as demand-driven guests, without
+periodic background timers or honoring guest update-delay requests. Responses
+remain ordered in the existing bounded queue; rejection due to queue pressure
+is retryable and also wakes service work. A coalesced burst allows up to 32
+service updates, with up to 32 additional translated cooperative continuation
+slices per response wake; exhausted work waits for another external response
+or foreground resume rather than spinning indefinitely. Guests must poll their
+responses to make progress. Service updates may read real wall time, change
+guest state, submit saves, or perform external side effects. Hosts MUST NOT
+stop subscriptions, coalesce responses, or discard protocol/GPU work merely
+because presentation is inactive.
+
+The browser runtime retains the latest complete framebuffer for foreground
+resume, including idle guests. Tri2D retained-resource transitions MUST still
+be applied atomically and in order while inactive; a Host may hold only the
+latest completed offscreen presentation, not only the latest Tri2D byte stream.
+The same distinction applies to WebGPU command execution versus visible surface
+presentation; already submitted GPU work may complete at the transition.
+Hosts suppress clipboard/navigation interactions, defer pointer-capture
+acquisition, cancel new mediated-input prompts (including file pickers) while
+inactive, and retain current cursor/IME state for resume. Stopping MUST clear
+retained presentation so queued callbacks cannot replay stale output.
 
 ### Framebuffer presentation
 
@@ -172,6 +238,175 @@ Return values:
      GPU error defined by the selected WebGPU contract
 ```
 
+#### Layered and volume textures
+
+Wire version 1 has an additive texture extension, available in both WebGPU
+profiles. Capability key `22` (`RasterFeatures`) bit `0` advertises 2D arrays,
+cube/cube-array views, and 3D color sampling. Keys `23` and `24` report
+`MaxTextureDimension3d` and `MaxTextureArrayLayers`, each capped at 256.
+Guests MUST check this feature bit and the advertised limits before using the
+extension. An absent feature entry does not grant support.
+
+`CreateTexture` (opcode 3) retains its compact 24-byte 2D payload. Its layout is:
+
+```text
+offset  type   meaning
+0       u32    resource handle
+4       u32    width
+8       u32    height
+12      u16    mip-level count
+14      u16    sample count (1)
+16      u16    texture format
+18      u8     dimension: 1 = 2D, 2 = 3D
+19      u8     flags: bit 0 = explicit depth or array-layer count
+20      u32    texture usage
+24      u32    depth or array-layer count, present only when flag bit 0 is set
+```
+
+The payload is exactly 28 bytes with the flag, otherwise exactly 24 bytes.
+Unknown flags are invalid. A 3D texture requires the flag. For 2D textures the
+extra count is the number of array layers; without it the count is one.
+All dimensions and counts are nonzero. The 4096 limit for 2D width/height is
+unchanged; 3D width, height and depth obey key 23. Mip counts cannot exceed
+the dimensions. Depth formats and render-attachment usage are not supported
+for 3D textures by this extension.
+
+`CreateTextureView` (opcode 23) keeps its 20-byte payload. View dimension at
+offset 10, and the texture-binding layout's view-dimension field, use the
+same values: `1` = 2D, `2` = 2D array, `3` = cube, `4` = cube array,
+`5` = 3D. Its existing base-array-layer/count fields at offsets 16/18 select
+layers of a 2D texture. A 2D view selects one layer; a cube selects six;
+a cube array selects a nonzero multiple of six. Cube views require a square
+base texture, even if a nonsquare texture's last mip is square. A 3D view
+requires a 3D source and both array fields zero. Views retain their source
+format, and mip/layer ranges must fit. Texture bindings must match the view
+dimension, sample type and texture-binding usage.
+
+`WriteTexture` (opcode 4) already carries origin Z and copy depth/layer count.
+Array-layer counts stay constant across mips; 3D depth shrinks with each mip.
+Upload strides must cover every row/image, including intermediate padding;
+the byte range may end at the last texel of the final row. R8 copies use one
+byte per texel, color RGBA/BGRA copies four. Depth uploads are not supported.
+The 16 MiB per-tick inline-upload budget is unchanged.
+
+The native backend also charges the backend's aligned staging row span,
+including gaps between array layers or volume slices, against that budget.
+Short final rows are padded before the backend copy; a small inline payload
+does not authorize an unbounded staging allocation.
+
+Texture quota accounting conservatively reserves four bytes per texel,
+including R8, across every layer and mip. The 256 MiB live texture limit
+and per-batch allocation budget, and the 512-texture limit, apply to the
+expanded dimensions. A selected array layer or cube face may be rendered
+through a single-mip 2D view with render-attachment usage; cube/array/3D views
+are not themselves render attachments.
+
+#### Stencil and depth bias
+
+Wire version 1 has a second additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `1` (value `2`) advertises
+it. Guests MUST check the bit before using any of the following; an absent
+bit does not grant support.
+
+- Texture format `8` is `Depth24PlusStencil8`. It follows every depth-format
+  rule: no uploads, no 3D textures, four quota bytes per texel. A render
+  attachment view of it uses aspect `1` (all); a sampled view uses aspect `2`
+  (depth only) and binds as depth or unfilterable float.
+- `BeginRenderPass` (opcode 12) keeps its 36-byte payload: color view,
+  depth view, surface generation, flags, clear RGBA and clear depth. Flags
+  `16` (stencil load), `32` (stencil store) and `64` (stencil clear value)
+  join color load `1`, color store `2`, depth load `4` and depth store `8`.
+  Flag `64` appends a `u32` stencil clear value at offset 36 (payload 40
+  bytes), at most 255. Without flag `16` the stencil aspect is cleared to
+  that value, or to 0 without flag `64`; flags `16` and `64` together are
+  invalid. Stencil flags require a depth attachment with a stencil aspect.
+  Other flag bits are invalid.
+- `CreateRenderPipeline` (opcode 10) flag `2` appends a 24-byte trailer
+  after the color targets. Other flag bits besides depth write `1` are
+  invalid.
+
+  ```text
+  offset  type   meaning
+  0       4 u8   front face: compare, fail op, depth-fail op, pass op
+  4       4 u8   back face: compare, fail op, depth-fail op, pass op
+  8       u8     stencil read mask
+  9       u8     stencil write mask
+  10      u16    zero
+  12      i32    constant depth bias
+  16      f32    depth bias slope scale
+  20      f32    depth bias clamp
+  ```
+
+  Compare functions use the depth-compare values. Stencil operations are
+  `1` keep, `2` zero, `3` replace, `4` invert, `5` increment-clamp,
+  `6` decrement-clamp, `7` increment-wrap, `8` decrement-wrap. The trailer
+  requires a depth format. A face other than compare always with keep
+  operations requires a stencil format. Point and line topologies require
+  all three bias values to be zero. Without the trailer the pipeline keeps
+  the WebGPU defaults: stencil always/keep, masks 0xFF, no bias.
+- `SetStencilReference` (opcode 30) carries one `u32` reference, at most
+  255, and is valid only inside a render pass. As in WebGPU, every pass
+  starts with reference 0.
+
+#### Blend constant
+
+Wire version 1 has a third additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `2` (value `4`) advertises
+it; an absent bit does not grant support.
+
+`SetBlendConstant` (opcode 31) carries the blend constant as four `f32`
+values, red, green, blue and alpha, in a 16-byte payload. Every value MUST be
+finite. The command is valid only inside a render pass and applies to draws
+recorded after it in that pass. As in WebGPU, every pass starts with constant
+`0, 0, 0, 0`. Blend factors `12` (constant) and `13` (one minus constant) read
+this value; without the extension they always see zero.
+
+#### Occlusion queries
+
+Wire version 1 has a fourth additive raster extension, available in both
+WebGPU profiles. `RasterFeatures` (key `22`) bit `3` (value `8`) advertises
+it; an absent bit does not grant support.
+
+- `BeginRenderPass` (opcode 12) flag `128` declares occlusion queries for the
+  pass. It appends a `u32` query count and a guest-chosen `u32` token after
+  the payload's other fields, including any stencil clear value (payload 44
+  bytes, or 48 with flag `64`). The count is nonzero, and the counts of all
+  passes in one batch total at most 4,096. Payloads without the flag keep
+  their existing layout.
+- `BeginOcclusionQuery` (opcode 32) carries one `u32` query index, below the
+  pass's count. `EndOcclusionQuery` (opcode 33) has an empty payload. Both are
+  valid only inside a render pass that declared queries. As in WebGPU, queries
+  do not nest, each index begins at most once per pass, an end needs an open
+  query, and the pass MUST NOT end while a query is open. A violation rejects
+  the batch.
+
+After the batch completes, the Host resolves each declaring pass and reads its
+results back without delaying the batch or later submissions. It delivers one
+event `9` (occlusion results) per declaring pass, after that batch's
+`submission complete` event, in submission order. The event header carries
+the batch sequence. Its payload is:
+
+```text
+offset  type      meaning
+0       u32       token from BeginRenderPass
+4       u32       query count N
+8       N x u64   samples that passed the depth and stencil tests, by index
+```
+
+Zero means no sample passed; an index the pass never began reports zero.
+Guests SHOULD treat any nonzero value as visible, because backends may report
+a conservative count rather than the exact number of samples. Results of a
+batch whose device is lost or reset, or of a stopped execution, are not
+delivered. Native Hosts receive outstanding results from
+`NativeGpuRenderer::poll_events` as well as from later `execute` calls.
+
+The browser backend retains at most 16,384 unresolved queries across 64
+readback passes. Admission includes readbacks still awaiting asynchronous
+mapping, not only submitted batches; exceeding either bound rejects the
+batch before GPU mutation. Completion or teardown releases the reservation.
+Reset, device loss and stop destroy pending readback buffers, and results
+from a retired device cannot delay or overwrite a replacement device's work.
+
 ### WebGPU submission
 
 ```text
@@ -202,7 +437,8 @@ Return values are defined by the selected WebGPU contract. ABI v1 reserves:
 host_gpu_receive(pointer: u32, capacity: u32) -> i32
 ```
 
-The call reads the oldest queued WebGPU event.
+The call reads the oldest queued WebGPU event. Occlusion results (event `9`)
+are described with the occlusion-query extension.
 
 ```text
 > 0  event bytes written
@@ -332,12 +568,13 @@ ABI v1 event types are:
 21  touch cancel
 ```
 
-Pointer button, position, and delta records are baseline optional input. An App
-does not list `pointer` in `deviceInput.requiredFeatures`: a Host with no
-pointer source simply emits no pointer records, and that absence is not a
-launch failure. Pointer capture is Host policy and is never selected by the
-manifest. The guest arms capture through the pointer-capture hostcall below,
-and the Host decides when an activation is eligible.
+Pointer movement and buttons, physical key transitions, committed text, IME,
+focus, wheel, and surface metrics are baseline application input. An App does
+not declare them in its manifest. A Host with no source for an optional input
+simply emits no records for it, and that absence is not a launch failure.
+Pointer capture is Host policy and is never selected by the manifest. The guest
+arms capture through the pointer-capture hostcall below, and the Host decides
+when an activation is eligible.
 
 Touch records use `code` as a Host-assigned contact ID and `x`/`y` as the
 physical-pixel position. An ID MUST remain stable from start through end or
@@ -400,8 +637,10 @@ host_input_cancel(handle: u32) -> u32
 
 `kind` and `media_type` are lowercase ASCII tokens using letters, digits,
 `-`, `.`, `_`, or `+`; each starts and ends with a letter or digit. Kinds are
-at most 32 bytes and media types at most 64 bytes. `max_bytes` is in
-`1..=1048576`. One execution may hold at most eight registrations. Repeating
+at most 32 bytes and media types at most 64 bytes. A media type is a
+kind-defined token, such as the UR type for `camera-ur`; it is not a MIME type. `max_bytes` is in
+`1..=1048576`. One execution may hold at most eight registrations, counting
+file registrations from `host_file_register`. Repeating
 an identical registration returns the existing positive handle. Registration
 otherwise returns:
 
@@ -412,10 +651,13 @@ otherwise returns:
 ```
 
 `host_input_trigger` returns 0 when accepted, 1 for an unknown handle, and 2
-while any registration is already active or the execution has exhausted its
-capture tokens. Acceptance means only that the Host will present its own
-consent and capture UI. The guest does not receive raw device frames and cannot
-bypass Host permission policy.
+while any registration is already active, undrained Host commands exhaust
+admission capacity, or device capture tokens are exhausted. Hosts reserve
+capacity for cancellation and teardown.
+Returning 2 does not release an existing selection; the guest may retry after
+the Host drains commands. Acceptance means only that the Host will present its
+own consent and capture UI. The guest does not receive raw device frames and
+cannot bypass Host permission policy.
 
 `host_input_status` returns:
 
@@ -440,17 +682,21 @@ the hostcall byte budget. A read with sufficient capacity charges the result
 length once; a size-only probe charges no transfer bytes.
 
 `host_input_cancel` returns 0 and tells the Host to stop capture for an active
-request, 1 for an unknown handle, or 2 when that handle is not active. Runtime
-teardown cancels every active request and releases every device stream.
+request, returns 0 and discards the result of a handle in status 3, 1 for an
+unknown handle, or 2 for any other state. Either success resets the
+registration to status 1. Runtime teardown cancels every active request and
+releases every device stream.
 
-The guest registration handle is reusable, but the Host-facing `handle` in
-`MediatedInputRequest`, `MediatedInputCommand::Cancel`, and browser
-`mediated-input-request` / `mediated-input-cancel` messages is an opaque capture
-token. The runtime allocates a fresh token in `1..=4294967295` for every accepted
-trigger, never wraps or reuses tokens, and refuses further triggers on
-exhaustion. Hosts MUST echo that token unchanged in completion messages and
-match cancellation against it, not against a guest registration or input kind.
-No worker message fields or guest hostcall signatures change.
+The guest registration handle is reusable, but the Host-facing `handle` in a
+device `MediatedInputRequest` and its `MediatedInputCommand::Cancel` (browser
+`mediated-input-request` / `mediated-input-cancel`) is an opaque capture token.
+The runtime allocates a fresh token in `2147483648..=4294967295` for every
+accepted device trigger, never wraps or reuses tokens, and refuses further
+device triggers on exhaustion. File interactions keep their positive-i32
+registration handles, disjoint from device capture tokens. Hosts MUST echo the
+issued handle unchanged in completion messages and match cancellation against
+it, not against an input kind or a guest device registration. No worker message
+fields or guest hostcall signatures change.
 
 A completion for an issued, retired token is discarded without affecting the
 current capture, including when a result crosses guest cancellation and the
@@ -464,9 +710,205 @@ demand-driven guest so it can observe the new status without polling.
 ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
 The Host owns camera access, QR recognition, UR fountain reconstruction, and
 type filtering; only the reconstructed UR CBOR bytes cross into guest memory.
-An App requiring this kind lists `"camera-ur"` in
-`deviceInput.requiredFeatures`. A conforming Host MUST reject launch when it
-cannot provide every required input feature.
+Apps discover `camera-ur` support through `host_input_register`. An unavailable
+kind returns `-2` from registration; it does not make the executable
+structurally incompatible.
+
+#### File input
+
+```text
+host_file_register(pointer: u32, length: u32) -> i32
+host_file_info(handle: u32, pointer: u32, capacity: u32) -> i32
+host_file_read(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
+host_file_cache_reset(handle: u32, size: u32) -> i32
+host_file_cache_write(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
+host_file_cache_commit(handle: u32) -> i32
+host_file_cache_read(handle: u32, offset: u32, pointer: u32, length: u32) -> i32
+```
+
+`host_file_register` registers one file handler described by a UTF-8 JSON
+object of at most 4 KiB:
+
+```json
+{
+  "id": "snes-rom",
+  "label": "SNES cartridge image",
+  "extensions": [".sfc", ".smc", ".swc", ".fig"],
+  "maxBytes": 16777216,
+  "delivery": "relaunch",
+  "mountPath": "game/cartridge.sfc"
+}
+```
+
+- `id` is 1 to 64 bytes of lowercase letters, digits, and `-`, starting and
+  ending with a letter or digit, and is unique within the execution.
+- `label` is 1 to 80 UTF-8 bytes shown in Host UI.
+- `extensions` holds at most 16 unique values of `.` followed by 1 to 16
+  lowercase letters or digits.
+- `mimeTypes` holds at most 16 unique lowercase `type/subtype` values of at
+  most 127 bytes, each part using letters, digits, and `!#$&^_.+-`. Wildcards
+  and parameters are invalid.
+- At least one of `extensions` or `mimeTypes` is non-empty.
+- `delivery` is `inline`, `relaunch`, or `stream`.
+- `maxBytes` is an integer in `1..=8388608` for `inline`,
+  `1..=134217728` for `relaunch`, and `1..=4294967295` for `stream`.
+- `mountPath` is present only for `relaunch`. It is an archive-relative UTF-8
+  path of at most 1,024 bytes with no empty, `.`, or `..` segment, no leading
+  `/`, no `\`, and no control character. It differs from `runtime.entrypoint`
+  and from every other relaunch registration of the execution.
+
+The descriptor MUST NOT contain unknown fields or duplicate keys, and every
+number is an integer. Rejecting unknown fields means a guest cannot probe for a
+field a Host does not implement; a new field requires a new descriptor shape.
+
+The call returns a positive handle shared with mediated input, so
+`host_input_trigger`, `host_input_status`, `host_input_read`, and
+`host_input_cancel` apply unchanged. Registering a descriptor equal after
+parsing to an existing one returns the existing handle; `extensions` and
+`mimeTypes` compare as ordered lists. Registration otherwise
+returns:
+
+```text
+-1  malformed descriptor, guest range, or an existing id with a different
+    descriptor
+-2  file input unavailable for this execution
+-3  registration quota exhausted
+-4  delivery mode unavailable for this execution
+```
+
+A file reaches the guest only through Host UI: a picker opened by
+`host_input_trigger`, a Host menu entry, or a file the user brings to the App,
+such as by dropping it on the surface, opening it from a share sheet, or
+choosing the App in an open-with chooser. The user's selection is the consent.
+The Host activates only an idle registration, one in status 1, 4, 5, or 6
+while no other registration is active. When a file matches several
+registrations, the user chooses among them; the Host never picks silently. A
+file that matches no registration is refused in Host UI and does not change any
+status. The Host rejects an empty matched file or one above `maxBytes` and reports
+status 6 without exposing any bytes. A dismissed picker reports status 4. Every status
+change is an external event and wakes a guest that imports
+`host_update_after`. While the execution is paused or backgrounded, the change
+is retained and observed by the next executed update; it does not start one.
+
+Extension and MIME-type matching selects a registration; it does not validate
+the contents. The guest MUST treat the bytes as untrusted input.
+
+While status is 3, `host_file_info` writes a UTF-8 JSON object describing the
+selected file:
+
+```json
+{ "name": "Example Game.sfc", "mimeType": "", "size": 1048576 }
+```
+
+`name` is the base name the Host received, with any path removed and control
+characters replaced; it is 1 to 1,024 bytes, and a file whose name is empty
+after sanitizing is rejected. `mimeType` is the lowercase `type/subtype` the
+Host resolved, without parameters, or empty when it has none. The call returns the written byte length, the negated required length
+when `capacity` is too small, zero when no file is selected, or `-1` for an
+unknown handle or invalid guest range.
+
+For `inline` delivery, the selected file becomes a status 3 result read with
+`host_input_read`. The read counts against the per-update Host-call byte
+budget.
+
+For `stream` delivery, the Host retains a disk-backed source rather than copying
+the file into guest memory or the asset archive. `host_file_read` synchronously
+copies at most 65,536 bytes from the selected file, starting at `offset`, into
+writable guest memory at `pointer`. `length` MUST be in `1..=65536`. The result
+is the number of bytes copied, limited by the remaining file length; at EOF it
+is zero. The call returns:
+
+```text
+-1  unknown handle, non-stream handler, or no selected source
+-2  invalid length or offset beyond the selected file size
+-3  destination is not a writable guest range
+-4  source I/O failure or short read
+```
+
+The Host validates the destination before performing I/O and charges the
+existing Host-call and byte budgets. Invalid requests leave the selection
+unchanged. Successful reads retain status 3 and metadata; `host_input_read`
+returns zero without acknowledging a stream. `host_input_cancel` releases the
+source, clears metadata, and returns the registration to status 1. Opening a
+new picker also releases the old source. An I/O failure releases the source,
+clears metadata, and reports status 6. Stopping the execution releases all
+selected sources. A refused replacement MUST NOT release the existing source.
+
+Native Hosts can supply `LocalFileSource` around an already user-selected file.
+Browser Hosts advertise stream support only from workers with `FileReaderSync`,
+retain the selected `File`/`Blob`, and read bounded slices there. File paths,
+private source tokens, and arbitrary filesystem access are not guest APIs.
+
+A Host MAY attach a private, disk-backed working cache to a selected stream.
+This stores derived bytes without changing the original selection, its metadata,
+or the asset archive. It is session scratch, not a persistent save or arbitrary
+filesystem API. No guest-chosen path or manifest capability is involved.
+
+- `host_file_cache_reset` reserves `size` bytes, truncates previous contents,
+  and starts an unsealed cache with write cursor zero. Size MUST be nonzero;
+  aggregate reservations across the execution MUST NOT exceed 536,870,912 bytes.
+  Invalid size or quota requests preserve the previous cache.
+- `host_file_cache_write` copies `1..=65536` guest bytes to the exact current
+  write cursor, advancing it by the returned byte count. Sparse, out-of-order,
+  over-length, and sealed writes are rejected.
+- `host_file_cache_commit` requires every declared byte to have been written.
+  It flushes and seals the cache. Reset and commit return zero on success.
+- `host_file_cache_read` reads only sealed caches, with the same bounded reads,
+  EOF clamping, guest-memory validation, and budget charging as `host_file_read`.
+
+Cache calls return `-1` for an unavailable cache (including unsealed reads),
+`-2` for invalid state, range, size, or quota, `-3` for invalid guest memory,
+and `-4` for backend I/O or short transfers. Backend failure drops the derived
+cache without changing the Ready original source. Its reservation remains
+charged until the backend has released the storage; asynchronous deletion MUST
+NOT allow overlapping retired and live caches to exceed the aggregate quota.
+Guest memory is validated before disk I/O. Cancel, picker reopen, replacement
+after release, and execution stop (including a fatal guest trap or exhausted
+gas budget) close both source and cache; refused candidates MUST NOT disturb
+the existing selection.
+
+Native `send_file_stream` accepts an optional `Box<dyn FileCache>`;
+`LocalFileCache::new` creates private scratch in a Host-selected directory,
+immediately unlinked on Unix and removed on drop elsewhere. Browser start
+messages opt in with `fileCache: true`, requiring streamed-file support.
+Workers use OPFS synchronous access handles by default; trusted embedders may
+supply `createPolkaVmRuntime(endpoint, { createFileCache })`. The asynchronous,
+zero-argument factory returns a backend implementing `size`, `reset`, `write`,
+`read`, `flush`, and `close`. Guest calls remain synchronous. Cache opening is
+bounded and completed before Ready delivery; stale candidates are closed.
+Normal browser termination waits for queued close/deletion operations and
+reports failures with an error and `terminated.cleanupFailed: true`. A hard
+worker or browser-process kill can leave origin-private scratch behind.
+
+For `relaunch` delivery, the Host stops the execution and starts a fresh
+execution of the same App. A Host MUST obtain confirmation before stopping an
+execution the user is interacting with. In the fresh execution,
+`host_asset_read` at `mountPath` returns the selected file in place of any
+archive asset at that path. The fresh execution starts with no registrations
+and registers its handlers again during `init`. A handler registered with the
+same `id`, `delivery`, and `mountPath` and a `maxBytes` no smaller than the
+file reports status 3, and `host_file_info` describes the mounted file until the
+guest acknowledges it; any other re-registration stays at status 1 while the
+file remains mounted. For a relaunch handle, `host_input_read` writes nothing,
+returns zero, and acknowledges the file, as does `host_input_cancel`; both
+reset the registration to status 1. Whether a later launch
+reuses the selection is Host policy; a Host SHOULD offer to reopen the last
+file.
+
+The Host retains the most recent non-empty set of registrations until a later
+execution of the App registers a handler, so it can offer to choose another
+file after an execution fails, including one that fails during `init`.
+
+When a file is opened with an App that is not running, the Host launches the
+App holding the file and delivers it to the first registration that matches it.
+A `relaunch` match causes one immediate relaunch with the file mounted.
+
+ABI v1 delivers one file per selection. Multi-file inputs, such as a disc image
+with its cue sheet, are outside this ABI.
+
+Mobile platform pickers filter by system type rather than extension. A Host MAY
+present an unfiltered picker and match the extension afterwards, and Apps
+SHOULD list `mimeTypes` wherever the format has a registered type.
 
 ### Pointer capture
 
@@ -681,9 +1123,11 @@ bit 2  rotation is emulated from pointer movement
 All numeric fields MUST be finite. Pointer emulation sets alpha and all
 acceleration fields to zero, fills beta and gamma, and sets bits 1 and 2.
 
-An application that cannot operate without motion lists `"motion"` in
-`deviceInput.requiredFeatures`. An application with pointer or keyboard
-fallback does not require motion and MUST handle `-1` and `-2`.
+Importing `host_motion_read` declares runtime intent to use motion, not a
+manifest requirement. A Host that provides physical motion MUST authorize it
+only while the execution is in the foreground and MUST stop physical sensor
+acquisition when the execution loses the foreground, closes, or loses
+authorization. The application MUST handle `-1` and `-2`.
 
 ### Time
 
@@ -692,12 +1136,43 @@ host_time_ms() -> u64
 host_sleep_ms(duration_ms: u32) -> ()
 ```
 
+Applications may also use the versioned `host.core` clock and entropy operations:
+
+```text
+polkadot_host_0_1_core_clock_monotonic(destination: u32) -> i32
+polkadot_host_0_1_core_clock_wall(destination: u32) -> i32
+polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
+```
+
+The clock operations write a little-endian `u64` nanosecond value and return
+zero. The monotonic clock is scoped to the execution; the wall clock is Unix
+time. `core_random` fills exactly the requested bytes, at most 4 KiB, from the
+Host CSPRNG. It returns `-3` for an empty request, `-5` when secure entropy is
+unavailable, and `-6` above the per-call limit. A failed entropy request does
+not write the guest destination. Invalid writable guest ranges fail the
+execution. These imports do not opt the application into the separate
+application-computer lifecycle.
+
 `host_time_ms` returns a monotonic millisecond clock scoped to the execution.
 It is not wall-clock time.
 
 `host_sleep_ms` yields or advances runtime time by no more than the remaining
 sleep allowance for the current call. A Host MAY return earlier than the
 requested duration.
+
+### Random
+
+```text
+host_random_fill(destination: u32, length: u32) -> u32
+```
+
+The Host fills the requested guest range from a CSPRNG. Random bytes are
+independent for every execution and MUST NOT be derived from `host_time_ms`.
+
+```text
+0  accepted
+1  zero length, over the per-call limit, or execution pool exhausted
+```
 
 ### Audio
 
@@ -728,13 +1203,16 @@ host_asset_read(
 ) -> u32
 ```
 
-The asset name is UTF-8 and relative to the verified application archive. The
+The asset name is UTF-8 and relative to the application archive. The
 Host writes at most `capacity` bytes starting at `offset` and returns the
 number written.
 
 Zero means the name was invalid, the asset was absent, or the offset was at or
 past the end of the asset. Assets are immutable for the lifetime of one
-execution.
+execution. Assets come from the verified archive, except that a file delivered
+through a relaunch registration replaces the asset at that registration's mount
+path. That file is untrusted user input, and it counts toward the asset bounds
+below.
 
 ### Save data
 
@@ -785,6 +1263,8 @@ audio samples per submission          96,000
 queued audio                           2 seconds
 queued input events                   4,096
 save data                             1 MiB
+random bytes per call                 4 KiB
+random bytes per execution            64 KiB
 one log                               4 KiB
 queued logs                           64
 queued GPU batches                    4
@@ -808,7 +1288,8 @@ Host stops the execution on an unhandled guest trap, gas exhaustion, invalid
 memory access, unrecoverable profile error, or Host transport failure.
 
 The Host may stop an execution when its App surface closes, the Product is
-replaced, or platform lifecycle policy requires termination. ABI v1 does not
+replaced, the user selects a file for a relaunch registration, or platform
+lifecycle policy requires termination. ABI v1 does not
 promise transparent restoration of guest memory or graphics resources after a
 stop.
 
@@ -843,6 +1324,8 @@ results covering:
 - save submission;
 - bounded logging;
 - host-frame request/response round trips and queue bounds;
+- file registration bounds, file info, inline delivery, and relaunch delivery
+  through assets;
 - graphics-profile enforcement;
 - demand-driven update deadlines, idle suspension, and external-event wakes.
 

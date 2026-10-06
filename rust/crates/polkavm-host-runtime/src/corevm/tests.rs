@@ -163,3 +163,239 @@ fn epoca_mouse_backlog_keeps_only_the_latest_frame_delta() {
     assert_eq!(events.pop_front(), Some(key.encode()));
     assert_eq!(events.pop_front(), Some(latest.encode()));
 }
+
+mod vector_io {
+    use super::*;
+    use polkavm_common::abi::MemoryMapBuilder;
+
+    const MEMORY_BYTES: u32 = 64 * 1024;
+    const IOV_OFFSET: u32 = 64;
+    const OUTPUT_OFFSET: u32 = 512;
+
+    fn memory_address() -> u32 {
+        MemoryMapBuilder::new(MEMORY_BYTES)
+            .rw_data_size(MEMORY_BYTES)
+            .stack_size(4 * 1024)
+            .build()
+            .unwrap()
+            .rw_data_address()
+    }
+
+    // Every result comes from an executing guest's syscall followed by pvm_yield.
+    // File opening, seeking, and reading all go through that same guest ABI.
+    fn guest(vectors: &[(u32, u64, u64)], calls: &[[u64; 4]], file: &[u8]) -> Vm {
+        let mut data = vec![0xcc; MEMORY_BYTES as usize];
+        data[..10].copy_from_slice(b"input.bin\0");
+        data[OUTPUT_OFFSET as usize..OUTPUT_OFFSET as usize + 2].copy_from_slice(b"ok");
+        for &(offset, address, length) in vectors {
+            let offset = offset as usize;
+            data[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+            if offset + 16 <= data.len() {
+                data[offset + 8..offset + 16].copy_from_slice(&length.to_le_bytes());
+            }
+        }
+        let mut code = Vec::new();
+        let open = [SYS_openat, AT_FDCWD, memory_address() as u64, 0];
+        for args in core::iter::once(&open).chain(calls) {
+            for (&register, &value) in [Reg::A0, Reg::A1, Reg::A2, Reg::A3].iter().zip(args) {
+                code.push(asm::load_imm(register, value as i32));
+            }
+            code.push(asm::ecalli(0));
+            code.push(asm::ecalli(1));
+        }
+        code.push(asm::ret());
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest64);
+        builder.set_rw_data_size(MEMORY_BYTES);
+        builder.set_rw_data(data);
+        builder.set_stack_size(4 * 1024);
+        builder.add_import(b"pvm_syscall");
+        builder.add_import(b"pvm_yield");
+        builder.add_export_by_basic_block(0, b"_pvm_start");
+        builder.set_code(&code, &[]);
+        let blob = ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap();
+        let mut vm = Vm::from_blob(blob, polkavm::BackendKind::Interpreter).unwrap();
+        vm.register_file("input.bin", file.to_vec());
+        vm.setup(ComputerContext::default()).unwrap();
+        vm.set_gas(1_000_000);
+        assert_eq!(result(&mut vm), 3);
+        vm
+    }
+
+    fn result(vm: &mut Vm) -> i32 {
+        assert!(matches!(vm.run().unwrap(), Interruption::Yield));
+        vm.instance.reg(Reg::A0) as i32
+    }
+
+    fn output(vm: &mut Vm, offset: u32, length: u32) -> Vec<u8> {
+        vm.instance
+            .read_memory(memory_address() + offset, length)
+            .unwrap()
+    }
+
+    #[test]
+    fn readv_preserves_progress_and_file_position_after_later_faults() {
+        let base = memory_address() as u64;
+        // Missing descriptor, missing length field, unmapped buffer, and a
+        // non-canonical buffer must all preserve the completed first vector.
+        for (offset, bad_buffer) in [
+            (MEMORY_BYTES - 16, 0),
+            (MEMORY_BYTES - 24, 0),
+            (IOV_OFFSET, 0),
+            (IOV_OFFSET, (1_u64 << 32) + base + OUTPUT_OFFSET as u64),
+        ] {
+            let mut vectors = vec![(offset, base + OUTPUT_OFFSET as u64, 2)];
+            if offset + 16 < MEMORY_BYTES {
+                vectors.push((offset + 16, bad_buffer, 2));
+            }
+            let mut vm = guest(
+                &vectors,
+                &[
+                    [SYS_readv, 3, base + offset as u64, 2],
+                    [SYS_lseek, 3, 0, SEEK_CUR],
+                    [SYS_read, 3, base + OUTPUT_OFFSET as u64 + 16, 5],
+                ],
+                &[1, 2, 3, 4, 5],
+            );
+            assert_eq!(result(&mut vm), 2);
+            assert_eq!(output(&mut vm, OUTPUT_OFFSET, 3), [1, 2, 0xcc]);
+            assert_eq!(result(&mut vm), 2);
+            assert_eq!(result(&mut vm), 3);
+            assert_eq!(output(&mut vm, OUTPUT_OFFSET + 16, 4), [3, 4, 5, 0xcc]);
+        }
+    }
+
+    #[test]
+    fn readv_returns_efault_without_consuming_file_when_nothing_was_read() {
+        let base = memory_address() as u64;
+        for offset in [MEMORY_BYTES, MEMORY_BYTES - 8, IOV_OFFSET] {
+            let vectors = if offset == MEMORY_BYTES {
+                vec![]
+            } else {
+                vec![(offset, 0, 1)]
+            };
+            let mut vm = guest(
+                &vectors,
+                &[
+                    [SYS_readv, 3, base + offset as u64, 1],
+                    [SYS_lseek, 3, 0, SEEK_CUR],
+                    [SYS_read, 3, base + OUTPUT_OFFSET as u64, 3],
+                ],
+                &[1, 2, 3],
+            );
+            assert_eq!(result(&mut vm), -(EFAULT as i32));
+            assert_eq!(result(&mut vm), 0);
+            assert_eq!(result(&mut vm), 3);
+            assert_eq!(output(&mut vm, OUTPUT_OFFSET, 3), [1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn readv_zero_length_does_not_hide_the_next_error() {
+        let base = memory_address() as u64;
+        let mut vm = guest(
+            &[
+                (IOV_OFFSET, base + OUTPUT_OFFSET as u64, 0),
+                (IOV_OFFSET + 16, 0, 1),
+            ],
+            &[
+                [SYS_readv, 3, base + IOV_OFFSET as u64, 2],
+                [SYS_read, 3, base + OUTPUT_OFFSET as u64, 3],
+            ],
+            &[1, 2, 3],
+        );
+        assert_eq!(result(&mut vm), -(EFAULT as i32));
+        assert_eq!(result(&mut vm), 3);
+        assert_eq!(output(&mut vm, OUTPUT_OFFSET, 3), [1, 2, 3]);
+    }
+
+    #[test]
+    fn readv_stops_at_short_reads_and_returns_zero_at_eof() {
+        let base = memory_address() as u64;
+        let mut vm = guest(
+            &[
+                (IOV_OFFSET, base + OUTPUT_OFFSET as u64, 2),
+                (IOV_OFFSET + 16, base + OUTPUT_OFFSET as u64 + 4, 6),
+                (IOV_OFFSET + 32, 0, 1),
+            ],
+            &[
+                [SYS_readv, 3, base + IOV_OFFSET as u64, 3],
+                [SYS_readv, 3, base + IOV_OFFSET as u64, 3],
+                [SYS_lseek, 3, 0, SEEK_CUR],
+            ],
+            &[1, 2, 3, 4, 5],
+        );
+        assert_eq!(result(&mut vm), 5);
+        assert_eq!(
+            output(&mut vm, OUTPUT_OFFSET, 8),
+            [1, 2, 0xcc, 0xcc, 3, 4, 5, 0xcc]
+        );
+        assert_eq!(result(&mut vm), 0);
+        assert_eq!(result(&mut vm), 5);
+    }
+
+    #[test]
+    fn writev_preserves_progress_after_later_descriptor_and_buffer_faults() {
+        let base = memory_address() as u64;
+        for (offset, bad_buffer) in [
+            (MEMORY_BYTES - 16, 0),
+            (MEMORY_BYTES - 24, 0),
+            (IOV_OFFSET, 0),
+            (IOV_OFFSET, (1_u64 << 32) + base + OUTPUT_OFFSET as u64),
+        ] {
+            let mut vectors = vec![(offset, base + OUTPUT_OFFSET as u64, 2)];
+            if offset + 16 < MEMORY_BYTES {
+                vectors.push((offset + 16, bad_buffer, 2));
+            }
+            let mut vm = guest(
+                &vectors,
+                &[
+                    [SYS_writev, FILENO_STDOUT, base + offset as u64, 2],
+                    [SYS_writev, FILENO_STDERR, base + offset as u64, 1],
+                ],
+                &[],
+            );
+            assert_eq!(result(&mut vm), 2);
+            assert_eq!(result(&mut vm), 2);
+        }
+    }
+
+    #[test]
+    fn writev_returns_efault_without_progress_and_ebadf_for_invalid_fd() {
+        let base = memory_address() as u64;
+        let mut vm = guest(
+            &[
+                (IOV_OFFSET, base + OUTPUT_OFFSET as u64, 0),
+                (IOV_OFFSET + 16, 0, 1),
+            ],
+            &[
+                [SYS_writev, FILENO_STDOUT, base + MEMORY_BYTES as u64, 1],
+                [SYS_writev, FILENO_STDERR, base + MEMORY_BYTES as u64 - 8, 1],
+                [SYS_writev, FILENO_STDOUT, base + IOV_OFFSET as u64, 2],
+                [SYS_writev, 3, base + IOV_OFFSET as u64, 1],
+            ],
+            &[],
+        );
+        assert_eq!(result(&mut vm), -(EFAULT as i32));
+        assert_eq!(result(&mut vm), -(EFAULT as i32));
+        assert_eq!(result(&mut vm), -(EFAULT as i32));
+        assert_eq!(result(&mut vm), -(EBADF as i32));
+    }
+
+    #[test]
+    fn writev_stops_after_the_host_transfer_limit_short_write() {
+        let base = memory_address() as u64;
+        let mut vm = guest(
+            &[
+                (
+                    IOV_OFFSET,
+                    base + OUTPUT_OFFSET as u64,
+                    MAX_GUEST_WRITE_BYTES + 1,
+                ),
+                (IOV_OFFSET + 16, base + OUTPUT_OFFSET as u64, 1),
+            ],
+            &[[SYS_writev, FILENO_STDOUT, base + IOV_OFFSET as u64, 2]],
+            &[],
+        );
+        assert_eq!(result(&mut vm), MAX_GUEST_WRITE_BYTES as i32);
+    }
+}

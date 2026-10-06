@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use crate::file_input::{self, FileDescriptor};
 use crate::PresentationProfile;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -18,11 +19,30 @@ pub struct AppDescriptor {
     pub presentation: PresentationProfile,
     /// Whether the application may submit audio.
     pub audio_enabled: bool,
-    /// Required device-input features.
-    pub input_features: Vec<String>,
     /// Required WebGPU limits, empty for other profiles.
     pub gpu_limits: BTreeMap<String, u64>,
+    /// Advisory `fileTypes` hint; it grants nothing.
+    pub file_types: Vec<FileTypeHint>,
 }
+
+/// One advisory `fileTypes` entry naming files the App opens.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FileTypeHint {
+    /// User-facing description of the suggested file type.
+    pub label: String,
+    /// Lowercase filename extensions including their leading dots.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Lowercase MIME types associated with the suggested file type.
+    #[serde(default)]
+    pub mime_types: Vec<String>,
+    /// The runtime registration `id` for these files.
+    #[serde(default, deserialize_with = "crate::file_input::present_string")]
+    pub handler: Option<String>,
+}
+
+const MAX_FILE_TYPE_HINTS: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +54,8 @@ struct Manifest {
     app_version: Vec<u32>,
     runtime: Runtime,
     capabilities: Capabilities,
+    #[serde(rename = "fileTypes", default)]
+    file_types: Vec<FileTypeHint>,
 }
 
 #[derive(Deserialize)]
@@ -49,8 +71,6 @@ struct Runtime {
 #[serde(deny_unknown_fields)]
 struct Capabilities {
     graphics: Graphics,
-    #[serde(rename = "deviceInput")]
-    device_input: Option<DeviceInput>,
     audio: Option<Audio>,
 }
 
@@ -64,15 +84,6 @@ struct Graphics {
     required_features: Vec<String>,
     #[serde(rename = "requiredLimits", default)]
     required_limits: BTreeMap<String, u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceInput {
-    #[serde(rename = "abiVersion")]
-    abi_version: u32,
-    #[serde(rename = "requiredFeatures", default)]
-    required_features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,23 +156,6 @@ impl AppDescriptor {
         } else if !gpu_limits.is_empty() {
             bail!("non-WebGPU graphics profile declares required limits");
         }
-        let input_features = if let Some(input) = manifest.capabilities.device_input {
-            if input.abi_version != 1 {
-                bail!("device input capability must use ABI version 1");
-            }
-            for feature in &input.required_features {
-                if feature != "pointer"
-                    && feature != "keyboard"
-                    && feature != "motion"
-                    && feature != "camera-ur"
-                {
-                    bail!("unsupported device input feature {feature}");
-                }
-            }
-            input.required_features
-        } else {
-            Vec::new()
-        };
         let audio_enabled = if let Some(audio) = manifest.capabilities.audio {
             if audio.abi_version != 1 || !audio.required_features.is_empty() {
                 bail!("audio capability requires unsupported features or ABI");
@@ -170,14 +164,26 @@ impl AppDescriptor {
         } else {
             false
         };
+        if manifest.file_types.len() > MAX_FILE_TYPE_HINTS
+            || !manifest.file_types.iter().all(FileTypeHint::is_valid)
+        {
+            bail!("invalid fileTypes hint");
+        }
         Ok(Self {
             app_version: manifest.app_version,
             program_path: manifest.runtime.entrypoint,
             presentation,
             audio_enabled,
-            input_features,
             gpu_limits,
+            file_types: manifest.file_types,
         })
+    }
+}
+
+impl FileTypeHint {
+    fn is_valid(&self) -> bool {
+        FileDescriptor::valid_type_filter(&self.label, &self.extensions, &self.mime_types)
+            && self.handler.as_deref().is_none_or(file_input::valid_id)
     }
 }
 
@@ -200,29 +206,30 @@ mod tests {
     use super::AppDescriptor;
     use crate::PresentationProfile;
 
-    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","keyboard"]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
-    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"deviceInput":{"abiVersion":1},"audio":{"abiVersion":1}}}"#;
-    const MOTION: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["pointer","motion"]}}}"#;
-    const CAMERA_UR: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d","requiredFeatures":[]},"deviceInput":{"abiVersion":1,"requiredFeatures":["keyboard","camera-ur"]}}}"#;
+    const FRAMEBUFFER: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer","requiredFeatures":[]},"audio":{"abiVersion":1,"requiredFeatures":[]}}}"#;
+    const MINIMAL: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"tri2d"},"audio":{"abiVersion":1}}}"#;
+
+    const FILE_INPUT: &[u8] = br#"{"$v":2,"kind":"app","appVersion":[1,2,3],"runtime":{"kind":"polkavm","abiVersion":1,"entrypoint":"app.polkavm"},"capabilities":{"graphics":{"abiVersion":1,"profile":"framebuffer"},"fileInput":{"abiVersion":1,"handlers":[{"id":"snes-rom","label":"SNES cartridge image","extensions":[".sfc",".smc"],"mediaTypes":["application/x-snes-rom"],"maxBytes":16777216,"mountPath":"game/cartridge.sfc"}]}}}"#;
+
+    #[test]
+    fn rejects_removed_manifest_file_input_capability() {
+        assert!(AppDescriptor::parse_exact(FILE_INPUT, FILE_INPUT).is_err());
+    }
 
     #[test]
     fn omitted_required_features_default_to_empty() {
         let descriptor = AppDescriptor::parse_exact(MINIMAL, MINIMAL).unwrap();
         assert_eq!(descriptor.presentation, PresentationProfile::Tri2d);
-        assert!(descriptor.input_features.is_empty());
         assert!(descriptor.audio_enabled);
     }
 
     #[test]
-    fn accepts_required_motion_input() {
-        let descriptor = AppDescriptor::parse_exact(MOTION, MOTION).unwrap();
-        assert_eq!(descriptor.input_features, ["pointer", "motion"]);
-    }
-
-    #[test]
-    fn accepts_required_camera_ur_input() {
-        let descriptor = AppDescriptor::parse_exact(CAMERA_UR, CAMERA_UR).unwrap();
-        assert_eq!(descriptor.input_features, ["keyboard", "camera-ur"]);
+    fn rejects_obsolete_device_input_capability() {
+        let obsolete = String::from_utf8(MINIMAL.to_vec()).unwrap().replace(
+            "\"audio\":{\"abiVersion\":1}",
+            "\"deviceInput\":{\"abiVersion\":1,\"requiredFeatures\":[\"keyboard\",\"text\"]},\"audio\":{\"abiVersion\":1}",
+        );
+        assert!(AppDescriptor::parse_exact(obsolete.as_bytes(), obsolete.as_bytes()).is_err());
     }
 
     #[test]
@@ -241,6 +248,41 @@ mod tests {
             .unwrap()
             .replace("\"abiVersion\":1", "\"abiVersion\":2");
         assert!(AppDescriptor::parse_exact(unknown.as_bytes(), unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn file_types_are_an_advisory_bounded_hint() {
+        let with_hint = |hint: &str| {
+            String::from_utf8(MINIMAL.to_vec()).unwrap().replace(
+                "\"kind\":\"app\"",
+                &format!("\"kind\":\"app\",\"fileTypes\":{hint}"),
+            )
+        };
+        let valid = with_hint(
+            r#"[{"label":"SNES cartridge image","extensions":[".sfc",".smc"],"handler":"snes-rom"},{"label":"Text","mimeTypes":["text/plain"]}]"#,
+        );
+        let descriptor = AppDescriptor::parse_exact(valid.as_bytes(), valid.as_bytes()).unwrap();
+        assert_eq!(descriptor.file_types.len(), 2);
+        assert_eq!(
+            descriptor.file_types[0].handler.as_deref(),
+            Some("snes-rom")
+        );
+        for invalid in [
+            r#"[{"label":"L"}]"#,
+            r#"[{"label":"L","extensions":[".x"],"handler":"Bad"}]"#,
+            r#"[{"label":"L","extensions":[".x"],"handler":null}]"#,
+            r#"[{"label":"L","extensions":[".x"],"delivery":"inline"}]"#,
+            r#"[{"label":"","extensions":[".x"]}]"#,
+        ] {
+            let manifest = with_hint(invalid);
+            assert!(
+                AppDescriptor::parse_exact(manifest.as_bytes(), manifest.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        let entry = r#"{"label":"L","extensions":[".x"]}"#;
+        let too_many = with_hint(&format!("[{}]", vec![entry; 17].join(",")));
+        assert!(AppDescriptor::parse_exact(too_many.as_bytes(), too_many.as_bytes()).is_err());
     }
 
     #[test]

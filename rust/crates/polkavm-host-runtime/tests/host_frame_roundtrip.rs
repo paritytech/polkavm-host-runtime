@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+//! Bounded request/response transport conformance on both execution backends.
+
 use polkavm::ProgramBlob;
 use polkavm_host_runtime::{BackendKind, PresentationProfile, Runtime};
 use std::collections::HashMap;

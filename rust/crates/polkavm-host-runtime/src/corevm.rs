@@ -13,8 +13,6 @@ use polkavm::{
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 
 struct File {
     blob: Vec<u8>,
@@ -69,10 +67,7 @@ pub struct Vm {
     motion: crate::MotionState,
     pointer_capture: crate::PointerCaptureState,
     update_after_ms: Option<u32>,
-    #[cfg(not(target_arch = "wasm32"))]
-    started: Instant,
-    #[cfg(target_arch = "wasm32")]
-    now_ms: u64,
+    clock: crate::HostClock,
     host_frame_requests: VecDeque<Vec<u8>>,
     host_frame_request_bytes: usize,
     host_frame_responses: VecDeque<Vec<u8>>,
@@ -508,10 +503,7 @@ impl Vm {
             motion: crate::MotionState::new(),
             pointer_capture: crate::PointerCaptureState::default(),
             update_after_ms: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            started: Instant::now(),
-            #[cfg(target_arch = "wasm32")]
-            now_ms: 0,
+            clock: crate::HostClock::new(),
             host_frame_requests: VecDeque::new(),
             host_frame_request_bytes: 0,
             host_frame_responses: VecDeque::new(),
@@ -545,18 +537,27 @@ impl Vm {
 
     #[cfg(target_arch = "wasm32")]
     pub fn set_time_ms(&mut self, time_ms: u64) {
-        self.now_ms = self.now_ms.max(time_ms);
+        self.clock.set_time_ms(time_ms);
     }
 
     fn time_ms(&self) -> u64 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.now_ms
-        }
+        self.clock.elapsed_ms()
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.clock.set_paused(paused);
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.started.elapsed().as_millis() as u64
-        }
+        self.computer.set_paused(paused);
+    }
+
+    pub(crate) fn pause_input(&mut self) {
+        self.input_events.retain(|event| {
+            event.value == 0
+                && event.key != crate::quake_keys::MOUSE_X
+                && event.key != crate::quake_keys::MOUSE_Y
+        });
+        self.epoca_input_events.retain(crate::input_survives_pause);
+        self.motion.consume();
     }
 
     pub fn set_motion_availability(
@@ -567,6 +568,9 @@ impl Vm {
     }
 
     pub fn send_motion_sample(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.clock.paused {
+            return Ok(());
+        }
         self.motion
             .set_sample(bytes)
             .map_err(|error| error.to_string())
@@ -644,6 +648,11 @@ impl Vm {
         self.host_frame_response_bytes += bytes.len();
         self.host_frame_responses.push_back(bytes);
         Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pending_host_frame_responses(&self) -> usize {
+        self.host_frame_responses.len()
     }
 
     pub(crate) fn clear_host_frame_queues(&mut self) {
@@ -753,6 +762,21 @@ impl Vm {
 
         log::trace!("  -> offset={}", fd.position);
         fd.position
+    }
+
+    fn read_iovec(&mut self, address: u64) -> Result<Option<(u64, u64)>, String> {
+        // The translated ABI wraps each descriptor-field address to 32 bits.
+        let result = self.instance.read_u64(address as u32).and_then(|buffer| {
+            self.instance
+                .read_u64(address.wrapping_add(8) as u32)
+                .map(|length| (buffer, length))
+        });
+        match result {
+            Ok(vector) => Ok(Some(vector)),
+            Err(MemoryAccessError::Error(error)) => Err(error.into()),
+            Err(MemoryAccessError::OutOfRangeAccess { .. })
+            | Err(MemoryAccessError::MemoryLimitReached) => Ok(None),
+        }
     }
 
     fn handle_read(&mut self, fd: u64, address: u64, length: u64) -> Result<u64, String> {
@@ -1126,6 +1150,9 @@ impl Vm {
                         continue;
                     }
                     let mut buffer = vec![0i16; sample_count];
+                    // SAFETY: i16 has no padding or invalid bit patterns. The initialized
+                    // allocation covers this bounded byte length and is uniquely borrowed.
+                    #[allow(unsafe_code)]
                     self.instance.read_memory_into(address, unsafe {
                         core::slice::from_raw_parts_mut(
                             buffer.as_mut_ptr().cast::<u8>(),
@@ -1147,6 +1174,9 @@ impl Vm {
                             continue;
                         }
                         let address = input_destination(address, written)?;
+                        // SAFETY: repr(C) InputEvent contains only two u8 fields, with
+                        // no padding. This byte view stays within the initialized slice.
+                        #[allow(unsafe_code)]
                         self.instance.write_memory(address, unsafe {
                             core::slice::from_raw_parts(
                                 events.as_ptr().cast::<u8>(),
@@ -1186,6 +1216,10 @@ impl Vm {
                     let address = u32::try_from(address)
                         .map_err(|_| "audio address is out of range".to_owned())?;
                     let mut buffer: Vec<i16> = Vec::with_capacity(length);
+                    // SAFETY: the bounded spare capacity covers `length` i16 values.
+                    // PolkaVM initializes the entire byte range on success; only then
+                    // is the length published. Every i16 bit pattern is valid.
+                    #[allow(unsafe_code)]
                     unsafe {
                         self.instance.read_memory_into(
                             address,
@@ -1228,14 +1262,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_read = self.handle_read(a1, address, length)?;
                                 if (bytes_read as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_read);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_read
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 
@@ -1258,14 +1307,29 @@ impl Vm {
 
                             let mut total_length = 0u64;
                             for n in 0..a3 {
-                                let address =
-                                    self.instance.read_u64(a2.wrapping_add(n * 16) as u32)?;
-                                let length = self
-                                    .instance
-                                    .read_u64(a2.wrapping_add(n * 16).wrapping_add(8) as u32)?;
+                                let Some((address, length)) =
+                                    self.read_iovec(a2.wrapping_add(n * 16))?
+                                else {
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            errno(EFAULT)
+                                        } else {
+                                            total_length
+                                        },
+                                    );
+                                    continue 'outer_loop;
+                                };
                                 let bytes_written = self.handle_write(a1, address, length)?;
                                 if (bytes_written as i64) < 0 {
-                                    self.instance.set_reg(Reg::A0, bytes_written);
+                                    self.instance.set_reg(
+                                        Reg::A0,
+                                        if total_length == 0 {
+                                            bytes_written
+                                        } else {
+                                            total_length
+                                        },
+                                    );
                                     continue 'outer_loop;
                                 }
 
