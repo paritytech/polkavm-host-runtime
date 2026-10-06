@@ -55,12 +55,13 @@ must regenerate their UniFFI bindings when updating to this API surface.
 
 Large browser guests use bounded groups of Wasm functions instead of one
 function per basic block, avoiding browser function-count limits while
-preserving gas accounting and hostcall resumption. Compilation first uses one
-module to keep calls local. If the browser exhausts native compilation capacity,
-the runtime retries with bounded code modules sharing guest memory, registers,
-and dispatch state before falling back to the interpreter. Cached compiled
-programs include the root and every code module; instantiation creates fresh
-guest state.
+preserving gas accounting and hostcall resumption. Long PolkaVM blocks split
+after 64 instructions, amortizing translated tail dispatch while keeping
+generated function bodies bounded. Compilation first uses one module to keep
+calls local. If the browser exhausts native compilation capacity, the runtime
+retries with bounded code modules sharing guest memory, registers, and dispatch
+state before falling back to the interpreter. Cached compiled programs include
+the root and every code module; instantiation creates fresh guest state.
 
 File handlers are runtime registrations on the mediated-input lifecycle
 (ABI v1 §File input). A Host declares the deliveries it serves with
