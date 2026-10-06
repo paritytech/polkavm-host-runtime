@@ -235,7 +235,12 @@ A guest MUST NOT treat `device lost` as fatal on its own. A Host that cannot
 rebuild the device emits no `device restored` and terminates the application
 through its ordinary lifecycle, which is the Host's decision to make, not a
 trap the guest raises. A Host MUST bound its rebuild attempts so a permanently
-broken adapter cannot loop.
+broken adapter cannot loop, including when replacement acquisition succeeds
+but the replacement immediately loses its device. The browser backend allows
+three acquisitions per recovery episode, delaying subsequent attempts by
+250 ms and 500 ms. A replacement surviving at least 30 seconds resets that
+budget on its next loss, so occasional independent resets do not impose a
+lifetime recovery ceiling.
 
 ### Host-frame transport
 
@@ -407,9 +412,10 @@ otherwise returns:
 ```
 
 `host_input_trigger` returns 0 when accepted, 1 for an unknown handle, and 2
-while any registration is already active. Acceptance means only that the Host
-will present its own consent and capture UI. The guest does not receive raw
-device frames and cannot bypass Host permission policy.
+while any registration is already active or the execution has exhausted its
+capture tokens. Acceptance means only that the Host will present its own
+consent and capture UI. The guest does not receive raw device frames and cannot
+bypass Host permission policy.
 
 `host_input_status` returns:
 
@@ -429,10 +435,31 @@ to status 1. Capacity smaller than the result returns the negated required
 length without consuming it. Other states and unknown handles return zero.
 The Host MUST reject empty results and results larger than the registration's
 bound before they become visible to the guest.
+Registration charges the combined kind and media-type lengths once against
+the hostcall byte budget. A read with sufficient capacity charges the result
+length once; a size-only probe charges no transfer bytes.
 
 `host_input_cancel` returns 0 and tells the Host to stop capture for an active
 request, 1 for an unknown handle, or 2 when that handle is not active. Runtime
 teardown cancels every active request and releases every device stream.
+
+The guest registration handle is reusable, but the Host-facing `handle` in
+`MediatedInputRequest`, `MediatedInputCommand::Cancel`, and browser
+`mediated-input-request` / `mediated-input-cancel` messages is an opaque capture
+token. The runtime allocates a fresh token in `1..=4294967295` for every accepted
+trigger, never wraps or reuses tokens, and refuses further triggers on
+exhaustion. Hosts MUST echo that token unchanged in completion messages and
+match cancellation against it, not against a guest registration or input kind.
+No worker message fields or guest hostcall signatures change.
+
+A completion for an issued, retired token is discarded without affecting the
+current capture, including when a result crosses guest cancellation and the
+same registration has already been re-armed. Unknown tokens and malformed
+terminal statuses or payloads remain errors: Ready requires nonempty bytes
+within the global input bound, and other terminal statuses require no bytes.
+The registered bound is additionally enforced for a live capture. No retired
+payload is stored or exposed to guest memory. An accepted completion wakes a
+demand-driven guest so it can observe the new status without polling.
 
 ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
 The Host owns camera access, QR recognition, UR fountain reconstruction, and

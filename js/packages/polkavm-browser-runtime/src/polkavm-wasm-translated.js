@@ -596,6 +596,7 @@
       this.mediatedInputKinds = new Set(mediatedInputKinds);
       this.mediatedInputRegistrations = new Map();
       this.nextMediatedInputHandle = 0;
+      this.nextMediatedInputRequestHandle = 0;
       this.activeMediatedInputHandle = null;
       this.tri2dSubmitted = false;
       this.uiSemanticsSubmitted = false;
@@ -969,12 +970,11 @@
     }
 
     sendMediatedInputResult(handle, status, bytes) {
-      const registration = this.mediatedInputRegistrations.get(handle);
       if (
         this.stopped ||
-        !registration ||
-        registration.status !== MEDIATED_INPUT_STATUS_ACTIVE ||
-        this.activeMediatedInputHandle !== handle ||
+        !Number.isInteger(handle) ||
+        handle <= 0 ||
+        handle > this.nextMediatedInputRequestHandle ||
         !Number.isInteger(status) ||
         ![
           MEDIATED_INPUT_STATUS_READY,
@@ -987,17 +987,28 @@
         throw new Error("invalid translated mediated-input result");
       }
       if (status === MEDIATED_INPUT_STATUS_READY) {
-        if (!bytes.byteLength || bytes.byteLength > registration.maxBytes) {
-          throw new Error("translated mediated-input result exceeds its registered bound");
+        if (!bytes.byteLength || bytes.byteLength > MAX_MEDIATED_INPUT_BYTES) {
+          throw new Error("translated mediated-input result exceeds its payload bound");
         }
-        registration.result = bytes.slice();
       } else if (bytes.byteLength) {
         throw new Error("translated mediated-input failure carries unexpected bytes");
-      } else {
-        registration.result = null;
       }
-      this.activeMediatedInputHandle = null;
-      registration.status = status;
+      for (const registration of this.mediatedInputRegistrations.values()) {
+        if (registration.requestHandle !== handle) {
+          continue;
+        }
+        if (bytes.byteLength > registration.maxBytes) {
+          throw new Error("translated mediated-input result exceeds its registered bound");
+        }
+        registration.result =
+          status === MEDIATED_INPUT_STATUS_READY ? bytes.slice() : null;
+        registration.requestHandle = null;
+        this.activeMediatedInputHandle = null;
+        registration.status = status;
+        return;
+      }
+      // Issued tokens are never reused, including when the guest re-arms the
+      // same registration. Retired completions cannot affect another capture.
     }
 
     #registerMediatedInput(kind, mediaType, maxBytes) {
@@ -1040,6 +1051,7 @@
         mediaType,
         maxBytes,
         status: MEDIATED_INPUT_STATUS_REGISTERED,
+        requestHandle: null,
         result: null,
       });
       return this.nextMediatedInputHandle;
@@ -1053,12 +1065,16 @@
       if (!registration) {
         return 1;
       }
+      if (this.nextMediatedInputRequestHandle === 0xffffffff) {
+        return 2;
+      }
+      registration.requestHandle = ++this.nextMediatedInputRequestHandle;
       registration.status = MEDIATED_INPUT_STATUS_ACTIVE;
       this.activeMediatedInputHandle = handle;
       registration.result = null;
       this.emit({
         type: "mediated-input-request",
-        handle,
+        handle: registration.requestHandle,
         kind: registration.kind,
         mediaType: registration.mediaType,
         maxBytes: registration.maxBytes,
@@ -1077,7 +1093,11 @@
       registration.status = MEDIATED_INPUT_STATUS_CANCELLED;
       registration.result = null;
       this.activeMediatedInputHandle = null;
-      this.emit({ type: "mediated-input-cancel", handle });
+      this.emit({
+        type: "mediated-input-cancel",
+        handle: registration.requestHandle,
+      });
+      registration.requestHandle = null;
       return 0;
     }
 
@@ -1496,10 +1516,10 @@
             this.#chargeBytes(kindLength + mediaTypeLength);
             try {
               const kind = strictDecoder.decode(
-                this.#read(this.#u32(a0), kindLength),
+                this.#range(this.#u32(a0), kindLength),
               );
               const mediaType = strictDecoder.decode(
-                this.#read(this.#u32(a2), mediaTypeLength),
+                this.#range(this.#u32(a2), mediaTypeLength),
               );
               result = this.#registerMediatedInput(
                 kind,
@@ -1544,7 +1564,6 @@
             this.#setReg(7, BigInt(-required));
             return false;
           }
-          this.#chargeBytes(required);
           this.#write(this.#u32(a1), registration.result);
           registration.result = null;
           registration.status = MEDIATED_INPUT_STATUS_REGISTERED;

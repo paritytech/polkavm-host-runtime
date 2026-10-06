@@ -941,9 +941,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       !pvm ||
       !Number.isInteger(handle) ||
       handle <= 0 ||
+      handle > 0xffffffff ||
       !Number.isInteger(status) ||
       status < 3 ||
-      status > 6
+      status > 6 ||
+      (status !== 3 && bytes.byteLength !== 0)
     ) {
       throw new Error("invalid PolkaVM browser mediated-input result");
     }
@@ -1086,6 +1088,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
           message.status,
           new Uint8Array(message.bytes),
         );
+        wake();
       } catch (error) {
         stopRuntime();
         postMessage({ type: "error", message: error.message });

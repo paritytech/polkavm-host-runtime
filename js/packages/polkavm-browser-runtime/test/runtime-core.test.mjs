@@ -602,7 +602,7 @@ test("host-frame response backpressure is retryable in both backends", async () 
   }
 });
 
-test("both browser backends deliver bounded mediated input", async () => {
+async function startMediatedInputRuntime(forceInterpreter, t) {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
   );
@@ -612,23 +612,36 @@ test("both browser backends deliver bounded mediated input", async () => {
       "rust/crates/polkavm-host-runtime/tests/fixtures/mediated-input.polkavm",
     ),
   );
-  const payload = new TextEncoder().encode("decoded-ur-cbor");
+  const result = endpoint();
+  t.after(() => {
+    if (!result.messages.some(message => message.type === "terminated")) {
+      result.receiver.onmessage({ data: { type: "stop" } });
+    }
+  });
+  result.receiver.onmessage({
+    data: {
+      type: "start",
+      runtime: bytesBuffer(runtime),
+      program: bytesBuffer(program),
+      assets: [],
+      graphicsProfile: "tri2d",
+      audioEnabled: false,
+      cacheKey: `mediated-input-${forceInterpreter}`,
+      mediatedInputKinds: ["camera-ur"],
+      forceInterpreter,
+    },
+  });
+  const ready = await waitForMessage(result.messages, "ready");
+  assert.equal(ready.backend, forceInterpreter ? "interpreter" : "compiler");
+  assert.equal(ready.usesUpdateScheduling, true);
+  await waitForStartupStage(result.messages, "first-update-completed");
+  return result;
+}
 
+test("both browser backends wake an idle guest for bounded mediated input", async (t) => {
+  const payload = new TextEncoder().encode("decoded-ur-cbor");
   for (const forceInterpreter of [false, true]) {
-    const { messages, receiver } = endpoint();
-    receiver.onmessage({
-      data: {
-        type: "start",
-        runtime: bytesBuffer(runtime),
-        program: bytesBuffer(program),
-        assets: [],
-        graphicsProfile: "tri2d",
-        audioEnabled: false,
-        cacheKey: `mediated-input-${forceInterpreter}`,
-        mediatedInputKinds: ["camera-ur"],
-        forceInterpreter,
-      },
-    });
+    const { messages, receiver } = await startMediatedInputRuntime(forceInterpreter, t);
 
     const request = await waitForMessage(messages, "mediated-input-request");
     assert.equal(request.kind, "camera-ur");
@@ -670,6 +683,121 @@ test("both browser backends deliver bounded mediated input", async () => {
 
     receiver.onmessage({ data: { type: "stop" } });
     await waitForMessage(messages, "terminated");
+  }
+});
+
+test("both browser backends discard a cancelled capture result after re-arming", async (t) => {
+  for (const forceInterpreter of [false, true]) {
+    const { messages, receiver } = await startMediatedInputRuntime(forceInterpreter, t);
+    try {
+      const first = await waitForMessage(messages, "mediated-input-request");
+      messages.length = 0;
+      receiver.onmessage({
+        data: { type: "input", bytes: bytesBuffer(pointerDelta(1, 0)) },
+      });
+      const cancel = await waitForMessage(messages, "mediated-input-cancel");
+      const second = await waitForMessage(messages, "mediated-input-request");
+      assert.equal(cancel.handle, first.handle);
+      assert.notEqual(second.handle, first.handle);
+      assert.equal(second.kind, first.kind);
+      receiver.onmessage({
+        data: {
+          type: "mediated-input-result",
+          handle: first.handle,
+          status: 3,
+          bytes: new Uint8Array([99]),
+        },
+      });
+      receiver.onmessage({
+        data: {
+          type: "mediated-input-result",
+          handle: second.handle,
+          status: 3,
+          bytes: new Uint8Array([42]),
+        },
+      });
+      const saved = await waitForMessage(messages, "save");
+      assert.deepEqual(new Uint8Array(saved.bytes), new Uint8Array([1, 0, 0, 0, 42]));
+      assert.equal(messages.some(message => message.type === "error"), false);
+      assert.equal(messages.some(message => message.type === "terminated"), false);
+    } finally {
+      receiver.onmessage({ data: { type: "stop" } });
+      await waitForMessage(messages, "terminated");
+    }
+  }
+});
+
+test("translated mediated input charges each byte once and rejects malformed or unknown completions", async (t) => {
+  const { messages, receiver } = await startMediatedInputRuntime(false, t);
+  const compiled = await waitForMessage(messages, "compiled");
+  receiver.onmessage({ data: { type: "stop" } });
+  await waitForMessage(messages, "terminated");
+  const outputs = [];
+  const translated = new globalThis.TranslatedPolkaVmRuntime(
+    compiled.module, [], output => outputs.push(output), 1_000_000,
+    false, "tri2d", null, 0, ["camera-ur"],
+  );
+  const budget = 32 * 1024 * 1024;
+  try {
+    translated.initialize();
+    assert.equal(
+      translated.hostcallBytes,
+      budget - new TextEncoder().encode("camera-urx-test-payload").byteLength - 12,
+      "registration reads plus the 12-byte save are charged once",
+    );
+    const first = outputs.find(output => output.type === "mediated-input-request");
+    const registration = translated.mediatedInputRegistrations.get(1);
+    translated.sendInput(pointerDelta(0, 0));
+    translated.update(1);
+    assert.equal(registration.status, 4);
+    assert.equal(outputs.at(-1).type, "mediated-input-cancel");
+    assert.equal(outputs.at(-1).handle, first.handle);
+    translated.sendMediatedInputResult(first.handle, 3, new Uint8Array([99]));
+    assert.equal(registration.status, 4);
+    assert.equal(registration.result, null);
+    translated.sendInput(pointerDelta(2, 0));
+    translated.update(2);
+    const second = outputs.at(-1);
+    assert.equal(second.type, "mediated-input-request");
+    assert.notEqual(second.handle, first.handle);
+    translated.sendMediatedInputResult(first.handle, 3, new Uint8Array([99]));
+    assert.equal(registration.status, 2);
+    assert.equal(registration.result, null);
+    for (const [handle, status, bytes] of [
+      [0, 3, new Uint8Array([1])],
+      [second.handle + 1, 3, new Uint8Array([1])],
+      [first.handle, 2, new Uint8Array()],
+      [first.handle, 3, new Uint8Array()],
+      [first.handle, 4, new Uint8Array([1])],
+      [first.handle, 3, new Uint8Array(1024 * 1024 + 1)],
+      [second.handle, 3, new Uint8Array(33)],
+    ]) {
+      assert.throws(() => translated.sendMediatedInputResult(handle, status, bytes));
+    }
+    const payload = new Uint8Array([1, 2, 3]);
+    translated.sendMediatedInputResult(second.handle, 3, payload);
+    translated.update(3);
+    assert.equal(
+      translated.hostcallBytes, budget - payload.byteLength - (payload.byteLength + 4),
+      "the size probe is free; result copy and save are each charged once",
+    );
+    assert.deepEqual(outputs.at(-1).bytes, new Uint8Array([3, 0, 0, 0, 1, 2, 3]));
+    assert.equal(registration.status, 1);
+    translated.sendMediatedInputResult(second.handle, 3, new Uint8Array([99]));
+    assert.equal(registration.result, null, "duplicate retired results are discarded");
+
+    translated.nextMediatedInputRequestHandle = 0xfffffffe;
+    translated.sendInput(pointerDelta(2, 0));
+    translated.update(4);
+    assert.equal(outputs.at(-1).handle, 0xffffffff);
+    translated.sendInput(pointerDelta(1, 0));
+    translated.update(5);
+    assert.equal(outputs.at(-1).type, "mediated-input-cancel");
+    assert.equal(outputs.at(-1).handle, 0xffffffff);
+    assert.equal(registration.status, 4, "token exhaustion refuses to re-arm");
+    assert.equal(translated.nextMediatedInputRequestHandle, 0xffffffff);
+  } finally {
+    translated.stop();
   }
 });
 

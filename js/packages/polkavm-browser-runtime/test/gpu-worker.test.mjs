@@ -18,6 +18,7 @@ const context = vm.createContext({
   Uint8Array,
   onmessage: null,
   postMessage() {},
+  performance: { now: () => 0 },
   setTimeout(callback) {
     queueMicrotask(callback);
   },
@@ -294,6 +295,10 @@ function lostEngine(overrides = {}) {
     testDeviceLossPending: false,
     stopped: true,
     disposed: false,
+    restoreAttempts: 0,
+    restoreInProgress: false,
+    restoreFailed: false,
+    deviceRestoredAt: null,
     device: { destroy() {} },
     context: { configure() {} },
     ...overrides,
@@ -410,4 +415,206 @@ test("a permanently unavailable adapter reports one error after bounded retries"
     capture.messages.map(message => message.type),
     ["error"]
   );
+});
+
+function replacementDevice(lost = new Promise(() => {})) {
+  return {
+    device: { addEventListener() {}, lost, destroy() {} },
+    context: { configure() {} },
+    format: "bgra8unorm",
+    limits: Array.from({ length: 21 }, () => 2048),
+  };
+}
+
+test("success followed by immediate device loss shares the retry ceiling and backoff", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  const delays = [];
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    // Stop the unfixed implementation eventually rather than hanging the test.
+    return replacementDevice(
+      attempts < 12
+        ? Promise.resolve({ message: "replacement immediately lost" })
+        : new Promise(() => {}),
+    );
+  };
+  context.setTimeout = (callback, delay) => {
+    delays.push(delay);
+    queueMicrotask(callback);
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [250, 500]);
+    assert.equal(engine.stopped, true);
+    assert.equal(capture.messages.filter(message => message.type === "capabilities").length, 3);
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+    await engine.restore();
+    assert.equal(attempts, 3, "a failed episode cannot restart itself");
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+test("healthy intervals reset the recovery budget instead of imposing a lifetime ceiling", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  let now = 0;
+  const delays = [];
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  const clock = context.performance.now;
+  context.performance.now = () => now;
+  context.setTimeout = (callback, delay) => {
+    delays.push(delay);
+    queueMicrotask(callback);
+  };
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    return replacementDevice();
+  };
+  const capture = captureMessages();
+  try {
+    for (let episode = 0; episode < 6; episode++) {
+      engine.stopped = true;
+      await engine.restore();
+      assert.equal(engine.stopped, false);
+      assert.equal(engine.restoreAttempts, 1);
+      now += 30_000;
+    }
+    assert.equal(attempts, 6);
+    assert.deepEqual(delays, []);
+    assert.equal(capture.messages.some(message => message.type === "error"), false);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    context.performance.now = clock;
+    capture.restore();
+  }
+});
+
+test("acquisition failures and short-lived replacements share one recovery budget", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    if (attempts === 1 || attempts > 3) {
+      throw new Error("adapter unavailable");
+    }
+    return replacementDevice(Promise.resolve({ message: "lost again" }));
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 3);
+    assert.equal(capture.messages.filter(message => message.type === "capabilities").length, 2);
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+});
+
+test("disposal during backoff cancels further acquisition and publication", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  let resume;
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    throw new Error("adapter unavailable");
+  };
+  context.setTimeout = callback => { resume = callback; };
+  const capture = captureMessages();
+  try {
+    const restoring = engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof resume, "function");
+    engine.stop();
+    resume();
+    await restoring;
+    assert.equal(attempts, 1);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+for (const supersede of [false, true]) {
+  test(`an acquisition completed after ${supersede ? "device replacement" : "disposal"} is destroyed without publication`, async () => {
+    const engine = lostEngine();
+    let resolveAcquisition;
+    let destroyed = 0;
+    let attempts = 0;
+    const replacement = replacementDevice();
+    replacement.device.destroy = () => { destroyed++; };
+    const acquire = GpuEngine.acquireDevice;
+    GpuEngine.acquireDevice = () => {
+      attempts++;
+      return new Promise(resolve => { resolveAcquisition = resolve; });
+    };
+    const capture = captureMessages();
+    try {
+      const restoring = engine.restore();
+      await engine.restore();
+      assert.equal(attempts, 1, "recovery is single-flight");
+      if (supersede) {
+        engine.device = replacementDevice().device;
+      } else {
+        engine.stop();
+      }
+      resolveAcquisition(replacement);
+      await restoring;
+      assert.equal(destroyed, 1);
+      assert.equal(engine.deviceGeneration, 1);
+      assert.deepEqual(capture.messages, []);
+    } finally {
+      engine.stop();
+      GpuEngine.acquireDevice = acquire;
+      capture.restore();
+    }
+  });
+}
+
+test("loss from a superseded device cannot start another recovery", async () => {
+  let loseOldDevice;
+  const old = replacementDevice(new Promise(resolve => { loseOldDevice = resolve; }));
+  const engine = lostEngine({ device: old.device });
+  engine.observeDevice(old.device);
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    return replacementDevice();
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    capture.messages.length = 0;
+    loseOldDevice({ message: "stale device loss" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1);
+    assert.equal(engine.stopped, false);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
 });
