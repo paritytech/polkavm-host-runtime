@@ -74,7 +74,15 @@ jobs:
         run: |
           rustup toolchain install nightly-2025-10-09 --profile minimal --component rust-src
           cargo install polkatool --version 0.31.0 --locked
-          cargo install polkatool --git https://github.com/paritytech/polkavm.git --rev c160c13c3c29bf3219ce1404ec95976000235a94 --locked --root "$RUNNER_TEMP/polkatool-runtime"
+          POLKAVM_REVISION="$(python3 -c '
+          import pathlib, re, tomllib
+          packages = tomllib.loads(pathlib.Path("Cargo.lock").read_text())["package"]
+          source, = {pkg["source"] for pkg in packages if pkg["name"] in ("polkavm", "polkavm-common")}
+          revision = source.rsplit("#", 1)[1]
+          assert re.fullmatch("[0-9a-f]{40}", revision), "PolkaVM requires an immutable Git revision"
+          print(revision)
+          ')"
+          cargo install polkatool --git https://github.com/paritytech/polkavm.git --rev "$POLKAVM_REVISION" --locked --root "$RUNNER_TEMP/polkatool-runtime"
           echo "POLKAVM_64_POLKATOOL=$RUNNER_TEMP/polkatool-runtime/bin/polkatool" >> "$GITHUB_ENV"
       - name: Format
         run: cargo +nightly fmt --check

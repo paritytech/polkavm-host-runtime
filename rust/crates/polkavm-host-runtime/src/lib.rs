@@ -563,35 +563,6 @@ fn fill_random(bytes: &mut [u8]) -> i32 {
     }
 }
 
-fn wall_clock_ns() -> u64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX.into()) as u64
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        wasm::wall_clock_ns()
-    }
-}
-
-fn fill_random(bytes: &mut [u8]) -> i32 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        match getrandom::fill(bytes) {
-            Ok(()) => 0,
-            Err(_) => computer::STATUS_DENIED,
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        wasm::fill_random(bytes)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MotionState {
     availability: motion_wire::MotionAvailability,

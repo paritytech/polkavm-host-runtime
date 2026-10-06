@@ -79,26 +79,6 @@ pub(crate) fn fill_random(bytes: &mut [u8]) -> i32 {
     unsafe { browser_random_fill(bytes.as_mut_ptr(), bytes.len()) }
 }
 
-#[link(wasm_import_module = "polkavm_browser")]
-unsafe extern "C" {
-    #[link_name = "clock_wall_ms"]
-    fn browser_clock_wall_ms() -> f64;
-    #[link_name = "random_fill"]
-    fn browser_random_fill(pointer: *mut u8, length: usize) -> i32;
-}
-
-pub(crate) fn wall_clock_ns() -> u64 {
-    let milliseconds = unsafe { browser_clock_wall_ms() };
-    if !milliseconds.is_finite() || milliseconds < 0.0 {
-        return 0;
-    }
-    (milliseconds as u64).saturating_mul(1_000_000)
-}
-
-pub(crate) fn fill_random(bytes: &mut [u8]) -> i32 {
-    unsafe { browser_random_fill(bytes.as_mut_ptr(), bytes.len()) }
-}
-
 struct Launch {
     program: Vec<u8>,
     assets: HashMap<String, Vec<u8>>,

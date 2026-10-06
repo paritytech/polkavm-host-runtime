@@ -40,7 +40,7 @@ for guest in "${GUESTS[@]}"; do
   # 32-bit fixture linker, but use the runtime's exact PolkaVM pin for 64-bit.
   LINKER=polkatool
   if [[ "${bitness:-32}" == 64 ]]; then
-    LINKER="${POLKAVM_64_POLKATOOL:?set to polkatool built from c160c13c3c29bf3219ce1404ec95976000235a94}"
+    LINKER="${POLKAVM_64_POLKATOOL:?set to polkatool built from the PolkaVM revision in Cargo.lock}"
   fi
   TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness "${bitness:-32}")"
   TARGET_NAME="$(basename "$TARGET_JSON" .json)"
