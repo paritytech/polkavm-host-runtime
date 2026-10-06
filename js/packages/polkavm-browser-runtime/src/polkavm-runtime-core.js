@@ -82,6 +82,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   let pendingFrame = null;
   let demandDriven = false;
   let tickPending = false;
+  let updateRequested = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
   let pointerCaptureSupported = false;
@@ -655,8 +656,8 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   }
 
   function hasBackgroundWork() {
-    // Only cooperative hostcall-budget yields are continuations. CoreVM's
-    // frame yield is an update boundary, never a reason for an idle spin.
+    // Gas and hostcall scheduling yields are continuations. CoreVM's frame
+    // yield is an update boundary, never a reason for an idle spin.
     if (translated?.hasPendingContinuation()) {
       return backgroundContinuationTicks > 0;
     }
@@ -691,6 +692,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
 
   function wake() {
     if (demandDriven && !backgrounded) {
+      updateRequested = true;
       scheduleTick(0);
     }
   }
@@ -703,8 +705,10 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       ? Math.min(backgroundServiceTicks + 1, MAX_BACKGROUND_SERVICE_TICKS)
       : MAX_BACKGROUND_SERVICE_TICKS;
     backgroundContinuationTicks = MAX_BACKGROUND_CONTINUATION_TICKS;
-    if (backgrounded || demandDriven) {
+    if (backgrounded) {
       scheduleTick(0);
+    } else {
+      wake();
     }
   }
 
@@ -766,6 +770,9 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         backgroundServiceTicks = pendingHostFrameResponses();
         backgroundContinuationTicks = MAX_BACKGROUND_CONTINUATION_TICKS;
       }
+      if (!backgrounded) {
+        updateRequested = true;
+      }
       if (!backgrounded && pendingFrame !== null) {
         const { output, transfers } = pendingFrame;
         pendingFrame = null;
@@ -792,6 +799,11 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   function tick() {
     if (!running || paused || (backgrounded && !hasBackgroundWork())) {
       return;
+    }
+    if (!translated?.hasPendingContinuation()) {
+      // An external wake belongs to the next logical call, not a continuation
+      // of a call that may already have polled before that event arrived.
+      updateRequested = false;
     }
     const firstUpdate = updateCount === 0;
     if (firstUpdate) {
@@ -856,7 +868,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       }
       return;
     }
-    if (translated?.hasPendingContinuation()) {
+    if (translated?.hasPendingContinuation() || updateRequested) {
       scheduleTick(0);
       return;
     }
@@ -1511,6 +1523,9 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
     for (const { output, transfers } of pendingOutputs) {
       postRuntimeOutput(output, transfers);
     }
+    // Initialization may still be suspended. Its completion cannot consume
+    // the automatic first update or make that update wait on an init deadline.
+    updateRequested = true;
     scheduleTick(0);
   }
 

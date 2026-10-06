@@ -122,7 +122,9 @@ function partitionedGuestBytes({
     0x23, 13, 0x42, ...sleb(meteredHostcalls.cost), 0x53, // gas < cost
     0x04, 0x40, 0x41, 0x7c, 0x0f, 0x0b, // return OUT_OF_GAS
     0x23, 13, 0x42, ...sleb(meteredHostcalls.cost), 0x7d, 0x24, 13,
-    0x42, 23, 0x42, 50, 0x23, 14, 0x45, 0x1b, 0x24, 7, // first delay 23, then 50
+    ...(meteredHostcalls.idle
+      ? [0x42, 0x7f, 0x24, 7] // idle
+      : [0x42, 23, 0x42, 50, 0x23, 14, 0x45, 0x1b, 0x24, 7]), // first delay 23, then 50
     ...(meteredHostcalls.frames ? [
       0x23, 14, 0x41, 1, 0x71, 0x24, 15, // odd calls display, even calls schedule
       0x23, 15, 0x04, 0x40,
@@ -1167,6 +1169,174 @@ test("background framebuffer retention resumes once after acknowledgment and nev
         receiver.onmessage?.({ data: { type: "stop" } });
       }
     });
+  }
+});
+
+test("initialization continuations cannot consume the automatic first update", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  for (const yielding of [false, true]) {
+    for (const idle of [false, true]) {
+      await t.test(`yielding=${yielding}, idle=${idle}`, async (t) => {
+        const { root } = partitionedGuestBytes({
+          meteredHostcalls: { entry: "init", count: 2, cost: 100, idle },
+        });
+        const compiledProgram = await Runtime.compile(root);
+        let calls = 0;
+        globalThis.TranslatedPolkaVmRuntime = class extends Runtime {
+          constructor(...args) {
+            super(...args);
+            const exports = this.pvm;
+            this.pvm = {
+              ...exports,
+              pvm_begin: (...args) => {
+                calls++;
+                if (yielding && calls === 1) this.hostcalls = 1;
+                return exports.pvm_begin(...args);
+              },
+            };
+          }
+        };
+        const scheduling = controlledTicks(t);
+        const { messages, receiver } = endpoint();
+        try {
+          receiver.onmessage({ data: {
+            type: "start", runtime: bytesBuffer(runtime), program: new Uint8Array([1]),
+            compiledProgram, assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+            cacheKey: `initial-update-${yielding}-${idle}`,
+          } });
+          assert.equal((await waitForMessage(messages, "ready")).backend, "compiler");
+          scheduling.controlTimers();
+          assert.equal(calls, 1, "only init has started");
+          if (yielding) {
+            scheduling.ticks.shift()();
+            assert.equal(calls, 1, "the first tick finishes init instead of restarting it");
+            assert.equal(scheduling.ticks.length, 1, "first update remains pending after init finishes");
+            assert.equal(scheduling.timers.size, 0, "init cannot postpone the first update");
+          }
+          assert.equal(scheduling.drain(), 1, "the first real update runs exactly once");
+          assert.equal(calls, 2);
+          assert.equal(scheduling.timers.size, idle ? 0 : 1, "the real update's deadline is honored");
+          assert.equal(messages.some((message) => message.type === "error"), false);
+        } finally {
+          receiver.onmessage?.({ data: { type: "stop" } });
+          globalThis.TranslatedPolkaVmRuntime = Runtime;
+        }
+      });
+    }
+  }
+});
+
+test("foreground wakes survive gas continuations and coalesce at the next call", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const { root } = partitionedGuestBytes({
+    meteredHostcalls: { count: 2, cost: 100 },
+  });
+  const compiledProgram = await Runtime.compile(root);
+  for (const event of ["input", "host-response", "resume", "foreground"]) {
+    await t.test(event, async (t) => {
+      let calls = 0;
+      globalThis.TranslatedPolkaVmRuntime = class extends Runtime {
+        constructor(...args) {
+          super(...args);
+          this.maxGas = 100n;
+          const exports = this.pvm;
+          this.pvm = {
+            ...exports,
+            pvm_begin: (...args) => {
+              calls++;
+              return exports.pvm_begin(...args);
+            },
+          };
+        }
+      };
+      const scheduling = controlledTicks(t);
+      const { messages, receiver } = endpoint();
+      const send = (data) => receiver.onmessage({ data });
+      try {
+        send({
+          type: "start", runtime: bytesBuffer(runtime), program: new Uint8Array([1]),
+          compiledProgram, assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+          cacheKey: `foreground-gas-wake-${event}`,
+        });
+        assert.equal((await waitForMessage(messages, "ready")).backend, "compiler");
+        scheduling.controlTimers();
+        scheduling.ticks.shift()();
+        assert.equal(calls, 1);
+        assert.equal(scheduling.ticks.length, 1, "gas exhaustion schedules a continuation");
+        for (let repeat = 0; repeat < 2; repeat++) {
+          if (event === "input") {
+            send({ type: "input", bytes: new Uint8Array([1, 4, 0, 0, 0, 0, 0, 0]) });
+          } else if (event === "host-response") {
+            send({ type: "host-frame-response", bytes: new Uint8Array([42]) });
+          } else if (event === "resume") {
+            send({ type: "pause", paused: true });
+            send({ type: "pause", paused: false });
+          } else {
+            send({ type: "background", backgrounded: true });
+            send({ type: "background", backgrounded: false });
+          }
+        }
+        assert.equal(scheduling.ticks.length, 1, "wakes share the pending continuation tick");
+        assert.equal(scheduling.drain(), 3, "finish the old call, then run one new two-quantum call");
+        assert.equal(calls, 2, "external wakes cannot be spent finishing the old call");
+        assert.equal(scheduling.timers.size, 1, "ordinary requested pacing resumes after the wake");
+        assert.equal(messages.some((message) => message.type === "error"), false);
+      } finally {
+        receiver.onmessage?.({ data: { type: "stop" } });
+        globalThis.TranslatedPolkaVmRuntime = Runtime;
+      }
+    });
+  }
+});
+
+test("foreground host responses arriving after a poll survive hostcall continuations and pause", async (t) => {
+  const runtime = await readFile(resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"));
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  globalThis.TranslatedPolkaVmRuntime = class extends Runtime {
+    constructor(...args) {
+      super(...args);
+      const exports = this.pvm;
+      this.pvm = {
+        ...exports,
+        pvm_begin: (...args) => {
+          this.hostcalls = 1;
+          return exports.pvm_begin(...args);
+        },
+        pvm_resume: () => {
+          this.hostcalls = 1;
+          return exports.pvm_resume();
+        },
+      };
+    }
+  };
+  const scheduling = controlledTicks(t);
+  const { messages, receiver } = endpoint();
+  const send = (data) => receiver.onmessage({ data });
+  try {
+    send({
+      type: "start", runtime: bytesBuffer(runtime), program: bytesBuffer(hostResponseEchoGuest(true)),
+      assets: [], graphicsProfile: "framebuffer", audioEnabled: false,
+      cacheKey: "foreground-hostcall-wake",
+    });
+    assert.equal((await waitForMessage(messages, "ready")).backend, "compiler");
+    scheduling.controlTimers();
+    scheduling.ticks.shift()(); // The first call has already polled an empty response queue.
+    send({ type: "host-frame-response", bytes: new Uint8Array([42]) });
+    send({ type: "pause", paused: true });
+    scheduling.drain();
+    assert.equal(messages.some((message) => message.type === "save"), false);
+    send({ type: "pause", paused: false });
+    scheduling.drain();
+    assert.deepEqual(messages.filter((message) => message.type === "save").map((message) => message.bytes[0]),
+      [0, 42], "the queued response must be observed by a fresh update despite the old call requesting idle");
+    assert.equal(scheduling.ticks.length, 0);
+    assert.equal(scheduling.timers.size, 0, "consuming a wake cannot create an idle spin");
+    assert.equal(messages.some((message) => message.type === "error"), false);
+  } finally {
+    receiver.onmessage?.({ data: { type: "stop" } });
+    globalThis.TranslatedPolkaVmRuntime = Runtime;
   }
 });
 

@@ -124,8 +124,10 @@ host_update_after(delay_ms: u32) -> ()
 
 Importing `host_update_after` opts a cooperative application guest into
 demand-driven updates. The Host performs the first `update` after `init`
-automatically. Before each later logical update, the Host clears the previous
-request. Calls made during that update, including all of its gas and hostcall
+automatically, including when initialization completes through continuations;
+an initialization scheduling request does not postpone that first update.
+Before each later logical update, the Host clears the previous request.
+Calls made during that update, including all of its gas and hostcall
 continuations, select the smallest requested delay.
 
 The CoreVM compatibility path recognizes the same import and applies equivalent
@@ -137,7 +139,9 @@ contract.
 `delay_ms == 0` requests another update as soon as the Host can schedule it.
 `delay_ms == u32::MAX` requests no timer; the Host waits until input, a
 Host-frame response, a GPU event, or another external event is queued for the
-guest. Every such event MUST wake an opted-in guest promptly.
+guest. Every such event MUST wake an opted-in guest promptly. A foreground wake
+received between execution quanta MUST remain pending until a new logical
+update starts; completing the interrupted call does not consume that wake.
 
 A guest that does not import this call retains Host-defined continuous
 scheduling for compatibility. Scheduling does not weaken per-update gas or
