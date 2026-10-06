@@ -488,7 +488,6 @@
       JSON.stringify({ name: file.name, mimeType: file.mimeType, size: file.size }),
     );
   }
-
   function isComputeOpcode(opcode) {
     return opcode >= 24 && opcode <= 29;
   }
@@ -1000,6 +999,9 @@
       this.fileCacheCleanupFailed = false;
       this.fileCacheStopped = null;
       this.nextMediatedInputHandle = 0;
+      // File interactions retain positive-i32 handles; device captures never
+      // reuse tokens from the disjoint high-bit namespace.
+      this.nextMediatedInputRequestHandle = 0x7fffffff;
       this.activeMediatedInputHandle = null;
       this.mediatedInputCommands = 0;
       this.tri2dSubmitted = false;
@@ -1401,12 +1403,12 @@
     }
 
     sendMediatedInputResult(handle, status, bytes) {
-      const registration = this.mediatedInputRegistrations.get(handle);
+      let registration;
       if (
         this.stopped ||
-        !registration ||
-        registration.status !== MEDIATED_INPUT_STATUS_ACTIVE ||
-        this.activeMediatedInputHandle !== handle ||
+        !Number.isInteger(handle) ||
+        handle <= 0 ||
+        handle > 0xffffffff ||
         !Number.isInteger(status) ||
         ![
           MEDIATED_INPUT_STATUS_READY,
@@ -1419,21 +1421,45 @@
         throw new Error("invalid translated mediated-input result");
       }
       if (status === MEDIATED_INPUT_STATUS_READY) {
-        if (registration.descriptor) {
-          throw new Error(
-            "translated file results are delivered with their name and MIME type",
-          );
+        if (!bytes.byteLength || bytes.byteLength > MAX_MEDIATED_INPUT_BYTES) {
+          throw new Error("translated mediated-input result exceeds its payload bound");
         }
-        if (!bytes.byteLength || bytes.byteLength > registration.maxBytes) {
-          throw new Error("translated mediated-input result exceeds its registered bound");
-        }
-        registration.result = bytes.slice();
       } else if (bytes.byteLength) {
         throw new Error("translated mediated-input failure carries unexpected bytes");
-      } else {
-        registration.result = null;
-        registration.file = null;
       }
+      if (handle >= 0x80000000) {
+        if (handle > this.nextMediatedInputRequestHandle) {
+          throw new Error("unknown translated mediated-input capture token");
+        }
+        for (const candidate of this.mediatedInputRegistrations.values()) {
+          if (candidate.requestHandle === handle) {
+            registration = candidate;
+            break;
+          }
+        }
+        if (!registration) {
+          return; // Retired tokens cannot complete a later device capture.
+        }
+      } else {
+        registration = this.mediatedInputRegistrations.get(handle);
+        if (
+          !registration?.descriptor ||
+          registration.status !== MEDIATED_INPUT_STATUS_ACTIVE ||
+          this.activeMediatedInputHandle !== handle
+        ) {
+          throw new Error("invalid translated file-input result");
+        }
+        if (status === MEDIATED_INPUT_STATUS_READY) {
+          throw new Error("translated file results are delivered with their name and MIME type");
+        }
+      }
+      if (bytes.byteLength > registration.maxBytes) {
+        throw new Error("translated mediated-input result exceeds its registered bound");
+      }
+      registration.result =
+        status === MEDIATED_INPUT_STATUS_READY ? bytes.slice() : null;
+      registration.file = null;
+      registration.requestHandle = null;
       this.activeMediatedInputHandle = null;
       registration.status = status;
     }
@@ -1481,6 +1507,7 @@
       this.mediatedInputRegistrations.set(this.nextMediatedInputHandle, {
         ...source,
         status: MEDIATED_INPUT_STATUS_REGISTERED,
+        requestHandle: null,
         result: null,
         file: null,
         source: null,
@@ -1937,6 +1964,12 @@
           MAX_MEDIATED_INPUT_REGISTRATIONS > MAX_MEDIATED_INPUT_COMMANDS) {
         return 2;
       }
+      if (!registration.descriptor) {
+        if (this.nextMediatedInputRequestHandle === 0xffffffff) {
+          return 2;
+        }
+        registration.requestHandle = ++this.nextMediatedInputRequestHandle;
+      }
       if (replacingStream) {
         this.#cancelMediatedInput(handle);
       }
@@ -1954,7 +1987,7 @@
       }
       this.#emitMediatedInputCommand({
         type: "mediated-input-request",
-        handle,
+        handle: registration.requestHandle,
         kind: registration.kind,
         mediaType: registration.mediaType,
         maxBytes: registration.maxBytes,
@@ -1984,7 +2017,11 @@
       registration.result = null;
       registration.file = null;
       this.activeMediatedInputHandle = null;
-      this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
+      this.#emitMediatedInputCommand({
+        type: "mediated-input-cancel",
+        handle: registration.requestHandle ?? handle,
+      });
+      registration.requestHandle = null;
       return 0;
     }
 
@@ -1998,7 +2035,11 @@
           this.#closeFileStream(registration);
           this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
         } else if (registration.status === MEDIATED_INPUT_STATUS_ACTIVE) {
-          this.#emitMediatedInputCommand({ type: "mediated-input-cancel", handle });
+          this.#emitMediatedInputCommand({
+            type: "mediated-input-cancel",
+            handle: registration.requestHandle ?? handle,
+          });
+          registration.requestHandle = null;
         }
       }
       this.input.length = 0;
@@ -2423,10 +2464,10 @@
             this.#chargeBytes(kindLength + mediaTypeLength);
             try {
               const kind = strictDecoder.decode(
-                this.#read(this.#u32(a0), kindLength),
+                this.#range(this.#u32(a0), kindLength),
               );
               const mediaType = strictDecoder.decode(
-                this.#read(this.#u32(a2), mediaTypeLength),
+                this.#range(this.#u32(a2), mediaTypeLength),
               );
               result = this.#registerMediatedInput(
                 kind,
@@ -3807,7 +3848,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       if (operation === 0) {
         return;
       }
-      const handle = pvm.polkavm_browser_mediated_input_handle();
+      const handle = pvm.polkavm_browser_mediated_input_handle() >>> 0;
       if (operation === 2) {
         postRuntimeOutput({ type: "mediated-input-cancel", handle });
         continue;
@@ -4992,14 +5033,18 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       (!translated && !pvm) ||
       !Number.isInteger(handle) ||
       handle <= 0 ||
+      handle > 0xffffffff ||
       !Number.isInteger(status) ||
       status < 3 ||
-      status > 6
+      status > 6 ||
+      (status !== 3 && bytes.byteLength !== 0)
     ) {
       throw new Error("invalid PolkaVM browser mediated-input result");
     }
     invalidateSelection(handle);
-    activeMediatedInputRequest = null;
+    if (activeMediatedInputRequest === handle) {
+      activeMediatedInputRequest = null;
+    }
     if (translated) {
       translated.sendMediatedInputResult(handle, status, bytes);
       activeMediatedInputHandles.delete(handle);
@@ -5170,7 +5215,6 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       pendingSelections.delete(handle);
     });
   }
-
   endpoint.onmessage = (event) => {
     if (disposed) {
       return;
