@@ -300,14 +300,14 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.3`.
-This candidate is `0.3.2-rc.2` plus the translated-backend gas continuation from
-`fix/resume-translated-out-of-gas` (#73), based on merged main
-`1e28810136a0e4c3cb1b00dd59bd5b1aa2e22798`, and retains PolkaVM engine
-`642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5`. Compared with `0.3.2-rc.2`, the
-browser compiler backend resumes an update across bounded gas slices instead of
-failing when the first slice ends; exhausting the full update budget still fails.
-It remains a prerelease, not a stable compatibility promise. The release generator
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.4`.
+This candidate is `0.3.2-rc.3` plus the translated-dispatch optimization merged
+to main as `1d553e4492f0d430bc471f48ce136c3d7bcc2d23` (#74), and retains PolkaVM
+engine `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5`. Compared with
+`0.3.2-rc.3`, the browser compiler splits long PolkaVM blocks every 64
+instructions instead of every 16, reducing indirect tail-dispatch overhead
+without changing gas accounting or block targets. It remains a prerelease, not
+a stable compatibility promise. The release generator
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
