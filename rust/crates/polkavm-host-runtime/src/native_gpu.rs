@@ -3185,9 +3185,11 @@ mod tests {
         assert_rejection(&stale, 1, gpu_wire::GPU_BATCH_ERROR_STALE_SURFACE);
         let (buffer, _) = renderer.buffer(3).unwrap();
         let (sender, receiver) = mpsc::channel();
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
         renderer.device.poll(wgpu::Maintain::Wait);
         receiver.recv().unwrap().unwrap();
         assert_eq!(&*buffer.slice(..).get_mapped_range(), &[5, 6, 7, 8]);
@@ -3230,10 +3232,7 @@ mod tests {
             (GpuOpcode::EndRenderPass, vec![]),
         ]));
         assert_event(&output, gpu_wire::GpuEventType::SubmissionComplete);
-        assert_eq!(
-            output.frame.unwrap().rgba,
-            [0, 255, 0, 255, 0, 255, 0, 255]
-        );
+        assert_eq!(output.frame.unwrap().rgba, [0, 255, 0, 255, 0, 255, 0, 255]);
     }
 
     #[test]
