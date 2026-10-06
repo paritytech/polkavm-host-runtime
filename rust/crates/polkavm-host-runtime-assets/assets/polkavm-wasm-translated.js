@@ -1148,17 +1148,16 @@
         return;
       }
       this.timeMs = Math.max(this.timeMs ?? 0, timeMs);
-      this.updateAfterMs = null;
-      this.gpuSubmits = 0;
-      this.hostFrameRequests = 0;
-      this.uiSemanticsSubmitted = false;
-      this.uiOutputSubmitted = false;
-      this.hostFrameRequestBytes = 0;
-      this.#resetBudget(
-        this.coreVm && !this.coreVmStarted
-          ? MAX_HOSTCALLS_PER_INIT
-          : MAX_HOSTCALLS_PER_UPDATE,
-      );
+      const hostcalls = this.coreVm && !this.coreVmStarted
+        ? MAX_HOSTCALLS_PER_INIT
+        : MAX_HOSTCALLS_PER_UPDATE;
+      if (this.continuationPending) {
+        // A worker tick is not a new guest call. Only the hostcall scheduling
+        // quantum restarts; gas, scheduling requests and call bounds survive.
+        this.hostcalls = hostcalls;
+      } else {
+        this.#resetBudget(hostcalls);
+      }
       if (this.coreVm) {
         this.#run(this.exports.get("_pvm_start"), true);
         this.coreVmStarted = true;
@@ -2029,6 +2028,12 @@
 
     #resetBudget(hostcalls, gas = this.maxGas) {
       this.hostcalls = hostcalls;
+      this.updateAfterMs = null;
+      this.gpuSubmits = 0;
+      this.hostFrameRequests = 0;
+      this.uiSemanticsSubmitted = false;
+      this.uiOutputSubmitted = false;
+      this.hostFrameRequestBytes = 0;
       this.hostcallBytes = MAX_HOSTCALL_BYTES;
       this.tri2dSubmitted = false;
       this.mediatedInputCommands = 0;
@@ -2069,6 +2074,9 @@
             throw new Error("translated PolkaVM guest ran out of gas");
           }
           this.remainingGasSlices--;
+          // Hostcall yields retain the gas already in the VM. Only an exhausted
+          // gas quantum gets a refill, charged against the complete call budget.
+          this.pvm.pvm_set_gas(this.maxGas);
           this.resumePending = true;
           this.continuationPending = true;
           return;
