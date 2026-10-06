@@ -1279,16 +1279,19 @@ class GpuEngine {
         this.deviceGeneration++;
         this.lastSequence = 0;
         this.pendingBatches = 0;
-        this.pendingResize = null;
         this.resizeScheduled = false;
         this.foregroundScheduled = false;
         this.backgrounded = this.backgroundRequested;
         this.queue = Promise.resolve();
+        const dimensions = this.pendingResize ?? this;
+        this.pendingResize = null;
+        const resized = this.resize(dimensions);
         this.stopped = false;
-        this.configureSurface();
         this.deviceRestoredAt = performance.now();
         this.observeDevice(replacement.device);
-        postBytes("capabilities", this.capabilities());
+        if (!resized) {
+          postBytes("capabilities", this.capabilities());
+        }
         this.emitTextEvent(8, 0, 0, "WebGPU device restored");
         return;
       }
@@ -1300,6 +1303,15 @@ class GpuEngine {
       postMessage({
         type: "error",
         message: `WebGPU device could not be restored: ${failure?.message || String(failure)}`,
+      });
+    } catch (error) {
+      // A rejected canvas configuration is fatal, not a successful recovery.
+      this.stopped = true;
+      this.restoreFailed = true;
+      this.device.destroy();
+      postMessage({
+        type: "error",
+        message: `WebGPU device could not be restored: ${error?.message || String(error)}`,
       });
     } finally {
       this.restoreInProgress = false;
@@ -1478,6 +1490,7 @@ class GpuEngine {
       view.setUint16(24, this.formatId, true);
       postBytes("event", makeEvent(6, 0, payload));
     }
+    return changed;
   }
 
   /** Binds the canvas to the current device; a restored device needs this too. */
@@ -1563,8 +1576,9 @@ class GpuEngine {
   }
 
   scheduleResize(dimensions) {
+    if (this.disposed) return;
     this.pendingResize = dimensions;
-    if (this.resizeScheduled) {
+    if (this.stopped || this.resizeScheduled) {
       return;
     }
     this.resizeScheduled = true;
@@ -1572,10 +1586,11 @@ class GpuEngine {
     this.queue = this.queue
       .then(() => {
         if (this.device !== device || this.disposed) return;
+        this.resizeScheduled = false;
+        if (this.stopped) return;
         const latest = this.pendingResize;
         this.pendingResize = null;
-        this.resizeScheduled = false;
-        if (!this.stopped && latest) {
+        if (latest) {
           this.resize(latest);
         }
       })

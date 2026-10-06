@@ -1746,3 +1746,185 @@ test("loss from a superseded device cannot start another recovery", async () => 
     capture.restore();
   }
 });
+
+for (const blockedQueue of [false, true]) {
+  test(`recovery coalesces resizes while the old queue is ${blockedQueue ? "blocked" : "drained"}`, async () => {
+    let releaseOldQueue;
+    let loseDevice;
+    let retry;
+    const old = replacementDevice(new Promise(resolve => { loseDevice = resolve; }));
+    const engine = lostEngine({
+      device: old.device,
+      stopped: false,
+      queue: blockedQueue
+        ? new Promise(resolve => { releaseOldQueue = resolve; })
+        : Promise.resolve(),
+    });
+    engine.observeDevice(old.device);
+    const replacement = replacementDevice();
+    let attempts = 0;
+    const acquire = GpuEngine.acquireDevice;
+    const setTimeout = context.setTimeout;
+    GpuEngine.acquireDevice = async () => {
+      if (++attempts === 1) throw new Error("adapter unavailable");
+      return replacement;
+    };
+    context.setTimeout = callback => { retry = callback; };
+    const capture = captureMessages();
+    try {
+      engine.scheduleResize({
+        physicalWidth: 640, physicalHeight: 480,
+        logicalWidth: 640, logicalHeight: 480, scale: 1,
+      });
+      const oldQueue = engine.queue;
+      loseDevice({ message: "lost while resizing" });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(engine.stopped, true);
+      assert.equal(typeof retry, "function");
+      const generationAtLoss = engine.surfaceGeneration;
+      engine.scheduleResize({
+        physicalWidth: 0, physicalHeight: 0,
+        logicalWidth: 0, logicalHeight: 0, scale: 1,
+      });
+      const latest = {
+        physicalWidth: 5000, physicalHeight: 1200,
+        logicalWidth: 1000, logicalHeight: 600, scale: 2,
+      };
+      engine.scheduleResize(latest);
+      assert.equal(engine.pendingResize, latest);
+      retry();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(attempts, 2);
+      assert.equal(engine.stopped, false);
+      assert.equal(engine.device, replacement.device);
+      assert.equal(engine.pendingResize, null);
+      assert.equal(engine.resizeScheduled, false);
+      assert.deepEqual(engine.canvas, { width: 2048, height: 1200 });
+      assert.equal(engine.surfaceGeneration, generationAtLoss + 1);
+      const capabilities = capture.messages.findLast(message => message.type === "capabilities");
+      const view = new DataView(capabilities.bytes.buffer);
+      assert.deepEqual(
+        [16, 20, 24, 28].map(offset => view.getUint32(offset, true)),
+        [2048, 1200, 1000, 600],
+      );
+      assert.equal(view.getFloat32(32, true), 2);
+      assert.equal(view.getUint32(40, true), 2);
+      assert.deepEqual(
+        capture.messages.filter(message => message.type === "event")
+          .slice(-2).map(message => eventType(message.bytes)),
+        [6, 8],
+      );
+      const published = capture.messages.length;
+      releaseOldQueue?.();
+      await oldQueue;
+      assert.equal(capture.messages.length, published, "the old resize cannot overwrite recovery");
+      assert.deepEqual(engine.canvas, { width: 2048, height: 1200 });
+    } finally {
+      engine.stop();
+      releaseOldQueue?.();
+      retry?.();
+      GpuEngine.acquireDevice = acquire;
+      context.setTimeout = setTimeout;
+      capture.restore();
+    }
+  });
+}
+
+test("a zero-sized surface pending recovery uses the ordinary one-pixel clamp", async () => {
+  const engine = lostEngine({ queue: Promise.resolve() });
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => replacementDevice();
+  const capture = captureMessages();
+  try {
+    engine.scheduleResize({
+      physicalWidth: 0, physicalHeight: 0,
+      logicalWidth: 0, logicalHeight: 0, scale: 1,
+    });
+    await engine.restore();
+    assert.deepEqual(engine.canvas, { width: 1, height: 1 });
+    assert.equal(engine.logicalWidth, 1);
+    assert.equal(engine.logicalHeight, 1);
+    assert.equal(engine.stopped, false);
+    assert.equal(capture.messages.some(message => message.type === "error"), false);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+});
+
+test("disposal discards pending recovery resizes and ignores later resize messages", async () => {
+  const engine = lostEngine({ queue: Promise.resolve() });
+  let retry;
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    throw new Error("adapter unavailable");
+  };
+  context.setTimeout = callback => { retry = callback; };
+  const capture = captureMessages();
+  try {
+    const restoring = engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    const dimensions = {
+      physicalWidth: 800, physicalHeight: 600,
+      logicalWidth: 800, logicalHeight: 600, scale: 1,
+    };
+    engine.scheduleResize(dimensions);
+    assert.equal(engine.pendingResize, dimensions);
+    engine.stop();
+    engine.scheduleResize(dimensions);
+    assert.equal(engine.pendingResize, null);
+    retry();
+    await restoring;
+    assert.equal(attempts, 1);
+    assert.deepEqual(engine.canvas, { width: 320, height: 240 });
+    assert.equal(engine.stopped, true);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    engine.stop();
+    retry?.();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+for (const invalidScale of [false, true]) {
+  test(`recovery reports ${invalidScale ? "invalid resize scale" : "canvas configuration rejection"} without publishing restoration`, async () => {
+    const engine = lostEngine({ queue: Promise.resolve() });
+    const replacement = replacementDevice();
+    let destroyed = 0;
+    let attempts = 0;
+    replacement.device.destroy = () => { destroyed++; };
+    if (!invalidScale) {
+      replacement.context.configure = () => { throw new Error("canvas rejected configuration"); };
+    }
+    const acquire = GpuEngine.acquireDevice;
+    GpuEngine.acquireDevice = async () => {
+      attempts++;
+      return replacement;
+    };
+    const capture = captureMessages();
+    try {
+      engine.scheduleResize({
+        physicalWidth: 800, physicalHeight: 600,
+        logicalWidth: 800, logicalHeight: 600, scale: invalidScale ? 0 : 1,
+      });
+      await engine.restore();
+      assert.equal(engine.stopped, true);
+      assert.equal(engine.restoreFailed, true);
+      assert.equal(destroyed, 1);
+      assert.deepEqual(capture.messages.map(message => message.type), ["error"]);
+      assert.match(capture.messages[0].message, invalidScale ? /surface scale/ : /canvas rejected/);
+      await engine.restore();
+      assert.equal(attempts, 1, "a rejected surface cannot silently restart recovery");
+    } finally {
+      engine.stop();
+      GpuEngine.acquireDevice = acquire;
+      capture.restore();
+    }
+  });
+}

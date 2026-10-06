@@ -32,7 +32,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "9d6a85b590717100a5cbad1523fe41c61d54bbcc988b8c3a2971ceaed1a8e256",
+        sha256: "7cf35f0cd2686d2d3a8c05ac8eacc9467bca88b007fce8c77d3d6a546f132c3e",
     },
     BrowserAsset {
         path: "THIRD_PARTY_LICENSES.txt",
@@ -74,7 +74,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "polkavm-gpu-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-gpu-worker.js"),
-        sha256: "95ebfbc1a72acfe5a4204685fabfcde930b6fb8cf652ee80c726b830b7757858",
+        sha256: "5427f27d885269bd74aee9cde56dd21bcca5e428cbb1fcb2b8882543668c9e4b",
     },
     BrowserAsset {
         path: "polkavm-runtime-core.js",

@@ -478,6 +478,15 @@ three acquisitions per recovery episode, delaying subsequent attempts by
 budget on its next loss, so occasional independent resets do not impose a
 lifetime recovery ceiling.
 
+Resizes received during device loss or retry backoff are coalesced, not
+discarded. Before publishing restoration, the browser backend applies the
+latest dimensions using the replacement device's limits and the ordinary
+one-pixel minimum for a zero-sized surface. Changed dimensions produce a
+surface-resized event and updated capabilities before `device restored`.
+Teardown discards pending resizes. If the pending dimensions or canvas
+configuration are rejected, the Host reports a lifecycle error instead of
+publishing a restored device.
+
 ### Host-frame transport
 
 Every ABI v1 application receives a bounded transport for opaque request and
