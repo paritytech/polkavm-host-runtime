@@ -7,6 +7,7 @@ TOOLCHAIN="${POLKAVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
   "polkavm-app-v2/host-frame-roundtrip polkavm_host_frame_roundtrip host-frame-roundtrip.polkavm"
   "polkavm-app-v2/core-services polkavm_app_core_services app-core-services.polkavm"
+  "polkavm-app-v2/core-services polkavm_app_core_services app-core-services-64.polkavm 64"
   "polkavm-app-v2/ui-output polkavm_ui_output ui-output.polkavm"
   "polkavm-app-v2/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
   "polkadot-host-computer-0.1/core-context polkavm_computer_core_context computer-core-context.polkavm"
@@ -29,13 +30,13 @@ done
 
 rustup component add rust-src --toolchain "$TOOLCHAIN" >/dev/null
 RUSTC="$(rustup which --toolchain "$TOOLCHAIN" rustc)"
-TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness 32)"
-TARGET_NAME="$(basename "$TARGET_JSON" .json)"
 TARGET_DIR="$(mktemp -d)"
 trap 'rm -rf "$TARGET_DIR"' EXIT
 
 for guest in "${GUESTS[@]}"; do
-  read -r directory artifact fixture <<<"$guest"
+  read -r directory artifact fixture bitness <<<"$guest"
+  TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness "${bitness:-32}")"
+  TARGET_NAME="$(basename "$TARGET_JSON" .json)"
   cargo +"$TOOLCHAIN" build \
     -Z build-std=core \
     --locked \

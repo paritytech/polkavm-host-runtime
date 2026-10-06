@@ -18,6 +18,10 @@ extern "C" {
 
 #[polkavm_derive::polkavm_export]
 extern "C" fn init() {
+    sample_services();
+}
+
+fn sample_services() {
     let mut output = [0u8; OUTPUT_BYTES];
     let mut monotonic_first = 0u64;
     let mut monotonic_second = 0u64;
@@ -50,7 +54,9 @@ extern "C" fn init() {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn update() {}
+extern "C" fn update() {
+    sample_services();
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
