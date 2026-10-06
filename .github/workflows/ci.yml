@@ -37,22 +37,25 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base="$PR_BASE"
           elif [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-            base="$(git rev-parse "$HEAD_SHA^")"
+            base="$(git hash-object -t tree /dev/null)"
           fi
           rust=false
           browser=false
-          while IFS= read -r file; do
+          changed_files="$(mktemp)"
+          trap 'rm -f "$changed_files"' EXIT
+          git diff --name-only -z "$base" "$HEAD_SHA" > "$changed_files"
+          while IFS= read -r -d '' file; do
             case "$file" in
               Cargo.toml|Cargo.lock|rust-toolchain.toml|rust/*|conformance/*|.github/*)
                 rust=true
                 ;;
             esac
             case "$file" in
-              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/crates/polkavm-host-runtime/*|rust/crates/polkavm-gpu-wire/*|rust/crates/polkavm-motion-wire/*|rust/crates/polkavm-host-runtime-assets/*|conformance/*|js/*|scripts/*|.github/*)
+              Cargo.toml|Cargo.lock|rust-toolchain.toml|package.json|package-lock.json|rust/*|conformance/*|js/*|scripts/*|licenses/*|THIRD_PARTY_NOTICES.md|LICENSE|.github/*)
                 browser=true
                 ;;
             esac
-          done < <(git diff --name-only "$base" "$HEAD_SHA")
+          done < "$changed_files"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "browser=$browser" >> "$GITHUB_OUTPUT"
 
@@ -71,6 +74,8 @@ jobs:
         run: |
           rustup toolchain install nightly-2025-10-09 --profile minimal --component rust-src
           cargo install polkatool --version 0.31.0 --locked
+          cargo install polkatool --git https://github.com/paritytech/polkavm.git --rev c160c13c3c29bf3219ce1404ec95976000235a94 --locked --root "$RUNNER_TEMP/polkatool-runtime"
+          echo "POLKAVM_64_POLKATOOL=$RUNNER_TEMP/polkatool-runtime/bin/polkatool" >> "$GITHUB_ENV"
       - name: Format
         run: cargo +nightly fmt --check
       - name: Clippy
@@ -97,9 +102,13 @@ jobs:
           node-version: 22
           cache: npm
       - name: Install pinned Rust browser target
-        run: rustup toolchain install 1.97.1 --profile minimal --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.97.1 --profile minimal --component rust-src,rust-docs --target wasm32-unknown-unknown
       - name: Install JavaScript dependencies
         run: npm ci
+      - name: Fetch locked sources for offline attribution
+        run: cargo fetch --locked
+      - name: Verify third-party attribution
+        run: node scripts/generate-third-party-notices.mjs --check
       - name: Build, test, and reproduce assets
         run: npm test
       - name: Upload reproduced browser assets
@@ -123,6 +132,7 @@ jobs:
     steps:
       - name: Require every selected lane
         env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
           RUST_SELECTED: ${{ needs.changes.outputs.rust }}
           RUST_RESULT: ${{ needs.rust.result }}
           BROWSER_SELECTED: ${{ needs.changes.outputs.browser }}
@@ -130,6 +140,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change classification: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          for selected in "$RUST_SELECTED" "$BROWSER_SELECTED"; do
+            if [[ "$selected" != "true" && "$selected" != "false" ]]; then
+              echo "Invalid lane selection: $selected" >&2
+              exit 1
+            fi
+          done
           if [[ "$RUST_SELECTED" == "true" && "$RUST_RESULT" != "success" ]]; then
             echo "Rust runtime lane: $RUST_RESULT" >&2
             exit 1

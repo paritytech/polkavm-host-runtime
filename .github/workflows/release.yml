@@ -18,7 +18,7 @@ jobs:
           node-version: 22
           cache: npm
       - name: Install pinned Rust browser target
-        run: rustup toolchain install 1.97.1 --profile minimal --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.97.1 --profile minimal --component rust-src,rust-docs --target wasm32-unknown-unknown
       - name: Verify tag and package version
         env:
           TAG: ${{ github.ref_name }}
@@ -34,6 +34,8 @@ jobs:
       - name: Build and test release source
         run: |
           npm ci
+          cargo fetch --locked
+          npm run verify:notices
           npm test
           cargo test --workspace --all-features --locked
       - name: Package release artifacts

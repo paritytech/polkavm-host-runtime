@@ -1,0 +1,330 @@
+[
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"snes-rom\",\"label\":\"SNES cartridge image\",\"extensions\":[\".sfc\",\".smc\"],\"maxBytes\":16777216,\"delivery\":\"relaunch\",\"mountPath\":\"game/cartridge.sfc\"}",
+    "valid": true
+  },
+  {
+    "descriptor": " \n{ \"delivery\" : \"inline\", \"maxBytes\" : 8388608, \"mimeTypes\" : [\"text/plain\", \"application/vnd.oasis.opendocument.text\"], \"label\" : \"Document\", \"id\" : \"a1-b2\" }\t",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"a\",\"label\":\"L\",\"extensions\":[\".x\"],\"mimeTypes\":[],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"a\",\"label\":\"L\",\"extensions\":[],\"mimeTypes\":[\"a/b\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"a\",\"label\":\"éééééééééééééééééééééééééééééééééééééééé\",\"extensions\":[\".abcdefghijklmnop\"],\"delivery\":\"relaunch\",\"maxBytes\":134217728,\"mountPath\":\"a/b/c.bin\"}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"i\\u0064\":\"doc\",\"label\":\"\\u00e9\\ud83d\\ude00\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"label\":\"L\",\"extensions\":[\".x\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"a\",\"label\":\"L\",\"mimeTypes\":[\"application/x-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "[\"doc\",\"Text document\",[\".txt\"],[],\"inline\",1024]",
+    "valid": false
+  },
+  {
+    "descriptor": "\"doc\"",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024,\"extra\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024,\"id\":\"doc\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024,\"maxBytes\":1024}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024.0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1e3}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":-0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":\"1024\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":8388609}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"relaunch\",\"maxBytes\":134217729,\"mountPath\":\"a\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":18446744073709551616}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"stream\",\"maxBytes\":1}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Large file\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":4294967295}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Large file\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":4294967296}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1.0}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1,\"mountPath\":\"data.bin\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"File\",\"extensions\":[\".bin\"],\"delivery\":\"stream\",\"maxBytes\":1,\"mountPath\":null}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"Inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024,\"mountPath\":\"a.txt\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1024,\"mountPath\":null}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"Text document\",\"extensions\":null,\"mimeTypes\":[\"a/b\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"relaunch\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"-doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc-\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"Doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"do_c\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"label\":\"L\",\"extensions\":[\".x\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[],\"mimeTypes\":[],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\"txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".TXT\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".t-t\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".abcdefghijklmnopq\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".a\",\".a\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".e0\",\".e1\",\".e2\",\".e3\",\".e4\",\".e5\",\".e6\",\".e7\",\".e8\",\".e9\",\".e10\",\".e11\",\".e12\",\".e13\",\".e14\",\".e15\",\".e16\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[1],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"text/*\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"text/plain; charset=utf-8\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"Text/plain\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"text\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"text/plain/x\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"/plain\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"mimeTypes\":[\"a/b\",\"a/b\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"a\",\"label\":\"L\",\"mimeTypes\":[\"application/x-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"/game.bin\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"game//a\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"./game\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"game/..\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"a\\\\b\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"a\\u0001b\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"a\\u007fb\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"a\\u0085b\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"rom\",\"label\":\"L\",\"extensions\":[\".bin\"],\"delivery\":\"relaunch\",\"maxBytes\":1,\"mountPath\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "valid": true
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"\\ud800\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"a\tb\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1,}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1} x",
+    "valid": false
+  },
+  {
+    "descriptor": "﻿{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":01}",
+    "valid": false
+  },
+  {
+    "descriptor": "{\"id\":\"doc\",\"label\":\"L\",\"extensions\":[\".txt\"],\"delivery\":\"inline\",\"maxBytes\":1",
+    "valid": false
+  },
+  {
+    "descriptor": "{}",
+    "valid": false
+  },
+  {
+    "descriptor": "",
+    "valid": false
+  }
+]

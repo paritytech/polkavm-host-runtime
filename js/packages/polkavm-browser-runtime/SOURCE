@@ -1,10 +1,10 @@
 PolkaVM App v2 browser runtime
 Source repository: https://github.com/paritytech/polkavm-host-runtime
-Release tag: v0.3.0
+Development package: 0.3.2-background.0 (unreleased)
 Rust crate: rust/crates/polkavm-host-runtime
 GPU wire crate: rust/crates/polkavm-gpu-wire
-PolkaVM native revision: c160c13c3c29bf3219ce1404ec95976000235a94
-PolkaVM wasm revision: c160c13c3c29bf3219ce1404ec95976000235a94
+PolkaVM native revision: 642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5
+PolkaVM wasm revision: 642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5
 
 The package build compiles polkavm-host-runtime for wasm32-unknown-unknown and bundles
 its bounded PolkaVM worker plus the Tri2D/WebGPU browser transport.

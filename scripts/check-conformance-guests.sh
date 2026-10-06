@@ -6,10 +6,11 @@ FIXTURES="$ROOT/rust/crates/polkavm-host-runtime/tests/fixtures"
 TOOLCHAIN="${POLKAVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
   "polkavm-app-v2/host-frame-roundtrip polkavm_host_frame_roundtrip host-frame-roundtrip.polkavm"
-  "polkavm-app-v2/core-services polkavm_app_core_services app-core-services.polkavm"
-  "polkavm-app-v2/core-services polkavm_app_core_services app-core-services-64.polkavm 64"
   "polkavm-app-v2/ui-output polkavm_ui_output ui-output.polkavm"
   "polkavm-app-v2/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
+  "polkavm-app-v2/core-services polkavm_app_core_services application-core-services.polkavm"
+  "polkavm-app-v2/core-services polkavm_app_core_services application-core-services-64.polkavm 64"
+  "polkavm-app-v2/mediated-input polkavm_mediated_input mediated-input.polkavm"
   "polkadot-host-computer-0.1/core-context polkavm_computer_core_context computer-core-context.polkavm"
   "polkadot-host-computer-0.1/core-services polkavm_computer_core_services computer-core-services.polkavm"
   "polkadot-host-computer-0.1/tty-fs-roundtrip polkavm_computer_tty_fs_roundtrip computer-tty-fs-roundtrip.polkavm"
@@ -35,6 +36,12 @@ trap 'rm -rf "$TARGET_DIR"' EXIT
 
 for guest in "${GUESTS[@]}"; do
   read -r directory artifact fixture bitness <<<"$guest"
+  # Latest64 changed its code encoding after polkatool 0.31. Keep the existing
+  # 32-bit fixture linker, but use the runtime's exact PolkaVM pin for 64-bit.
+  LINKER=polkatool
+  if [[ "${bitness:-32}" == 64 ]]; then
+    LINKER="${POLKAVM_64_POLKATOOL:?set to polkatool built from c160c13c3c29bf3219ce1404ec95976000235a94}"
+  fi
   TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness "${bitness:-32}")"
   TARGET_NAME="$(basename "$TARGET_JSON" .json)"
   cargo +"$TOOLCHAIN" build \
@@ -45,7 +52,7 @@ for guest in "${GUESTS[@]}"; do
     --target "$TARGET_JSON" \
     --release
 
-  polkatool link \
+  "$LINKER" link \
     "$TARGET_DIR/$TARGET_NAME/release/$artifact.elf" \
     -o "$TARGET_DIR/$fixture"
 

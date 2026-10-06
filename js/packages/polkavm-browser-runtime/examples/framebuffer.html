@@ -1,0 +1,20 @@
+<!doctype html>
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+<meta charset="utf-8">
+<title>PolkaVM browser session — framebuffer fixture</title>
+<style>
+  body { font: 16px system-ui; margin: 2rem; background: #181818; color: #eee; }
+  canvas { display: block; width: 640px; max-width: 100%; image-rendering: pixelated; margin: 1rem 0; }
+</style>
+<h1>PolkaVM framebuffer fixture</h1>
+<p>Build the browser package, serve the repository root over HTTP, then open this
+  page. Pixels below come from the real framebuffer guest, not a browser animation.</p>
+<p>The host owns rendering and permission policy; this example grants no host prompts.</p>
+<canvas width="320" height="200" aria-label="Guest framebuffer"></canvas>
+<button id="pause" disabled>Pause</button>
+<button id="background" disabled>Background</button>
+<button id="stop" disabled>Stop and release worker</button>
+<pre id="status">Loading runtime and fixture…</pre>
+<script type="module" src="./framebuffer.js"></script>
