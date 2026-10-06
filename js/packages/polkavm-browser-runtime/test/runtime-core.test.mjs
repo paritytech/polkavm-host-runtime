@@ -1566,7 +1566,7 @@ test("translated mediated input charges each byte once and rejects malformed or 
   await waitForMessage(messages, "terminated");
   const outputs = [];
   const translated = new globalThis.TranslatedPolkaVmRuntime(
-    compiled.module, [], output => outputs.push(output), 1_000_000,
+    compiled.program, [], output => outputs.push(output), 1_000_000,
     false, "tri2d", null, 0, ["camera-ur"],
   );
   const budget = 32 * 1024 * 1024;

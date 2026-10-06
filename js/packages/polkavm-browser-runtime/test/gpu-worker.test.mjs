@@ -1182,16 +1182,18 @@ function occlusionPass(count, token = 0) {
 }
 
 function occlusionEngine() {
-  const engine = validationEngine();
   const gates = [];
   const passCalls = [];
   const buffers = [];
   const bytes = buffer => new Uint8Array(buffer.storage);
-  Object.assign(engine, {
-    occlusionDelivery: Promise.resolve(),
-    occlusionEpoch: 0,
-    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+  const backend = {
+    context: {
+      configure() {},
+      getCurrentTexture: () => ({ createView: () => ({}) }),
+    },
     device: {
+      addEventListener() {},
+      lost: new Promise(() => {}),
       pushErrorScope() {},
       popErrorScope: async () => null,
       createQuerySet: ({ count }) => ({ samples: new Array(count).fill(0n), destroy() {} }),
@@ -1234,7 +1236,21 @@ function occlusionEngine() {
     emitBatchRejected(...args) {
       assert.fail(`valid occlusion batch was rejected: ${args[3]}`);
     },
-  });
+  };
+  // Exercise lifecycle methods with constructor-initialized recovery state;
+  // validationEngine deliberately only models batch validation.
+  const engine = new GpuEngine(
+    {},
+    backend.device,
+    backend.context,
+    "rgba8unorm",
+    validationEngine().limits,
+    { physicalWidth: 64, physicalHeight: 64, logicalWidth: 64, logicalHeight: 64, scale: 1 },
+    false,
+    false,
+    {},
+  );
+  engine.emitBatchRejected = backend.emitBatchRejected;
   return { engine, gates, passCalls, buffers };
 }
 
@@ -1350,6 +1366,7 @@ test("reset destroys pending query buffers and fresh results bypass an abandoned
 
 test("backend rejection releases all query resources without emitting results", async () => {
   const { engine, buffers } = occlusionEngine();
+  const initialSequence = engine.lastSequence;
   let scopes = 0;
   engine.device.popErrorScope = async () => ++scopes === 2 ? { message: "invalid pass" } : null;
   const rejected = [];
@@ -1360,7 +1377,7 @@ test("backend rejection releases all query resources without emitting results", 
   assert.match(rejected[0][3], /invalid pass/);
   assert.equal(engine.occlusionReadbacks.size, 0);
   assert.ok(buffers.every(buffer => buffer.destroyed));
-  assert.equal(engine.lastSequence, 0n);
+  assert.equal(engine.lastSequence, initialSequence, "rejected batches do not advance sequencing");
   engine.stop();
 });
 
@@ -1393,6 +1410,7 @@ test("device restoration fences old batches waiting for backend validation", asy
     engine.stopped = true;
     engine.abandonOcclusionResults();
     await engine.restore();
+    assert.equal(engine.device, replacement.device, "recovery installs the acquired device");
     await engine.execute(commands([[1, u32s([handle(10), 8, 4, 0])]]));
     scopes.forEach(resolveScope => resolveScope(null));
     await oldQueue;
