@@ -56,7 +56,12 @@ Host MUST NOT enter the same program concurrently.
 The Host selects and enforces a nonzero gas budget for each call. It MAY
 execute that budget as smaller internal quanta, returning to its scheduler and
 resuming the same call between quanta. This preserves the program counter,
-registers, memory, and remaining call budget; it is not a transparent restart.
+registers, memory, remaining call budget, scheduling requests, and per-call
+Host-service bounds; it is not a transparent restart. A hostcall scheduling
+quantum ending MUST NOT refill the guest's gas. The translated browser runtime
+keeps the VM's remaining gas across hostcall yields and charges each exhausted
+gas quantum's refill against the call's configured slice allowance. Reduced
+initialization budgets do not receive additional gas quanta.
 Exhausting the complete call budget, a trap, invalid guest-memory access, or a
 Host-call budget failure fails the current execution. ABI v1 does not restart
 a failed program transparently.
@@ -119,12 +124,15 @@ host_update_after(delay_ms: u32) -> ()
 
 Importing `host_update_after` opts a cooperative application guest into
 demand-driven updates. The Host performs the first `update` after `init`
-automatically. Before each later update, the Host clears the previous request.
-Calls made during that Host update select the smallest requested delay.
+automatically. Before each later logical update, the Host clears the previous
+request. Calls made during that update, including all of its gas and hostcall
+continuations, select the smallest requested delay.
 
 The CoreVM compatibility path recognizes the same import and applies equivalent
-behavior to the initial `_pvm_start` slice and each later resume. This is Host
-compatibility behavior, not part of the portable CoreVM contract.
+behavior between intentional frame yields: a frame yield starts a new
+scheduling and resource-budget boundary, but a gas or hostcall quantum does
+not. This is Host compatibility behavior, not part of the portable CoreVM
+contract.
 
 `delay_ms == 0` requests another update as soon as the Host can schedule it.
 `delay_ms == u32::MAX` requests no timer; the Host waits until input, a

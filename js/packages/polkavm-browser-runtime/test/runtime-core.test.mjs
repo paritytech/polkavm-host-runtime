@@ -16,7 +16,10 @@ function bytesBuffer(bytes) {
   );
 }
 
-function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
+function partitionedGuestBytes({
+  outOfGasOnBegin = false,
+  meteredHostcalls = null,
+} = {}) {
   const uleb = (value) => {
     const bytes = [];
     do {
@@ -25,6 +28,17 @@ function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
       bytes.push(byte | (value ? 0x80 : 0));
     } while (value);
     return bytes;
+  };
+  const sleb = (value) => {
+    const bytes = [];
+    for (;;) {
+      const byte = value & 0x7f;
+      value >>= 7;
+      const done = (value === 0 && !(byte & 0x40)) ||
+        (value === -1 && (byte & 0x40));
+      bytes.push(byte | (done ? 0 : 0x80));
+      if (done) return bytes;
+    }
   };
   const string = (value) => {
     const bytes = [...new TextEncoder().encode(value)];
@@ -75,15 +89,49 @@ function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
   const metadataExport = (name) => [
     name.length, 0, ...new TextEncoder().encode(name), 0, 0, 0, 0,
   ];
+  const metadataString = (name) => [
+    name.length, 0, ...new TextEncoder().encode(name),
+  ];
   const metadata = [
     ...new TextEncoder().encode("EPM2"),
     1, 0, 0, 0, // 64-bit registers
-    ...new Array(11 * 4).fill(0), // no hostcall address translation needed
-    0, 0, 0, 0, // imports
-    2, 0, 0, 0, // exports
-    ...metadataExport("init"),
-    ...metadataExport("update"),
+    ...new Array(9 * 4).fill(0),
+    0, 0, 1, 0, // stackHigh = 65536, identity-mapped memory
+    0, 0, 0, 0, // stackPhysical
+    ...(meteredHostcalls
+      ? [
+        meteredHostcalls.frames ? 2 : 1, 0, 0, 0,
+        ...metadataString("host_update_after"),
+        ...(meteredHostcalls.frames ? metadataString("pvm_display") : []),
+        meteredHostcalls.entry === "init" ? 2 : 1, 0, 0, 0,
+        ...(meteredHostcalls.entry === "init" ? metadataExport("init") : []),
+        ...metadataExport(meteredHostcalls.frames ? "_pvm_start" : "update"),
+      ]
+      : [
+        0, 0, 0, 0, // imports
+        2, 0, 0, 0, // exports
+        ...metadataExport("init"),
+        ...metadataExport("update"),
+      ]),
   ];
+  // A real Wasm dispatcher: each ECALL costs gas, resumes at the next call,
+  // and leaves its remaining gas in the same exported global as the compiler.
+  const meteredResume = meteredHostcalls ? [
+    0x23, 14, 0x41, ...sleb(meteredHostcalls.count), 0x4f, // calls >= count
+    0x04, 0x40, 0x41, 0x7f, 0x0f, 0x0b, // return FINISHED
+    0x23, 13, 0x42, ...sleb(meteredHostcalls.cost), 0x53, // gas < cost
+    0x04, 0x40, 0x41, 0x7c, 0x0f, 0x0b, // return OUT_OF_GAS
+    0x23, 13, 0x42, ...sleb(meteredHostcalls.cost), 0x7d, 0x24, 13,
+    0x42, 23, 0x42, 50, 0x23, 14, 0x45, 0x1b, 0x24, 7, // first delay 23, then 50
+    ...(meteredHostcalls.frames ? [
+      0x23, 14, 0x41, 1, 0x71, 0x24, 15, // odd calls display, even calls schedule
+      0x23, 15, 0x04, 0x40,
+      0x42, 1, 0x24, 7, 0x42, 1, 0x24, 8, // 1x1 frame at address 0
+      0x0b,
+    ] : []),
+    0x23, 14, 0x41, 1, 0x6a, 0x24, 14, // calls++
+    0x41, 0x7e, // ECALL
+  ] : null;
   const rootSections = [
     section(0, [...string("epoca.pvm.meta"), ...metadata]),
     section(
@@ -94,12 +142,17 @@ function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
         [0x60, 1, 0x7e, 0], // set_gas(i64)
       ]),
     ),
-    section(3, outOfGasOnBegin ? [4, 0, 1, 2, 0] : [3, 0, 1, 2]),
+    section(3, outOfGasOnBegin || meteredHostcalls
+      ? [4, 0, 1, 2, 0] : [3, 0, 1, 2]),
     section(4, [1, 0x70, 0, 2]),
     section(5, [1, 0, 1]),
     section(
       6,
-      vector(Array.from({ length: 14 }, () => [0x7e, 1, 0x42, 0, 0x0b])),
+      vector([
+        ...Array.from({ length: 14 }, () => [0x7e, 1, 0x42, 0, 0x0b]),
+        [0x7f, 1, 0x41, 0, 0x0b], // completed hostcalls
+        [0x7f, 1, 0x41, 0, 0x0b], // ecall import index
+      ]),
     ),
     section(
       7,
@@ -110,7 +163,11 @@ function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
         exportEntry("__helper0", 0, 0),
         exportEntry("pvm_begin", 0, 1),
         exportEntry("pvm_set_gas", 0, 2),
-        ...(outOfGasOnBegin ? [exportEntry("pvm_resume", 0, 3)] : []),
+        ...(outOfGasOnBegin || meteredHostcalls
+          ? [exportEntry("pvm_resume", 0, 3)] : []),
+        exportEntry("gas", 3, 13),
+        exportEntry("calls", 3, 14),
+        exportEntry("ecall", 3, 15),
         ...Array.from({ length: 13 }, (_, index) =>
           exportEntry(`r${index}`, 3, index),
         ),
@@ -120,11 +177,19 @@ function partitionedGuestBytes({ outOfGasOnBegin = false } = {}) {
       10,
       vector([
         body([0x41, 0, 0x28, 2, 0]), // helper reads memory[0]
-        body(outOfGasOnBegin
-          ? [0x41, 0x7c] // STATUS_OUT_OF_GAS
-          : [0x20, 1, 0x24, 13, 0x20, 0, 0x13, 0, 0]),
+        body(meteredHostcalls
+          ? [
+            0x20, 1, 0x24, 13, // gas = begin argument
+            0x41, 0, 0x24, 14, // calls = 0
+            0x12, 3, // tail-call metered dispatcher
+          ]
+          : outOfGasOnBegin
+            ? [0x41, 0x7c] // STATUS_OUT_OF_GAS
+            : [0x20, 1, 0x24, 13, 0x20, 0, 0x13, 0, 0]),
         body([0x20, 0, 0x24, 13]),
-        ...(outOfGasOnBegin ? [body([0x41, 0, 0x13, 0, 0])] : []),
+        ...(meteredHostcalls
+          ? [body(meteredResume)]
+          : outOfGasOnBegin ? [body([0x41, 0, 0x13, 0, 0])] : []),
       ]),
     ),
   ];
@@ -208,6 +273,124 @@ test("translated execution resumes after exhausting a gas slice", async () => {
     /translated PolkaVM guest ran out of gas/,
   );
   bounded.stop();
+});
+
+async function meteredRuntime({ count, cost, entry, frames, gas, slices = 1 }) {
+  const Runtime = globalThis.TranslatedPolkaVmRuntime;
+  const { root } = partitionedGuestBytes({
+    meteredHostcalls: { count, cost, entry, frames },
+  });
+  return new Runtime(
+    await Runtime.compile(root), [], () => {}, gas, false, "framebuffer",
+    null, 0, [], null, slices,
+  );
+}
+
+test("translated scheduling requests and call bounds survive gas continuations", async () => {
+  const runtime = await meteredRuntime({
+    count: 2, cost: 100, gas: 100, slices: 2,
+  });
+  runtime.initialize();
+  runtime.update(1);
+  assert.equal(runtime.hasPendingContinuation(), true);
+  assert.equal(runtime.updateAfterMilliseconds(), 23);
+  // These bounds belong to the logical call, not the worker's scheduling tick.
+  runtime.gpuSubmits = 1;
+  runtime.hostFrameRequests = 2;
+  runtime.hostFrameRequestBytes = 3;
+  runtime.uiSemanticsSubmitted = true;
+  runtime.uiOutputSubmitted = true;
+  runtime.tri2dSubmitted = true;
+  runtime.mediatedInputCommands = 4;
+  runtime.hostcallBytes = 5;
+  runtime.update(2);
+  assert.equal(runtime.hasPendingContinuation(), false);
+  assert.equal(runtime.updateAfterMilliseconds(), 23, "retain the earliest request");
+  const callBounds = () => [
+    runtime.gpuSubmits, runtime.hostFrameRequests, runtime.hostFrameRequestBytes,
+    runtime.uiSemanticsSubmitted, runtime.uiOutputSubmitted, runtime.tri2dSubmitted,
+    runtime.mediatedInputCommands, runtime.hostcallBytes,
+  ];
+  assert.deepEqual(callBounds(), [1, 2, 3, true, true, true, 4, 5]);
+  runtime.update(3);
+  assert.deepEqual(callBounds(), [0, 0, 0, false, false, false, 0, 32 * 1024 * 1024]);
+  assert.equal(runtime.pvm.calls.value, 1, "the next update starts a new call");
+  runtime.stop();
+  runtime.update(4);
+  assert.equal(runtime.pvm.calls.value, 1, "stop must not resume a pending call");
+});
+
+test("translated hostcall yields cannot refill the complete-call gas budget", async () => {
+  const runtime = await meteredRuntime({
+    count: 4 * 65536 - 1, cost: 100, gas: 10_000_000, slices: 2,
+  });
+  runtime.initialize();
+  runtime.update(1);
+  assert.equal(runtime.pvm.calls.value, 65536);
+  assert.equal(runtime.pvm.gas.value, 3_446_400n);
+  runtime.update(2);
+  assert.equal(runtime.pvm.calls.value, 100000, "exhaust the first gas quantum");
+  runtime.update(3);
+  assert.equal(runtime.pvm.calls.value, 165536);
+  assert.throws(() => runtime.update(4), /guest ran out of gas/);
+  assert.equal(runtime.pvm.calls.value, 200000, "at most two gas quanta are spent");
+  runtime.stop();
+});
+
+test("translated single-slice calls retain unused gas through hostcall yields", async () => {
+  const runtime = await meteredRuntime({
+    count: 65537, cost: 100, gas: 10_000_000,
+  });
+  runtime.initialize();
+  runtime.update(1);
+  assert.equal(runtime.hasPendingContinuation(), true);
+  runtime.update(2);
+  assert.equal(runtime.hasPendingContinuation(), false);
+  assert.equal(runtime.pvm.gas.value, 3_446_300n);
+  assert.equal(runtime.updateAfterMilliseconds(), 23);
+  runtime.stop();
+});
+
+test("translated initialization continues without losing its remaining gas", async () => {
+  const runtime = await meteredRuntime({
+    entry: "init", count: 150000, cost: 100, gas: 10_000_000, slices: 2,
+  });
+  runtime.initialize();
+  assert.equal(runtime.pvm.calls.value, 100000);
+  runtime.update(1);
+  assert.equal(runtime.hasPendingContinuation(), false);
+  assert.equal(runtime.pvm.calls.value, 150000);
+  assert.equal(runtime.pvm.gas.value, 5_000_000n);
+  runtime.stop();
+});
+
+test("translated reduced initialization budgets survive hostcall yields", async () => {
+  const runtime = await meteredRuntime({
+    entry: "init", count: 1024 * 1024 + 2, cost: 1, gas: 2_000_000, slices: 4,
+  });
+  runtime.initialize(1024 * 1024 + 1);
+  assert.equal(runtime.hasPendingContinuation(), true);
+  assert.equal(runtime.pvm.gas.value, 1n);
+  assert.throws(() => runtime.update(1), /guest ran out of gas/);
+  assert.equal(runtime.pvm.calls.value, 1024 * 1024 + 1);
+  runtime.stop();
+});
+
+test("translated CoreVM frame boundaries start fresh scheduling and gas budgets", async () => {
+  const runtime = await meteredRuntime({
+    frames: true, count: 4, cost: 100, gas: 200,
+  });
+  runtime.initialize();
+  runtime.update(1);
+  assert.equal(runtime.pvm.calls.value, 2);
+  assert.equal(runtime.pvm.gas.value, 0n);
+  assert.equal(runtime.hasPendingContinuation(), false, "a frame is not a gas continuation");
+  assert.equal(runtime.updateAfterMilliseconds(), 23);
+  runtime.update(2);
+  assert.equal(runtime.pvm.calls.value, 4, "resume rather than restarting _pvm_start");
+  assert.equal(runtime.pvm.gas.value, 0n, "the next frame gets a fresh gas budget");
+  assert.equal(runtime.updateAfterMilliseconds(), 50, "the old frame's request is cleared");
+  runtime.stop();
 });
 
 test("compiled programs accept root-only modules but reject malformed parts and bare modules", async () => {
