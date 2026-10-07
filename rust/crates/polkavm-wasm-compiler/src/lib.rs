@@ -1159,15 +1159,6 @@ fn emit_load(
         emit_set_reg(f, dst);
         return;
     }
-    if base == Some(Reg::SP.raw()) {
-        let offset = offset
-            .wrapping_sub(context.layout.stack_low as i32)
-            .wrapping_add(context.layout.stack_phys as i32);
-        emit_address(f, base, offset);
-        emit_load_at(f, kind);
-        emit_set_reg(f, dst);
-        return;
-    }
     emit_address(f, base, offset);
     f.instruction(&W::Call(context.load_function_base + kind as u32));
     emit_set_reg(f, dst);
@@ -1213,14 +1204,6 @@ fn emit_store(
         } else {
             emit_trap(f, pc);
         }
-        return;
-    }
-    if base == Some(Reg::SP.raw()) {
-        let offset = offset
-            .wrapping_sub(context.layout.stack_low as i32)
-            .wrapping_add(context.layout.stack_phys as i32);
-        emit_address(f, base, offset);
-        emit_store_value(f, kind, source, immediate);
         return;
     }
     emit_address(f, base, offset);
@@ -2551,6 +2534,36 @@ mod tests {
                 assert!(compile(&program, restricted).is_err());
             }
             assert!(compile(&[], limits).is_err());
+        }
+    }
+
+    #[test]
+    fn heap_backed_fiber_stack_matches_interpreter() {
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            let mut builder = ProgramBlobBuilder::new(isa);
+            builder.set_stack_size(4096);
+            builder.add_export_by_basic_block(0, b"main");
+            builder.set_code(
+                &[
+                    asm::move_reg(Reg::S0, Reg::SP),
+                    asm::load_imm(Reg::A1, 4096),
+                    asm::sbrk(Reg::A0, Reg::A1),
+                    asm::move_reg(Reg::SP, Reg::A0),
+                    asm::load_imm(Reg::A1, 0x12345678),
+                    asm::store_indirect_u32(Reg::A1, Reg::SP, -16),
+                    asm::load_indirect_i32(Reg::A2, Reg::SP, -16),
+                    asm::move_reg(Reg::SP, Reg::S0),
+                    asm::store_indirect_u32(Reg::A2, Reg::SP, -16),
+                    asm::load_indirect_i32(Reg::A3, Reg::SP, -16),
+                    asm::ret(),
+                ],
+                &[],
+            );
+            let program = builder.into_vec().unwrap();
+            let expected = interpreter_registers(&program);
+            assert_eq!(expected[Reg::A2 as usize], 0x12345678);
+            assert_eq!(expected[Reg::A3 as usize], 0x12345678);
+            assert_eq!(translated_registers(&program), expected);
         }
     }
 
