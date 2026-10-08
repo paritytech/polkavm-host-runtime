@@ -394,7 +394,6 @@ test("translated CoreVM frame boundaries start fresh scheduling and gas budgets"
   assert.equal(runtime.updateAfterMilliseconds(), 50, "the old frame's request is cleared");
   runtime.stop();
 });
-
 test("compiled programs accept root-only modules but reject malformed parts and bare modules", async () => {
   const Runtime = globalThis.TranslatedPolkaVmRuntime;
   const { root } = partitionedGuestBytes();
