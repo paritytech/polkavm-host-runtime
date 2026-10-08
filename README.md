@@ -300,19 +300,26 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.6`.
-This candidate is `0.3.2-rc.5` plus the compiler correction for heap-backed
-fiber stacks: SP-relative loads and stores use the same guest-address mapping
-as other dynamic accesses, rather than assuming SP always points into the
-reserved stack segment. This lets OpenHV's managed fibers use the compiled
-browser backend. The 32-bit and 64-bit regression compares heap-backed and
-reserved-stack accesses with the interpreter.
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.7`.
+This candidate adds exact binary32 add/multiply intrinsics, accepting and returning
+raw IEEE-754 bits. Native execution, browser fallback and translated Wasm preserve
+round-to-nearest-even, subnormals, signed zero, and the documented NaN payload/sign
+rules. The bounded intrinsics consume guest gas without consuming Host I/O quotas.
+Translated float calls continue directly into the next block when it belongs to
+the same generated function; gas checks and real Host-call suspension are retained.
+No sustained application FPS improvement is claimed by this release.
+
+The candidate retains `0.3.2-rc.6`'s correction for heap-backed fiber stacks:
+SP-relative loads and stores use the same guest-address mapping as other dynamic
+accesses, rather than assuming SP always points into the reserved stack segment.
+The 32-bit and 64-bit regression compares heap-backed and reserved-stack accesses
+with the interpreter.
 The candidate retains the surface-resize fix: offscreen passes retain their
 resources across resize, stale default-surface passes report error `4` with
 the offending command index, and offscreen/resource-only work does not count
 as a presented frame. It retains PolkaVM engine
 `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` and the prior translated-dispatch
-optimization, without adding the unfinished binary32 or checkpoint changes.
+optimization, without adding the unfinished checkpoint changes.
 It remains a prerelease, not a stable compatibility promise. The release generator
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.

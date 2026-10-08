@@ -5,7 +5,9 @@
 //! Host-independent PolkaVM-to-WebAssembly compilation.
 //!
 //! Callers supply resource policy through [`Limits`]. This crate emits modules;
-//! it does not execute guest code, implement hostcalls, or manage browser workers.
+//! it does not execute guest code or manage browser workers. The reserved pure
+//! arithmetic imports `host_f32_add` and `host_f32_mul` lower to Wasm arithmetic;
+//! all other hostcalls return to the embedding Host.
 //!
 //! # Output ABI
 //!
@@ -187,6 +189,17 @@ fn translate_with_part_limit(
     }
     let metered_targets = collect_metered_targets(&instructions);
 
+    let float_imports: Vec<_> = blob
+        .imports()
+        .into_iter()
+        .map(|symbol| {
+            symbol.and_then(|symbol| match symbol.as_bytes() {
+                b"host_f32_add" => Some(FloatOperation::Add),
+                b"host_f32_mul" => Some(FloatOperation::Mul),
+                _ => None,
+            })
+        })
+        .collect();
     let layout = build_layout(&blob, limits.max_heap_bytes)?;
     let targets = collect_block_targets(&blob, &instructions)?;
     let (blocks, block_by_pc) = build_blocks(&instructions, &targets)?;
@@ -349,6 +362,7 @@ fn translate_with_part_limit(
         metered_targets: &metered_targets,
         bswap64_function: 2,
         is_64_bit: blob.is_64_bit(),
+        float_imports: &float_imports,
         indirect_function: 3,
         return_function: 4,
         physical_address_function: 5,
@@ -702,6 +716,12 @@ fn collect_metered_targets(instructions: &[ParsedInstruction]) -> Vec<u32> {
 }
 
 #[derive(Clone, Copy)]
+enum FloatOperation {
+    Add,
+    Mul,
+}
+
+#[derive(Clone, Copy)]
 struct EmitContext<'a> {
     layout: Layout,
     block_by_pc: &'a BlockMap,
@@ -713,6 +733,7 @@ struct EmitContext<'a> {
     metered_targets: &'a [u32],
     bswap64_function: u32,
     is_64_bit: bool,
+    float_imports: &'a [Option<FloatOperation>],
     indirect_function: u32,
     return_function: u32,
     physical_address_function: u32,
@@ -969,7 +990,7 @@ fn emit_block_group(
     f.instruction(&W::GlobalGet(GLOBAL_PC));
     f.instruction(&W::LocalSet(LOCAL_ADDR));
     emit_switch(&mut f, blocks.len(), LOCAL_ADDR, BLOCKS_PER_FUNCTION);
-    for block in blocks {
+    for (block_index, block) in blocks.iter().enumerate() {
         f.instruction(&W::End);
         if context
             .metered_targets
@@ -986,7 +1007,24 @@ fn emit_block_group(
             }
         }
         if !terminated {
-            emit_block_target(context, &mut f, block.last().unwrap().next_offset.0)?;
+            let last = block.last().unwrap();
+            // Real hostcalls terminate above. Only lowered arithmetic ECALLs
+            // can continue into the adjacent case without re-entering this
+            // function's dispatcher. Keep its PC and gas-check entry intact.
+            if matches!(last.kind, PvmInstruction::ecalli(_))
+                && blocks
+                    .get(block_index + 1)
+                    .is_some_and(|next| next[0].offset == last.next_offset)
+            {
+                let target = context
+                    .block_by_pc
+                    .get(last.next_offset.0)
+                    .ok_or_else(|| anyhow!("arithmetic continuation is not a block"))?;
+                f.instruction(&W::I32Const(target as i32));
+                f.instruction(&W::GlobalSet(GLOBAL_PC));
+            } else {
+                emit_block_target(context, &mut f, last.next_offset.0)?;
+            }
         }
     }
     f.instruction(&W::End);
@@ -1593,6 +1631,10 @@ fn emit_instruction(
             return Ok(true);
         }
         ecalli(index) => {
+            if let Some(Some(operation)) = context.float_imports.get(index as u32 as usize) {
+                emit_float32(f, *operation);
+                return Ok(false);
+            }
             f.instruction(&W::I32Const(index));
             f.instruction(&W::GlobalSet(GLOBAL_ECALL));
             let next = context
@@ -1998,6 +2040,57 @@ fn emit_instruction(
         }
     }
     Ok(false)
+}
+
+// These imports have fixed, pure ABI semantics. Preserve their specified NaN
+// payload/sign selection explicitly: Wasm's arithmetic NaN payload is otherwise
+// engine-dependent. Other guest registers and memory remain untouched.
+fn emit_float32(f: &mut Function, operation: FloatOperation) {
+    // A non-NaN result needs no operand repair. Read the original register bits
+    // only on the NaN path, before writing A0, so native NaN canonicalization
+    // cannot lose the selected operand's payload or sign.
+    for reg in [Reg::A0, Reg::A1] {
+        f.instruction(&W::GlobalGet(reg.to_u32()));
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::F32ReinterpretI32);
+    }
+    f.instruction(&match operation {
+        FloatOperation::Add => W::F32Add,
+        FloatOperation::Mul => W::F32Mul,
+    });
+    f.instruction(&W::I32ReinterpretF32);
+    f.instruction(&W::LocalTee(LOCAL_ADDR));
+    f.instruction(&W::I32Const(0x7fffffff));
+    f.instruction(&W::I32And);
+    f.instruction(&W::I32Const(0x7f800000));
+    f.instruction(&W::I32GtU);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    for reg in [Reg::A0, Reg::A1] {
+        f.instruction(&W::GlobalGet(reg.to_u32()));
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::LocalTee(LOCAL_PHYS));
+        f.instruction(&W::I32Const(0x7fffffff));
+        f.instruction(&W::I32And);
+        f.instruction(&W::I32Const(0x7f800000));
+        f.instruction(&W::I32GtU);
+        f.instruction(&W::If(BlockType::Result(ValType::I32)));
+        f.instruction(&W::LocalGet(LOCAL_PHYS));
+        if matches!(operation, FloatOperation::Add) {
+            f.instruction(&W::I32Const(0x7fffffff));
+            f.instruction(&W::I32And);
+        }
+        f.instruction(&W::I32Const(0x00400000));
+        f.instruction(&W::I32Or);
+        f.instruction(&W::Else);
+    }
+    f.instruction(&W::I32Const(0x7fc00000));
+    f.instruction(&W::End);
+    f.instruction(&W::End);
+    f.instruction(&W::Else);
+    f.instruction(&W::LocalGet(LOCAL_ADDR));
+    f.instruction(&W::End);
+    f.instruction(&W::I64ExtendI32U);
+    f.instruction(&W::GlobalSet(Reg::A0.to_u32()));
 }
 
 fn emit_memset(context: &EmitContext<'_>, f: &mut Function, pc: u32) {
@@ -3043,6 +3136,194 @@ mod tests {
                     .i64(),
                 Some(value),
             );
+        }
+    }
+
+    #[test]
+    fn float_intrinsics_preserve_bits_and_other_registers() {
+        let add: [(u32, u32, u32); 14] = [
+            (0x3f800000, 0x33800000, 0x3f800000), // halfway, even down
+            (0x3f800001, 0x33800000, 0x3f800002), // halfway, even up
+            (0x00800000, 0x80000001, 0x007fffff),
+            (0x00000001, 0x00000001, 0x00000002),
+            (0x7f7fffff, 0x7f7fffff, 0x7f800000),
+            (0x3f800000, 0xbf800000, 0x00000000),
+            (0x80000000, 0x80000000, 0x80000000),
+            (0x80000000, 0x00000000, 0x00000000),
+            (0xff800123, 0x7fc32100, 0x7fc00123),
+            (0x3f800000, 0xffc01234, 0x7fc01234),
+            (0x7f800000, 0xff800000, 0x7fc00000),
+            (0x7f800000, 0x3f800000, 0x7f800000),
+            (0xff800000, 0xff800000, 0xff800000),
+            (0x7fc32100, 0xff800123, 0x7fc32100),
+        ];
+        let mul: [(u32, u32, u32); 14] = [
+            (0x40000000, 0x40400000, 0x40c00000),
+            (0x80000000, 0x40400000, 0x80000000),
+            (0x80000000, 0xc0400000, 0x00000000),
+            (0x00800000, 0x3f000000, 0x00400000),
+            (0x00000001, 0x3f000000, 0x00000000),
+            (0x00000003, 0x3f000000, 0x00000002),
+            (0x80000001, 0x3f000000, 0x80000000),
+            (0x7f7fffff, 0x40000000, 0x7f800000),
+            (0xff800123, 0x7fc32100, 0xffc00123),
+            (0x3f800000, 0xff800123, 0xffc00123),
+            (0xff800000, 0x00000000, 0x7fc00000),
+            (0x7f800000, 0xbf800000, 0xff800000),
+            (0x00000000, 0xff800000, 0x7fc00000),
+            (0x7fc32100, 0xff800123, 0x7fc32100),
+        ];
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            for (name, cases) in [(b"host_f32_add", add), (b"host_f32_mul", mul)] {
+                let mut builder = ProgramBlobBuilder::new(isa);
+                builder.set_stack_size(4096);
+                builder.add_export_by_basic_block(0, b"main");
+                builder.add_import(name);
+                builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
+                let program = builder.into_vec().unwrap();
+                for part_limit in [None, Some(1)] {
+                    let wasm =
+                        translate_with_part_limit(&program, TEST_LIMITS, part_limit).unwrap();
+                    let (mut store, instance) = instance_from_wasm(&wasm);
+                    let begin = instance
+                        .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                        .unwrap();
+                    for (a, b, expected) in cases {
+                        let high = if isa == InstructionSetKind::Latest64 {
+                            0x1234567800000000u64
+                        } else {
+                            0
+                        };
+                        for (reg, bits) in [(Reg::A0, a), (Reg::A1, b), (Reg::A2, 123)] {
+                            instance
+                                .get_global(&store, reg.name_non_abi())
+                                .unwrap()
+                                .set(&mut store, Val::I64((high | bits as u64) as i64))
+                                .unwrap();
+                        }
+                        assert_eq!(begin.call(&mut store, (0, 10)).unwrap(), STATUS_FINISHED);
+                        let registers = register_values(&store, instance);
+                        assert_eq!(registers[Reg::A0 as usize], expected as u64);
+                        assert_eq!(registers[Reg::A1 as usize], high | b as u64);
+                        assert_eq!(registers[Reg::A2 as usize], high | 123);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float_intrinsic_loop_yields_to_gas_and_resumes_once() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_stack_size(4096);
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_import(b"host_f32_add");
+        builder.set_code(&[asm::ecalli(0), asm::jump(0)], &[]);
+        let program = builder.into_vec().unwrap();
+        let (mut store, instance) = translated_instance(&program);
+        for reg in [Reg::A0, Reg::A1] {
+            instance
+                .get_global(&store, reg.name_non_abi())
+                .unwrap()
+                .set(&mut store, Val::I64(0x3f800000))
+                .unwrap();
+        }
+        let begin = instance
+            .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+            .unwrap();
+        let resume = instance
+            .get_typed_func::<(), i32>(&store, "pvm_resume")
+            .unwrap();
+        let gas = instance
+            .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+            .unwrap();
+        assert_eq!(begin.call(&mut store, (0, 2)).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            register_values(&store, instance)[Reg::A0 as usize],
+            0x40000000
+        );
+        gas.call(&mut store, 2).unwrap();
+        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_OUT_OF_GAS);
+        assert_eq!(
+            register_values(&store, instance)[Reg::A0 as usize],
+            0x40400000
+        );
+    }
+
+    #[test]
+    fn float_continuations_preserve_gas_and_hostcall_resume_across_groups() {
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            // Put either intrinsic at the end of a group as well as testing
+            // both continuations within one group.
+            for padding in [0, BLOCKS_PER_FUNCTION - 2, BLOCKS_PER_FUNCTION - 1] {
+                let mut builder = ProgramBlobBuilder::new(isa);
+                builder.set_stack_size(4096);
+                builder.add_export_by_basic_block(0, b"main");
+                builder.add_import(b"host_f32_add");
+                builder.add_import(b"host_f32_mul");
+                builder.add_import(b"host_test");
+                let mut instructions = Vec::with_capacity(padding + 5);
+                instructions.extend((0..padding).map(|i| asm::jump(i as u32 + 1)));
+                instructions.extend([
+                    asm::ecalli(0),
+                    asm::ecalli(1),
+                    asm::ecalli(2),
+                    asm::add_imm_32(Reg::A2, Reg::A2, 1),
+                    asm::jump(padding as u32),
+                ]);
+                builder.set_code(&instructions, &[]);
+                let program = builder.into_vec().unwrap();
+                for part_limit in [None, Some(1)] {
+                    let wasm =
+                        translate_with_part_limit(&program, TEST_LIMITS, part_limit).unwrap();
+                    let (mut store, instance) = instance_from_wasm(&wasm);
+                    for (reg, bits) in [(Reg::A0, 0x3f800000), (Reg::A1, 0x40000000)] {
+                        instance
+                            .get_global(&store, reg.name_non_abi())
+                            .unwrap()
+                            .set(&mut store, Val::I64(bits))
+                            .unwrap();
+                    }
+                    let begin = instance
+                        .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                        .unwrap();
+                    let resume = instance
+                        .get_typed_func::<(), i32>(&store, "pvm_resume")
+                        .unwrap();
+                    let gas = instance
+                        .get_typed_func::<i64, ()>(&store, "pvm_set_gas")
+                        .unwrap();
+
+                    // Exhaust gas before the loop, then perform (a + 2) * 2
+                    // exactly once per resumed iteration.
+                    assert_eq!(begin.call(&mut store, (0, 1)).unwrap(), STATUS_OUT_OF_GAS);
+                    assert_eq!(
+                        register_values(&store, instance)[Reg::A0 as usize],
+                        0x3f800000
+                    );
+                    assert_eq!(register_values(&store, instance)[Reg::A2 as usize], 0);
+                    for (count, expected) in [(1, 0x40c00000), (2, 0x41800000)] {
+                        gas.call(&mut store, 2).unwrap();
+                        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_ECALL);
+                        assert_eq!(
+                            register_values(&store, instance)[Reg::A0 as usize],
+                            expected
+                        );
+                        assert_eq!(
+                            register_values(&store, instance)[Reg::A2 as usize],
+                            count - 1
+                        );
+                        // The real hostcall still yields; only its resume may
+                        // advance the counter and return to the metered entry.
+                        assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_OUT_OF_GAS);
+                        assert_eq!(
+                            register_values(&store, instance)[Reg::A0 as usize],
+                            expected
+                        );
+                        assert_eq!(register_values(&store, instance)[Reg::A2 as usize], count);
+                    }
+                }
+            }
         }
     }
 
