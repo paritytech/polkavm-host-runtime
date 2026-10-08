@@ -27,6 +27,12 @@
 //! resuming. Guest registers are mutable `i64` globals `r0` through `r12`; the
 //! memory, dispatch table, and internal globals are also exported for linking.
 //! Generated modules require WebAssembly tail calls but use only one memory.
+//!
+//! Block groups cache guest registers in Wasm locals, loading inputs on demand.
+//! Dirty registers are published before control leaves a block and before
+//! potentially trapping memory operations. Resumption always reloads shared
+//! globals, including changes made by the host. RV32 results are zero-extended
+//! at their writes; RV64 word operations retain their signed extension.
 
 use anyhow::{anyhow, bail, Context, Result};
 use polkavm_common::abi::{MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
@@ -36,9 +42,9 @@ use polkavm_common::program::{
 use std::borrow::Cow;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
-    EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
-    ImportSection, Instruction as W, MemArg, MemorySection, MemoryType, Module, RefType,
-    TableSection, TableType, TypeSection, ValType,
+    EntityType, ExportKind, ExportSection, Function as WasmFunction, FunctionSection,
+    GlobalSection, GlobalType, ImportSection, Instruction as W, MemArg, MemorySection, MemoryType,
+    Module, RefType, TableSection, TableType, TypeSection, ValType,
 };
 
 const PAGE_SIZE: u32 = 65_536;
@@ -79,6 +85,91 @@ const LOCAL_ADDR: u32 = 0;
 const LOCAL_PHYS: u32 = 1;
 const LOCAL_I64_0: u32 = 2;
 const LOCAL_I64_1: u32 = 3;
+const LOCAL_REGISTER_BASE: u32 = 4;
+
+// Helpers use the encoder directly; block groups additionally keep guest
+// registers in locals. Only guest register reads/writes go through this cache:
+// PC, gas and heap globals retain their existing shared-state semantics.
+struct Function {
+    body: WasmFunction,
+    registers: Option<RegisterCache>,
+}
+
+struct RegisterCache {
+    initialized: u16,
+    dirty: u16,
+    is_64_bit: bool,
+}
+
+impl std::ops::Deref for Function {
+    type Target = WasmFunction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.body
+    }
+}
+
+impl Function {
+    fn new<const N: usize>(locals: [(u32, ValType); N]) -> Self {
+        Self {
+            body: WasmFunction::new(locals),
+            registers: None,
+        }
+    }
+
+    fn instruction(&mut self, instruction: &W<'_>) {
+        self.body.instruction(instruction);
+    }
+
+    // Initialization must dominate every continuing use in this guest block.
+    // Emitters that read registers in Wasm branches (cmov and memset) preload
+    // those inputs before branching; conditional results are stored after End.
+    fn initialize_register(&mut self, reg: RawReg) {
+        let index = reg_index(reg);
+        if let Some(registers) = &mut self.registers {
+            let bit = 1 << index;
+            if registers.initialized & bit == 0 {
+                self.body.instruction(&W::GlobalGet(index));
+                self.body
+                    .instruction(&W::LocalSet(LOCAL_REGISTER_BASE + index));
+                registers.initialized |= bit;
+            }
+        }
+    }
+
+    // Do not clear dirty bits here: a flush inside one branch must not suppress
+    // the flush on its sibling path. Unconditional memory barriers clear them
+    // explicitly once the globals are synchronized on every continuing path.
+    // Shared arithmetic/address/load helpers neither read nor mutate guest
+    // register globals. Any future observing helper must be a cache boundary.
+    fn flush_registers(&mut self) {
+        if let Some(registers) = &self.registers {
+            let mut dirty = registers.dirty;
+            while dirty != 0 {
+                let index = dirty.trailing_zeros();
+                self.body
+                    .instruction(&W::LocalGet(LOCAL_REGISTER_BASE + index));
+                self.body.instruction(&W::GlobalSet(index));
+                dirty &= dirty - 1;
+            }
+        }
+    }
+
+    fn memory_barrier(&mut self) {
+        // A Wasm memory trap bypasses our explicit STATUS_TRAP exits. Publish
+        // all preceding writes before even a shared load helper can trap.
+        self.flush_registers();
+        if let Some(registers) = &mut self.registers {
+            registers.dirty = 0;
+        }
+    }
+
+    fn is_32_bit(&self) -> bool {
+        self.registers
+            .as_ref()
+            .is_some_and(|registers| !registers.is_64_bit)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -370,20 +461,28 @@ fn translate_with_part_limit(
         load_function_base,
         local_block_start: 0,
         local_block_end: root_block_count,
+        dispatch_group: 0,
+        block_index: 0,
+        branch_depth: 0,
     };
     helper_code.function(&emit_indirect_helper(&context, true));
     helper_code.function(&emit_indirect_helper(&context, false));
     helper_code.function(&emit_physical_address_helper(layout));
     helper_code.function(&emit_gas_helper());
     for kind in LoadKind::ALL {
-        helper_code.function(&emit_load_helper(kind, context.physical_address_function));
+        helper_code.function(&emit_load_helper(kind, layout));
     }
     let mut code = if partitioned {
         CodeSection::new()
     } else {
         let mut code = helper_code.clone();
-        for group in blocks.chunks(BLOCKS_PER_FUNCTION) {
-            code.function(&emit_block_group(&context, group)?);
+        for (group_index, group) in blocks.chunks(BLOCKS_PER_FUNCTION).enumerate() {
+            let group_context = EmitContext {
+                dispatch_group: group_index as u32,
+                ..context
+            };
+            let function = emit_block_group(&group_context, group)?;
+            code.function(&function);
         }
         code
     };
@@ -443,6 +542,7 @@ fn translate_with_part_limit(
             let mut part_context = EmitContext {
                 local_block_start: part_table_offset,
                 local_block_end: group_index as u32 + 1,
+                dispatch_group: group_index as u32,
                 ..context
             };
             let mut function = emit_block_group(&part_context, group)?;
@@ -741,6 +841,9 @@ struct EmitContext<'a> {
     load_function_base: u32,
     local_block_start: u32,
     local_block_end: u32,
+    dispatch_group: u32,
+    block_index: u32,
+    branch_depth: u32,
 }
 
 fn reg_index(reg: RawReg) -> u32 {
@@ -962,7 +1065,19 @@ fn emit_gas_helper() -> Function {
 }
 
 fn emit_gas_charge(f: &mut Function, gas_function: u32) {
-    f.instruction(&W::Call(gas_function));
+    if f.registers.is_some() {
+        // A shared call at every block entry hides register-global values
+        // from the engine across otherwise direct forward branches.
+        f.instruction(&W::GlobalGet(GLOBAL_GAS));
+        f.instruction(&W::I64Const(1));
+        f.instruction(&W::I64Sub);
+        f.instruction(&W::GlobalSet(GLOBAL_GAS));
+        f.instruction(&W::GlobalGet(GLOBAL_GAS));
+        f.instruction(&W::I64Const(0));
+        f.instruction(&W::I64LeS);
+    } else {
+        f.instruction(&W::Call(gas_function));
+    }
     f.instruction(&W::If(BlockType::Empty));
     f.instruction(&W::I32Const(STATUS_OUT_OF_GAS));
     f.instruction(&W::Return);
@@ -986,12 +1101,21 @@ fn emit_block_group(
     context: &EmitContext<'_>,
     blocks: &[&[ParsedInstruction]],
 ) -> Result<Function> {
-    let mut f = Function::new([(2, ValType::I32), (2, ValType::I64)]);
+    let mut f = Function::new([(2, ValType::I32), (2 + REGISTER_COUNT, ValType::I64)]);
     f.instruction(&W::GlobalGet(GLOBAL_PC));
     f.instruction(&W::LocalSet(LOCAL_ADDR));
     emit_switch(&mut f, blocks.len(), LOCAL_ADDR, BLOCKS_PER_FUNCTION);
-    for (block_index, block) in blocks.iter().enumerate() {
+    for (index, block) in blocks.iter().enumerate() {
+        let context = EmitContext {
+            block_index: index as u32,
+            ..*context
+        };
         f.instruction(&W::End);
+        f.registers = Some(RegisterCache {
+            initialized: 0,
+            dirty: 0,
+            is_64_bit: context.is_64_bit,
+        });
         if context
             .metered_targets
             .binary_search(&block[0].offset.0)
@@ -1001,30 +1125,13 @@ fn emit_block_group(
         }
         let mut terminated = false;
         for instruction in *block {
-            if emit_instruction(context, &mut f, instruction)? {
+            if emit_instruction(&context, &mut f, instruction)? {
                 terminated = true;
                 break;
             }
         }
         if !terminated {
-            let last = block.last().unwrap();
-            // Real hostcalls terminate above. Only lowered arithmetic ECALLs
-            // can continue into the adjacent case without re-entering this
-            // function's dispatcher. Keep its PC and gas-check entry intact.
-            if matches!(last.kind, PvmInstruction::ecalli(_))
-                && blocks
-                    .get(block_index + 1)
-                    .is_some_and(|next| next[0].offset == last.next_offset)
-            {
-                let target = context
-                    .block_by_pc
-                    .get(last.next_offset.0)
-                    .ok_or_else(|| anyhow!("arithmetic continuation is not a block"))?;
-                f.instruction(&W::I32Const(target as i32));
-                f.instruction(&W::GlobalSet(GLOBAL_PC));
-            } else {
-                emit_block_target(context, &mut f, last.next_offset.0)?;
-            }
+            emit_block_target(&context, &mut f, block.last().unwrap().next_offset.0)?;
         }
     }
     f.instruction(&W::End);
@@ -1034,6 +1141,7 @@ fn emit_block_group(
 }
 
 fn emit_block_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Result<()> {
+    f.flush_registers();
     let target = context
         .block_by_pc
         .get(pc)
@@ -1041,7 +1149,14 @@ fn emit_block_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> Re
     f.instruction(&W::I32Const(target as i32));
     f.instruction(&W::GlobalSet(GLOBAL_PC));
     let group = target / BLOCKS_PER_FUNCTION as u32;
-    if (context.local_block_start..context.local_block_end).contains(&group) {
+    // Backward/cross-group transfers tail-call; forward targets use the
+    // existing switch labels without restarting the group dispatcher.
+    let block_index = target % BLOCKS_PER_FUNCTION as u32;
+    if group == context.dispatch_group && block_index > context.block_index {
+        f.instruction(&W::Br(
+            block_index - context.block_index - 1 + context.branch_depth,
+        ));
+    } else if (context.local_block_start..context.local_block_end).contains(&group) {
         let helper_count = context.load_function_base + LoadKind::ALL.len() as u32;
         f.instruction(&W::ReturnCall(
             helper_count + group - context.local_block_start,
@@ -1061,6 +1176,7 @@ fn emit_return_target(context: &EmitContext<'_>, f: &mut Function, pc: u32) -> R
 }
 
 fn emit_trap(f: &mut Function, pc: u32) {
+    f.flush_registers();
     f.instruction(&W::I32Const(pc as i32));
     f.instruction(&W::GlobalSet(GLOBAL_TRAP_PC));
     f.instruction(&W::I32Const(STATUS_TRAP));
@@ -1068,17 +1184,41 @@ fn emit_trap(f: &mut Function, pc: u32) {
 }
 
 fn emit_reg(f: &mut Function, reg: RawReg) {
-    f.instruction(&W::GlobalGet(reg_index(reg)));
+    f.initialize_register(reg);
+    if f.registers.is_some() {
+        f.instruction(&W::LocalGet(LOCAL_REGISTER_BASE + reg_index(reg)));
+    } else {
+        f.instruction(&W::GlobalGet(reg_index(reg)));
+    }
 }
 
 fn emit_set_reg(f: &mut Function, reg: RawReg) {
-    f.instruction(&W::GlobalSet(reg_index(reg)));
+    if f.is_32_bit() {
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::I64ExtendI32U);
+    }
+    emit_set_normalized_reg(f, reg);
+}
+
+fn emit_set_normalized_reg(f: &mut Function, reg: RawReg) {
+    let index = reg_index(reg);
+    if let Some(registers) = &mut f.registers {
+        registers.initialized |= 1 << index;
+        registers.dirty |= 1 << index;
+        f.instruction(&W::LocalSet(LOCAL_REGISTER_BASE + index));
+    } else {
+        f.instruction(&W::GlobalSet(index));
+    }
 }
 
 fn emit_i32_result(f: &mut Function, reg: RawReg, operation: W<'_>) {
     f.instruction(&operation);
-    f.instruction(&W::I64ExtendI32S);
-    emit_set_reg(f, reg);
+    f.instruction(&if f.is_32_bit() {
+        W::I64ExtendI32U
+    } else {
+        W::I64ExtendI32S
+    });
+    emit_set_normalized_reg(f, reg);
 }
 
 fn emit_address(f: &mut Function, base: Option<RawReg>, offset: i32) {
@@ -1121,34 +1261,40 @@ fn emit_physical_address(f: &mut Function, virtual_base: u32, physical_base: u32
     }
 }
 
-fn emit_physical_address_helper(layout: Layout) -> Function {
-    let mut f = Function::new([]);
+// Inline the address mapping into each shared load helper. A second Wasm call
+// for every guest load costs heavily in memory-bound guests; seven small helper
+// bodies retain compact callsites without assuming SP names the native stack.
+fn emit_mapped_address(f: &mut Function, layout: Layout) {
     f.instruction(&W::LocalGet(0));
     f.instruction(&W::I32Const(layout.stack_low as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.stack_low, layout.stack_phys);
+    emit_physical_address(f, layout.stack_low, layout.stack_phys);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(0));
     f.instruction(&W::I32Const(layout.rw_address as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.rw_address, layout.rw_phys);
+    emit_physical_address(f, layout.rw_address, layout.rw_phys);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.ro_address, layout.ro_phys);
+    emit_physical_address(f, layout.ro_address, layout.ro_phys);
     f.instruction(&W::End);
     f.instruction(&W::End);
+}
+
+fn emit_physical_address_helper(layout: Layout) -> Function {
+    let mut f = Function::new([]);
+    emit_mapped_address(&mut f, layout);
     f.instruction(&W::End);
     f
 }
 
-fn emit_load_helper(kind: LoadKind, physical_address_function: u32) -> Function {
+fn emit_load_helper(kind: LoadKind, layout: Layout) -> Function {
     let mut f = Function::new([]);
-    f.instruction(&W::LocalGet(0));
-    f.instruction(&W::Call(physical_address_function));
+    emit_mapped_address(&mut f, layout);
     emit_load_at(&mut f, kind);
     f.instruction(&W::End);
     f
@@ -1181,6 +1327,7 @@ fn emit_load(
     offset: i32,
     kind: LoadKind,
 ) {
+    f.memory_barrier();
     let bytes = match kind {
         LoadKind::U8 | LoadKind::I8 => 1,
         LoadKind::U16 | LoadKind::I16 => 2,
@@ -1229,6 +1376,7 @@ fn emit_store(
     immediate: i32,
     kind: StoreKind,
 ) {
+    f.memory_barrier();
     let bytes = match kind {
         StoreKind::U8 => 1,
         StoreKind::U16 => 2,
@@ -1365,10 +1513,14 @@ fn emit_compare_branch(
     instruction: &ParsedInstruction,
     target: u32,
 ) -> Result<()> {
+    let branch_context = EmitContext {
+        branch_depth: context.branch_depth + 1,
+        ..*context
+    };
     f.instruction(&W::If(BlockType::Empty));
-    emit_block_target(context, f, target)?;
+    emit_block_target(&branch_context, f, target)?;
     f.instruction(&W::Else);
-    emit_block_target(context, f, instruction.next_offset.0)?;
+    emit_block_target(&branch_context, f, instruction.next_offset.0)?;
     f.instruction(&W::End);
     f.instruction(&W::Unreachable);
     Ok(())
@@ -1387,6 +1539,7 @@ fn emit_indirect(context: &EmitContext<'_>, f: &mut Function, pc: u32, base: Raw
 // shared validation/resolution. A regular call would retain a Wasm stack frame
 // across every guest return or indirect jump.
 fn emit_indirect_from_local(context: &EmitContext<'_>, f: &mut Function, pc: u32, meter: bool) {
+    f.flush_registers();
     let current_pc = context.control_targets[context
         .control_targets
         .partition_point(|target| *target <= pc)
@@ -1468,120 +1621,6 @@ fn emit_indirect_helper(context: &EmitContext<'_>, meter: bool) -> Function {
     f
 }
 
-fn written_register(kind: PvmInstruction) -> Option<RawReg> {
-    use PvmInstruction::*;
-    Some(match kind {
-        load_imm(dst, _)
-        | load_imm64(dst, _)
-        | move_reg(dst, _)
-        | load_u8(dst, _)
-        | load_i8(dst, _)
-        | load_u16(dst, _)
-        | load_i16(dst, _)
-        | load_u32(dst, _)
-        | load_i32(dst, _)
-        | load_u64(dst, _)
-        | load_indirect_u8(dst, _, _)
-        | load_indirect_i8(dst, _, _)
-        | load_indirect_u16(dst, _, _)
-        | load_indirect_i16(dst, _, _)
-        | load_indirect_u32(dst, _, _)
-        | load_indirect_i32(dst, _, _)
-        | load_indirect_u64(dst, _, _)
-        | add_32(dst, _, _)
-        | add_64(dst, _, _)
-        | sub_32(dst, _, _)
-        | sub_64(dst, _, _)
-        | and(dst, _, _)
-        | xor(dst, _, _)
-        | or(dst, _, _)
-        | and_inverted(dst, _, _)
-        | or_inverted(dst, _, _)
-        | xnor(dst, _, _)
-        | mul_32(dst, _, _)
-        | mul_64(dst, _, _)
-        | mul_upper_unsigned_unsigned(dst, _, _)
-        | mul_upper_signed_signed(dst, _, _)
-        | mul_upper_signed_unsigned(dst, _, _)
-        | add_imm_32(dst, _, _)
-        | add_imm_64(dst, _, _)
-        | and_imm(dst, _, _)
-        | xor_imm(dst, _, _)
-        | or_imm(dst, _, _)
-        | mul_imm_32(dst, _, _)
-        | mul_imm_64(dst, _, _)
-        | negate_and_add_imm_32(dst, _, _)
-        | negate_and_add_imm_64(dst, _, _)
-        | set_less_than_unsigned(dst, _, _)
-        | set_less_than_signed(dst, _, _)
-        | set_less_than_unsigned_imm(dst, _, _)
-        | set_less_than_signed_imm(dst, _, _)
-        | set_greater_than_unsigned_imm(dst, _, _)
-        | set_greater_than_signed_imm(dst, _, _)
-        | shift_logical_left_32(dst, _, _)
-        | shift_logical_left_64(dst, _, _)
-        | shift_logical_right_32(dst, _, _)
-        | shift_logical_right_64(dst, _, _)
-        | shift_arithmetic_right_32(dst, _, _)
-        | shift_arithmetic_right_64(dst, _, _)
-        | shift_logical_left_imm_32(dst, _, _)
-        | shift_logical_left_imm_64(dst, _, _)
-        | shift_logical_right_imm_32(dst, _, _)
-        | shift_logical_right_imm_64(dst, _, _)
-        | shift_arithmetic_right_imm_32(dst, _, _)
-        | shift_arithmetic_right_imm_64(dst, _, _)
-        | shift_logical_right_imm_alt_32(dst, _, _)
-        | shift_logical_right_imm_alt_64(dst, _, _)
-        | shift_arithmetic_right_imm_alt_32(dst, _, _)
-        | shift_arithmetic_right_imm_alt_64(dst, _, _)
-        | shift_logical_left_imm_alt_32(dst, _, _)
-        | shift_logical_left_imm_alt_64(dst, _, _)
-        | rotate_left_32(dst, _, _)
-        | rotate_left_64(dst, _, _)
-        | rotate_right_32(dst, _, _)
-        | rotate_right_64(dst, _, _)
-        | rotate_right_imm_32(dst, _, _)
-        | rotate_right_imm_64(dst, _, _)
-        | rotate_right_imm_alt_32(dst, _, _)
-        | rotate_right_imm_alt_64(dst, _, _)
-        | div_unsigned_32(dst, _, _)
-        | div_unsigned_64(dst, _, _)
-        | div_signed_32(dst, _, _)
-        | div_signed_64(dst, _, _)
-        | rem_unsigned_32(dst, _, _)
-        | rem_unsigned_64(dst, _, _)
-        | rem_signed_32(dst, _, _)
-        | rem_signed_64(dst, _, _)
-        | count_leading_zero_bits_32(dst, _)
-        | count_leading_zero_bits_64(dst, _)
-        | count_trailing_zero_bits_32(dst, _)
-        | count_trailing_zero_bits_64(dst, _)
-        | count_set_bits_32(dst, _)
-        | count_set_bits_64(dst, _)
-        | sign_extend_8(dst, _)
-        | sign_extend_16(dst, _)
-        | zero_extend_16(dst, _)
-        | reverse_byte(dst, _)
-        | maximum(dst, _, _)
-        | maximum_unsigned(dst, _, _)
-        | minimum(dst, _, _)
-        | minimum_unsigned(dst, _, _)
-        | cmov_if_zero(dst, _, _)
-        | cmov_if_not_zero(dst, _, _)
-        | cmov_if_zero_imm(dst, _, _)
-        | cmov_if_not_zero_imm(dst, _, _)
-        | sbrk(dst, _) => dst,
-        _ => return None,
-    })
-}
-
-fn normalize_32(f: &mut Function, reg: RawReg) {
-    emit_reg(f, reg);
-    f.instruction(&W::I32WrapI64);
-    f.instruction(&W::I64ExtendI32U);
-    emit_set_reg(f, reg);
-}
-
 fn emit_instruction(
     context: &EmitContext<'_>,
     f: &mut Function,
@@ -1635,6 +1674,7 @@ fn emit_instruction(
                 emit_float32(f, *operation);
                 return Ok(false);
             }
+            f.flush_registers();
             f.instruction(&W::I32Const(index));
             f.instruction(&W::GlobalSet(GLOBAL_ECALL));
             let next = context
@@ -2031,14 +2071,6 @@ fn emit_instruction(
             return Ok(true);
         }
     }
-    if !context.is_64_bit {
-        if instruction.kind == PvmInstruction::memset {
-            normalize_32(f, Reg::A0.raw());
-            normalize_32(f, Reg::A2.raw());
-        } else if let Some(reg) = written_register(instruction.kind) {
-            normalize_32(f, reg);
-        }
-    }
     Ok(false)
 }
 
@@ -2050,7 +2082,7 @@ fn emit_float32(f: &mut Function, operation: FloatOperation) {
     // only on the NaN path, before writing A0, so native NaN canonicalization
     // cannot lose the selected operand's payload or sign.
     for reg in [Reg::A0, Reg::A1] {
-        f.instruction(&W::GlobalGet(reg.to_u32()));
+        emit_reg(f, reg.raw());
         f.instruction(&W::I32WrapI64);
         f.instruction(&W::F32ReinterpretI32);
     }
@@ -2066,7 +2098,7 @@ fn emit_float32(f: &mut Function, operation: FloatOperation) {
     f.instruction(&W::I32GtU);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     for reg in [Reg::A0, Reg::A1] {
-        f.instruction(&W::GlobalGet(reg.to_u32()));
+        emit_reg(f, reg.raw());
         f.instruction(&W::I32WrapI64);
         f.instruction(&W::LocalTee(LOCAL_PHYS));
         f.instruction(&W::I32Const(0x7fffffff));
@@ -2090,10 +2122,12 @@ fn emit_float32(f: &mut Function, operation: FloatOperation) {
     f.instruction(&W::LocalGet(LOCAL_ADDR));
     f.instruction(&W::End);
     f.instruction(&W::I64ExtendI32U);
-    f.instruction(&W::GlobalSet(Reg::A0.to_u32()));
+    emit_set_normalized_reg(f, Reg::A0.raw());
 }
 
 fn emit_memset(context: &EmitContext<'_>, f: &mut Function, pc: u32) {
+    f.memory_barrier();
+    f.initialize_register(Reg::A1.raw());
     emit_reg(f, Reg::A0.raw());
     f.instruction(&W::I32WrapI64);
     f.instruction(&W::LocalSet(LOCAL_ADDR));
@@ -2381,26 +2415,33 @@ fn emit_minmax(
 }
 
 fn emit_cmov(f: &mut Function, dst: RawReg, src: RawReg, condition: RawReg, zero: bool) {
+    f.initialize_register(src);
+    f.initialize_register(dst);
     emit_reg(f, condition);
     f.instruction(&W::I64Eqz);
     if !zero {
         f.instruction(&W::I32Eqz);
     }
-    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::If(BlockType::Result(ValType::I64)));
     emit_reg(f, src);
-    emit_set_reg(f, dst);
+    f.instruction(&W::Else);
+    emit_reg(f, dst);
     f.instruction(&W::End);
+    emit_set_reg(f, dst);
 }
 fn emit_cmov_imm(f: &mut Function, dst: RawReg, condition: RawReg, value: i32, zero: bool) {
+    f.initialize_register(dst);
     emit_reg(f, condition);
     f.instruction(&W::I64Eqz);
     if !zero {
         f.instruction(&W::I32Eqz);
     }
-    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::If(BlockType::Result(ValType::I64)));
     f.instruction(&W::I64Const(value as i64));
-    emit_set_reg(f, dst);
+    f.instruction(&W::Else);
+    emit_reg(f, dst);
     f.instruction(&W::End);
+    emit_set_reg(f, dst);
 }
 
 fn emit_sbrk(context: &EmitContext<'_>, f: &mut Function, dst: RawReg, size: RawReg) {
@@ -2657,6 +2698,143 @@ mod tests {
             assert_eq!(expected[Reg::A2 as usize], 0x12345678);
             assert_eq!(expected[Reg::A3 as usize], 0x12345678);
             assert_eq!(translated_registers(&program), expected);
+        }
+    }
+
+    #[test]
+    fn cached_conditional_registers_and_word_results_match_interpreter() {
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            for condition in [-1, 0, 1] {
+                let mut builder = ProgramBlobBuilder::new(isa);
+                builder.set_stack_size(4096);
+                builder.add_export_by_basic_block(0, b"main");
+                builder.set_code(
+                    &[
+                        asm::load_imm(Reg::A0, -1),
+                        asm::load_imm(Reg::A1, condition),
+                        // Both source and destination are initially uncached;
+                        // a skipped move must leave them available afterwards.
+                        asm::cmov_if_zero(Reg::A2, Reg::S0, Reg::A1),
+                        asm::move_reg(Reg::A3, Reg::S0),
+                        asm::cmov_if_not_zero(Reg::A0, Reg::A0, Reg::A1),
+                        asm::cmov_if_zero_imm(Reg::A4, Reg::A1, -1),
+                        asm::cmov_if_not_zero_imm(Reg::A1, Reg::A1, -128),
+                        asm::add_imm_32(Reg::T0, Reg::A0, 1),
+                        asm::sign_extend_8(Reg::T1, Reg::A1),
+                        asm::shift_logical_right_imm_32(Reg::T2, Reg::T1, 1),
+                        asm::ret(),
+                    ],
+                    &[],
+                );
+                let program = builder.into_vec().unwrap();
+                assert_eq!(
+                    translated_registers(&program),
+                    interpreter_registers(&program),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_registers_match_interpreter_at_hostcalls_and_traps() {
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            for (ending, wasm_trap) in [
+                (asm::trap(), false),
+                (asm::store_imm_u32(0, 123), false),
+                // A helper's native Wasm trap must still expose preceding
+                // writes, without committing the failed load's destination.
+                (asm::load_indirect_i32(Reg::T2, Reg::SP, 0), true),
+            ] {
+                let mut builder = ProgramBlobBuilder::new(isa);
+                builder.set_stack_size(4096);
+                builder.add_export_by_basic_block(0, b"main");
+                builder.add_import(b"host_test");
+                builder.set_code(
+                    &[
+                        asm::load_imm(Reg::A0, -1),
+                        asm::load_imm(Reg::A1, 1),
+                        asm::cmov_if_zero(Reg::A2, Reg::S0, Reg::A1),
+                        asm::ecalli(0),
+                        asm::cmov_if_zero(Reg::A2, Reg::S0, Reg::A1),
+                        asm::move_reg(Reg::A4, Reg::S0),
+                        asm::sign_extend_8(Reg::A3, Reg::A3),
+                        asm::add_imm_32(Reg::A0, Reg::A0, 1),
+                        asm::ecalli(0),
+                        asm::move_reg(Reg::A5, Reg::A2),
+                        asm::load_imm(Reg::T0, 41),
+                        asm::add_imm_32(Reg::T0, Reg::T0, 1),
+                        asm::store_indirect_u32(Reg::T0, Reg::SP, -4),
+                        asm::load_indirect_i32(Reg::T1, Reg::SP, -4),
+                        asm::load_imm(Reg::T2, 7),
+                        ending,
+                        asm::trap(),
+                    ],
+                    &[],
+                );
+                let program = builder.into_vec().unwrap();
+                let blob = ProgramBlob::parse((&program[..]).into()).unwrap();
+                let entry = blob.exports().next().unwrap().program_counter();
+                let instructions: Vec<_> = blob.instructions().collect();
+                let trap_pc = instructions[instructions.len() - 2].offset.0;
+                let mut config = Config::new();
+                config.set_backend(Some(BackendKind::Interpreter));
+                config.set_sandboxing_enabled(true);
+                let engine = Engine::new(&config).unwrap();
+                let module = Module::from_blob(&engine, &ModuleConfig::new(), blob).unwrap();
+                let mut native = module.instantiate().unwrap();
+                native.set_reg(Reg::SP, module.default_sp());
+                native.set_reg(Reg::RA, RETURN_TO_HOST);
+                native.set_gas(i64::MAX);
+                native.set_next_program_counter(entry);
+
+                let (mut store, instance) = translated_instance(&program);
+                let begin = instance
+                    .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                    .unwrap();
+                let resume = instance
+                    .get_typed_func::<(), i32>(&store, "pvm_resume")
+                    .unwrap();
+                assert_eq!(native.run().unwrap(), InterruptKind::Ecalli(0));
+                assert_eq!(begin.call(&mut store, (0, i64::MAX)).unwrap(), STATUS_ECALL);
+                assert_eq!(
+                    register_values(&store, instance),
+                    Reg::ALL.map(|reg| native.reg(reg)),
+                );
+
+                for (reg, value) in [(Reg::S0, 321), (Reg::A1, 0), (Reg::A3, 128)] {
+                    native.set_reg(reg, value);
+                    instance
+                        .get_global(&store, reg.name_non_abi())
+                        .unwrap()
+                        .set(&mut store, Val::I64(value as i64))
+                        .unwrap();
+                }
+                assert_eq!(native.run().unwrap(), InterruptKind::Ecalli(0));
+                assert_eq!(resume.call(&mut store, ()).unwrap(), STATUS_ECALL);
+                assert_eq!(
+                    register_values(&store, instance),
+                    Reg::ALL.map(|reg| native.reg(reg)),
+                );
+                assert_eq!(native.run().unwrap(), InterruptKind::Trap);
+                let result = resume.call(&mut store, ());
+                if wasm_trap {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), STATUS_TRAP);
+                    assert_eq!(
+                        instance
+                            .get_global(&store, "trap_pc")
+                            .unwrap()
+                            .get(&store)
+                            .i32(),
+                        Some(trap_pc as i32),
+                    );
+                }
+                assert_eq!(
+                    register_values(&store, instance),
+                    Reg::ALL.map(|reg| native.reg(reg)),
+                );
+            }
         }
     }
 

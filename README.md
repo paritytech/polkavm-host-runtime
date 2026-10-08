@@ -224,6 +224,39 @@ runtime handles this ordering and caches the complete set. Browser Wasm tail
 calls are required by the compiled backend; unsupported compilation falls back
 to the interpreter. Compiler tests use the pinned native engine only as an oracle.
 
+The unreleased load-helper optimization emits address mapping directly inside
+each shared load helper, avoiding a second Wasm call on every dynamic load.
+It retains the general guest-address mapping, including heap-backed fiber
+stacks; SP is not assumed to point into the reserved stack segment. In a local
+hardware-WebGPU OpenHV menu comparison, this change alone moved 8.85 to
+9.37 FPS while adding 294 bytes to the 204,709,713-byte translated module.
+
+The subsequent unreleased compiler pass caches the 13 guest registers in
+block-local Wasm locals. Dirty registers are published at control transfers,
+hostcalls, explicit traps, and before potentially trapping memory operations.
+RV32 writes remain zero-normalized; host register mutations are observed on
+resumption. Direct forward transfers within a 128-block group branch to the
+existing Wasm labels instead of re-entering the dispatcher; backward and
+cross-group transfers still tail-call. Block-entry gas checks are emitted inline
+to avoid a shared call obscuring register globals from the Wasm optimizer.
+Gas accounting, the exported register ABI, memory layout, heap limits, and
+partitioned-module contract are unchanged. The 21 compiler regressions pass,
+including interpreter comparisons at hostcalls and traps.
+
+With the same integer-audio/input-before-render OpenHV guest, matched local
+60-second menu captures improved **13.15 → 22.40 FPS** (70%). The preserved
+published guest/runtime measured 10.15 FPS in the same comparison. Chromium 153
+used a non-fallback NVIDIA Ampere WebGPU adapter at 1304×1088 with music enabled.
+The final core compiled the guest normally in-browser, without supplied
+precompiled guest Wasm: translation took 3,998 ms and the backend was `compiler`.
+A fresh Cold Rage/Rogue AI match exercised construction, placement, and return
+to the menu. A separate longer menu/settings session hit a guest
+`OutOfMemoryException` while loading that map. The unchanged compiler passed a
+12,800-frame menu-residency comparison and repeated match loading; the failure's
+cause is unresolved, not proven pre-existing. The candidate is not
+release-qualified, a published release, or a general frame-rate guarantee;
+the documented rc6 package provenance below is unchanged.
+
 ## Compatibility and installation
 
 Version numbers describe different boundaries; they are not interchangeable:
