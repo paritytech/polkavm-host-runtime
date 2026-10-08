@@ -474,13 +474,14 @@ test("both browser backends activate idle registrations and reject over-bound fi
       records: [INLINE, { camera: true }, { trigger: 1 }],
       forceInterpreter,
     });
-    await nextMessage(messages, 0, "mediated-input-request");
+    const request = await nextMessage(messages, 0, "mediated-input-request");
+    assert.ok(request.handle >= 0x80000000, "camera tokens cannot alias file handles");
     let { delivery } = await deliver(receiver, messages, 1, "a.txt", "", "a");
     assert.equal(delivery.outcome, "refused");
     receiver.onmessage({
       data: {
         type: "mediated-input-result",
-        handle: 2,
+        handle: request.handle,
         status: 4,
         bytes: new ArrayBuffer(0),
       },

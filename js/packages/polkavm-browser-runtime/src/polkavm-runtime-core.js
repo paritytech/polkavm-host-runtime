@@ -546,7 +546,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       if (operation === 0) {
         return;
       }
-      const handle = pvm.polkavm_browser_mediated_input_handle();
+      const handle = pvm.polkavm_browser_mediated_input_handle() >>> 0;
       if (operation === 2) {
         postRuntimeOutput({ type: "mediated-input-cancel", handle });
         continue;
@@ -1750,14 +1750,18 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       (!translated && !pvm) ||
       !Number.isInteger(handle) ||
       handle <= 0 ||
+      handle > 0xffffffff ||
       !Number.isInteger(status) ||
       status < 3 ||
-      status > 6
+      status > 6 ||
+      (status !== 3 && bytes.byteLength !== 0)
     ) {
       throw new Error("invalid PolkaVM browser mediated-input result");
     }
     invalidateSelection(handle);
-    activeMediatedInputRequest = null;
+    if (activeMediatedInputRequest === handle) {
+      activeMediatedInputRequest = null;
+    }
     if (translated) {
       translated.sendMediatedInputResult(handle, status, bytes);
       activeMediatedInputHandles.delete(handle);
@@ -1928,7 +1932,6 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       pendingSelections.delete(handle);
     });
   }
-
   endpoint.onmessage = (event) => {
     if (disposed) {
       return;

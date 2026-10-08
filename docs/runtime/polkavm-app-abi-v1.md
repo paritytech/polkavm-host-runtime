@@ -463,6 +463,29 @@ are described with the occlusion-query extension.
      GPU error defined by the selected WebGPU contract
 ```
 
+#### Surface resize
+
+`SurfaceChanged` (event `6`) publishes new capabilities without invalidating
+guest-owned resources or abandoning previously submitted work. The surface
+generation in `BeginRenderPass` applies only to color view `0`, the Host's
+default surface. Explicit color/depth views retain their own handle lifetimes
+and attachment validation across a resize; their pass does not depend on the
+default surface's generation.
+
+A default-surface pass with an obsolete generation is rejected with
+`BatchRejected` error code `4` and the offending command index. The browser
+validates the whole batch before mutation; native execution may already have
+applied commands preceding the rejection. Guests MUST NOT blindly replay or
+discard resource-bearing batches on this error. A guest can isolate its final
+resource-free screen blit in a separate batch, retire that submission on a
+stale-surface rejection at command `0`, and present the next frame using fresh
+dimensions. Keep the generation and dimensions from the same snapshot; do not
+retag an old viewport or depth attachment with a new generation.
+
+Queued batches deliver terminal completion/rejection events in submission order.
+Offscreen and resource-only batches still complete, but do not count as
+presented frames. A discarded obsolete blit does not count as a presentation.
+
 #### Device loss and restoration
 
 A browser or driver may take the GPU device away at any time — a driver reset,
@@ -487,7 +510,21 @@ A guest MUST NOT treat `device lost` as fatal on its own. A Host that cannot
 rebuild the device emits no `device restored` and terminates the application
 through its ordinary lifecycle, which is the Host's decision to make, not a
 trap the guest raises. A Host MUST bound its rebuild attempts so a permanently
-broken adapter cannot loop.
+broken adapter cannot loop, including when replacement acquisition succeeds
+but the replacement immediately loses its device. The browser backend allows
+three acquisitions per recovery episode, delaying subsequent attempts by
+250 ms and 500 ms. A replacement surviving at least 30 seconds resets that
+budget on its next loss, so occasional independent resets do not impose a
+lifetime recovery ceiling.
+
+Resizes received during device loss or retry backoff are coalesced, not
+discarded. Before publishing restoration, the browser backend applies the
+latest dimensions using the replacement device's limits and the ordinary
+one-pixel minimum for a zero-sized surface. Changed dimensions produce a
+surface-resized event and updated capabilities before `device restored`.
+Teardown discards pending resizes. If the pending dimensions or canvas
+configuration are rejected, the Host reports a lifecycle error instead of
+publishing a restored device.
 
 ### Host-frame transport
 
@@ -662,8 +699,9 @@ otherwise returns:
 ```
 
 `host_input_trigger` returns 0 when accepted, 1 for an unknown handle, and 2
-while any registration is already active or undrained Host commands exhaust
-admission capacity. Hosts reserve capacity for cancellation and teardown.
+while any registration is already active, undrained Host commands exhaust
+admission capacity, or device capture tokens are exhausted. Hosts reserve
+capacity for cancellation and teardown.
 Returning 2 does not release an existing selection; the guest may retry after
 the Host drains commands. Acceptance means only that the Host will present its
 own consent and capture UI. The guest does not receive raw device frames and
@@ -687,12 +725,35 @@ to status 1. Capacity smaller than the result returns the negated required
 length without consuming it. Other states and unknown handles return zero.
 The Host MUST reject empty results and results larger than the registration's
 bound before they become visible to the guest.
+Registration charges the combined kind and media-type lengths once against
+the hostcall byte budget. A read with sufficient capacity charges the result
+length once; a size-only probe charges no transfer bytes.
 
 `host_input_cancel` returns 0 and tells the Host to stop capture for an active
 request, returns 0 and discards the result of a handle in status 3, 1 for an
 unknown handle, or 2 for any other state. Either success resets the
 registration to status 1. Runtime teardown cancels every active request and
 releases every device stream.
+
+The guest registration handle is reusable, but the Host-facing `handle` in a
+device `MediatedInputRequest` and its `MediatedInputCommand::Cancel` (browser
+`mediated-input-request` / `mediated-input-cancel`) is an opaque capture token.
+The runtime allocates a fresh token in `2147483648..=4294967295` for every
+accepted device trigger, never wraps or reuses tokens, and refuses further
+device triggers on exhaustion. File interactions keep their positive-i32
+registration handles, disjoint from device capture tokens. Hosts MUST echo the
+issued handle unchanged in completion messages and match cancellation against
+it, not against an input kind or a guest device registration. No worker message
+fields or guest hostcall signatures change.
+
+A completion for an issued, retired token is discarded without affecting the
+current capture, including when a result crosses guest cancellation and the
+same registration has already been re-armed. Unknown tokens and malformed
+terminal statuses or payloads remain errors: Ready requires nonempty bytes
+within the global input bound, and other terminal statuses require no bytes.
+The registered bound is additionally enforced for a live capture. No retired
+payload is stored or exposed to guest memory. An accepted completion wakes a
+demand-driven guest so it can observe the new status without polling.
 
 ABI v1 defines the `camera-ur` kind. Its media type is the expected UR type.
 The Host owns camera access, QR recognition, UR fountain reconstruction, and
@@ -1116,6 +1177,56 @@ only while the execution is in the foreground and MUST stop physical sensor
 acquisition when the execution loses the foreground, closes, or loses
 authorization. The application MUST handle `-1` and `-2`.
 
+### Exact binary32 arithmetic
+
+```text
+host_f32_add(a: u32, b: u32) -> u32
+host_f32_mul(a: u32, b: u32) -> u32
+```
+
+These optional imports interpret both arguments and the result as raw IEEE-754
+binary32 bits, not integer values or pointers. Addition and multiplication MUST
+round to nearest, ties to even, with gradual underflow (no flushing subnormals
+to zero), signed zeros, and signed infinities. Each operation rounds once to
+binary32; it MUST NOT be fused with another operation.
+
+NaN propagation is explicit and matches the guest soft-float implementation,
+independently of the Host's native floating-point NaN conventions:
+
+- If either argument is a NaN, select the first NaN in argument order `a`, `b`.
+- Addition returns `(selected & 0x7fffffff) | 0x00400000`: preserve the payload,
+  quiet signaling NaNs, and clear the sign.
+- Multiplication returns `selected | 0x00400000`: preserve the payload and
+  sign, and quiet signaling NaNs.
+- With no NaN operand, opposite-signed infinities added together or zero
+  multiplied by infinity return the positive canonical NaN `0x7fc00000`,
+  regardless of operand order or signs.
+
+Subtraction uses `host_f32_add(a, b ^ 0x80000000)`; there is no separate
+subtraction import.
+
+These are pure, fixed-cost arithmetic operations: they access no guest memory,
+allocate no per-operation storage, and perform no IO. Their guest instructions
+remain gas-metered, including import calls. Hosts MUST NOT charge them against
+Host IO call-count or byte budgets; this exemption does not apply to any other
+Host import.
+
+Existing guests that do not import these symbols are unchanged. Guests that
+import them require an updated runtime providing this exact contract; an
+unsupported Host MUST reject the import rather than silently substitute an
+approximation or a fallback implementation.
+
+The browser Wasm translator lowers these imports directly to binary32
+arithmetic without a JavaScript hostcall. It checks the result for NaN and
+repairs exceptional results from the original integer operand bits; non-NaN
+results need no operand checks. This lowering preserves the register and gas
+contract above, including when execution resumes after gas exhaustion.
+When the arithmetic continuation is the adjacent block in the same generated
+function, execution falls through without re-entering the group dispatcher.
+The translator still records the continuation PC and retains its gas checks.
+Continuations across function/module boundaries retain tail-call dispatch,
+and ordinary Host imports still yield to the Host.
+
 ### Time
 
 ```text
@@ -1244,9 +1355,9 @@ asset files                           2,048
 one asset                             128 MiB
 all assets                            256 MiB
 one asset read                        16 MiB
-Host-call bytes per init/update       32 MiB
-Host calls during init                131,072
-Host calls during update              65,536
+Host IO call bytes per init/update    32 MiB
+Host IO calls during init             131,072
+Host IO calls during update           65,536
 sleep during init                     100 ms
 sleep during update                   50 ms
 audio samples per submission          96,000

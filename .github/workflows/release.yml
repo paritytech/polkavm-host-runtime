@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# A repeated tag event must verify the first publication, not race its upload.
+concurrency:
+  group: runtime-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -51,7 +56,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --verify-tag \
-            --title "PolkaVM Host Runtime $GITHUB_REF_NAME" \
-            --generate-notes
+          release_flags=()
+          prerelease=false
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            prerelease=true
+            release_flags+=(--prerelease --latest=false)
+          fi
+          if state="$(gh release view "$GITHUB_REF_NAME" \
+            --json isDraft,isPrerelease --jq '[.isDraft,.isPrerelease] | @tsv')"; then
+            [[ "$state" == $'false\t'"$prerelease" ]] || {
+              echo "existing release has unexpected draft/prerelease state" >&2
+              exit 1
+            }
+            published="$(mktemp -d)"
+            trap 'rm -rf "$published"' EXIT
+            gh release download "$GITHUB_REF_NAME" --dir "$published"
+            # Compare the complete inventory and every byte, including provenance.
+            # Never overwrite a release or accept a partial previous publication.
+            diff -r -- artifacts "$published"
+            echo "Existing immutable release exactly matches the rebuilt artifacts."
+          else
+            # Creation remains fail-closed if lookup failed for any other reason,
+            # or another publisher created the tag's release in the meantime.
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --verify-tag \
+              --title "PolkaVM Host Runtime $GITHUB_REF_NAME" \
+              --generate-notes \
+              "${release_flags[@]}"
+          fi

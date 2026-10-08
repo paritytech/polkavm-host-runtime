@@ -20,6 +20,10 @@ pub const MAX_MEDIATED_INPUT_BYTES: usize = 1024 * 1024;
 /// Maximum simultaneous registrations and supported kinds.
 pub const MAX_MEDIATED_INPUT_REGISTRATIONS: usize = 8;
 
+// File interactions retain positive-i32 registration handles. Device capture
+// tokens use the disjoint high-bit namespace and are never reused.
+const FIRST_CAPTURE_TOKEN: u32 = 0x8000_0000;
+
 // Admission reserves one cancellation per registration in addition to queued work.
 const MAX_PENDING_MEDIATED_INPUT_COMMANDS: usize = 2 * MAX_MEDIATED_INPUT_REGISTRATIONS;
 
@@ -83,7 +87,7 @@ impl TryFrom<u32> for MediatedInputStatus {
 /// Bounded request for host-mediated input, subject to host consent policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediatedInputRequest {
-    /// Registration handle used to complete or cancel this request.
+    /// Opaque capture token echoed by the Host, not a guest registration handle.
     pub handle: u32,
     /// Registered host-supported input kind.
     pub kind: String,
@@ -102,7 +106,7 @@ pub enum MediatedInputCommand {
     FileRequest(FileInputRequest),
     /// Cancel the outstanding host interaction for a registration.
     Cancel {
-        /// Registration whose active interaction should be cancelled.
+        /// Device capture token or file registration to cancel.
         handle: u32,
     },
 }
@@ -118,6 +122,7 @@ struct Registration {
     source: Source,
     max_bytes: usize,
     status: MediatedInputStatus,
+    request_handle: Option<u32>,
     result: Option<Vec<u8>>,
     file: Option<FileInfo>,
 }
@@ -158,6 +163,7 @@ pub(crate) struct MediatedInputState {
     commands: VecDeque<MediatedInputCommand>,
     file_registrations_changed: bool,
     next_handle: u32,
+    next_request_handle: u32,
 }
 
 impl MediatedInputState {
@@ -208,7 +214,6 @@ impl MediatedInputState {
             info: relaunch.info(),
         });
     }
-
     pub(crate) fn register(&mut self, kind: String, media_type: String, max_bytes: usize) -> i32 {
         if !valid_token(&kind, MAX_MEDIATED_INPUT_KIND_BYTES)
             || !valid_token(&media_type, MAX_MEDIATED_INPUT_MEDIA_TYPE_BYTES)
@@ -298,6 +303,7 @@ impl MediatedInputState {
                 source,
                 max_bytes,
                 status: MediatedInputStatus::Registered,
+                request_handle: None,
                 result: None,
                 file: None,
             },
@@ -491,6 +497,17 @@ impl MediatedInputState {
         {
             return MEDIATED_INPUT_TRIGGER_BUSY;
         }
+        if matches!(&registration.source, Source::Device { .. }) {
+            let Some(token) = self
+                .next_request_handle
+                .max(FIRST_CAPTURE_TOKEN - 1)
+                .checked_add(1)
+            else {
+                return MEDIATED_INPUT_TRIGGER_BUSY;
+            };
+            self.next_request_handle = token;
+            registration.request_handle = Some(token);
+        }
         if selected_stream {
             self.commands
                 .push_back(MediatedInputCommand::Cancel { handle });
@@ -500,7 +517,7 @@ impl MediatedInputState {
         self.commands.push_back(match &registration.source {
             Source::Device { kind, media_type } => {
                 MediatedInputCommand::Request(MediatedInputRequest {
-                    handle,
+                    handle: registration.request_handle.expect("device capture token"),
                     kind: kind.clone(),
                     media_type: media_type.clone(),
                     max_bytes: registration.max_bytes as u32,
@@ -574,8 +591,9 @@ impl MediatedInputState {
         }
         registration.status = MediatedInputStatus::Registered;
         registration.clear_result();
-        self.commands
-            .push_back(MediatedInputCommand::Cancel { handle });
+        self.commands.push_back(MediatedInputCommand::Cancel {
+            handle: registration.request_handle.take().unwrap_or(handle),
+        });
         MEDIATED_INPUT_CANCEL_ACCEPTED
     }
 
@@ -603,22 +621,14 @@ impl MediatedInputState {
         status: MediatedInputStatus,
         bytes: Vec<u8>,
     ) -> Result<()> {
-        let registration = self
-            .registrations
-            .get_mut(&handle)
-            .ok_or_else(|| anyhow!("unknown mediated-input handle {handle}"))?;
-        if registration.status != MediatedInputStatus::Active {
-            bail!("mediated-input handle {handle} is not active");
+        if handle >= FIRST_CAPTURE_TOKEN && handle > self.next_request_handle {
+            bail!("unknown mediated-input capture token {handle}");
         }
         match status {
-            MediatedInputStatus::Ready if registration.file_descriptor().is_some() => {
-                bail!("file results are delivered with their name and MIME type");
-            }
             MediatedInputStatus::Ready => {
-                if bytes.is_empty() || bytes.len() > registration.max_bytes {
-                    bail!("mediated-input result exceeds the registered bound");
+                if bytes.is_empty() || bytes.len() > MAX_MEDIATED_INPUT_BYTES {
+                    bail!("mediated-input result exceeds the payload bound");
                 }
-                registration.result = Some(bytes);
             }
             MediatedInputStatus::Cancelled
             | MediatedInputStatus::PermissionDenied
@@ -626,7 +636,6 @@ impl MediatedInputState {
                 if !bytes.is_empty() {
                     bail!("mediated-input failure carries unexpected bytes");
                 }
-                registration.clear_result();
             }
             MediatedInputStatus::Invalid
             | MediatedInputStatus::Registered
@@ -634,6 +643,36 @@ impl MediatedInputState {
                 bail!("invalid terminal mediated-input status")
             }
         }
+        let registration = if handle >= FIRST_CAPTURE_TOKEN {
+            let Some(registration) = self
+                .registrations
+                .values_mut()
+                .find(|registration| registration.request_handle == Some(handle))
+            else {
+                // Retired device tokens cannot complete a later capture.
+                return Ok(());
+            };
+            registration
+        } else {
+            let registration = self
+                .registrations
+                .get_mut(&handle)
+                .filter(|registration| registration.file_descriptor().is_some())
+                .ok_or_else(|| anyhow!("unknown file-input handle {handle}"))?;
+            if registration.status != MediatedInputStatus::Active {
+                bail!("file-input handle {handle} is not active");
+            }
+            if status == MediatedInputStatus::Ready {
+                bail!("file results are delivered with their name and MIME type");
+            }
+            registration
+        };
+        if bytes.len() > registration.max_bytes {
+            bail!("mediated-input result exceeds the registered bound");
+        }
+        registration.clear_result();
+        registration.result = (status == MediatedInputStatus::Ready).then_some(bytes);
+        registration.request_handle = None;
         registration.status = status;
         Ok(())
     }
@@ -725,7 +764,7 @@ mod tests {
         assert_eq!(
             state.take_command(),
             Some(MediatedInputCommand::Request(MediatedInputRequest {
-                handle: handle as u32,
+                handle: FIRST_CAPTURE_TOKEN,
                 kind: "camera-ur".to_owned(),
                 media_type: "x-zklock-authorization".to_owned(),
                 max_bytes: 4,
@@ -733,13 +772,17 @@ mod tests {
         );
         assert!(state
             .complete(
-                handle as u32,
+                FIRST_CAPTURE_TOKEN,
                 MediatedInputStatus::Ready,
                 vec![1, 2, 3, 4, 5]
             )
             .is_err());
         state
-            .complete(handle as u32, MediatedInputStatus::Ready, vec![1, 2, 3])
+            .complete(
+                FIRST_CAPTURE_TOKEN,
+                MediatedInputStatus::Ready,
+                vec![1, 2, 3],
+            )
             .unwrap();
         assert_eq!(state.result(handle as u32), Some([1, 2, 3].as_slice()));
         state.consume_result(handle as u32);
@@ -748,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_forwarded_and_late_results_are_rejected() {
+    fn cancellation_discards_late_results_without_completing_a_rearmed_handle() {
         let mut state = MediatedInputState::default();
         state
             .set_supported_kinds(&["camera-ur".to_owned()])
@@ -759,12 +802,150 @@ mod tests {
         assert_eq!(state.cancel(handle), MEDIATED_INPUT_CANCEL_ACCEPTED);
         assert_eq!(
             state.take_command(),
-            Some(MediatedInputCommand::Cancel { handle })
+            Some(MediatedInputCommand::Cancel {
+                handle: FIRST_CAPTURE_TOKEN
+            })
         );
+        state
+            .complete(FIRST_CAPTURE_TOKEN, MediatedInputStatus::Ready, vec![1])
+            .unwrap();
         assert_eq!(state.status(handle), MediatedInputStatus::Registered);
+        assert_eq!(state.result(handle), None);
+        assert_eq!(state.trigger(handle), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        let Some(MediatedInputCommand::Request(request)) = state.take_command() else {
+            panic!("expected rearmed request");
+        };
+        assert_eq!(request.handle, FIRST_CAPTURE_TOKEN + 1);
+        state
+            .complete(FIRST_CAPTURE_TOKEN, MediatedInputStatus::Ready, vec![2])
+            .unwrap();
+        assert_eq!(state.status(handle), MediatedInputStatus::Active);
+        assert_eq!(state.result(handle), None);
+        for (token, status, bytes) in [
+            (0, MediatedInputStatus::Ready, vec![1]),
+            (FIRST_CAPTURE_TOKEN + 2, MediatedInputStatus::Ready, vec![1]),
+            (FIRST_CAPTURE_TOKEN, MediatedInputStatus::Active, vec![]),
+            (FIRST_CAPTURE_TOKEN, MediatedInputStatus::Ready, vec![]),
+            (FIRST_CAPTURE_TOKEN, MediatedInputStatus::Failed, vec![1]),
+            (
+                FIRST_CAPTURE_TOKEN,
+                MediatedInputStatus::Ready,
+                vec![0; MAX_MEDIATED_INPUT_BYTES + 1],
+            ),
+            (
+                FIRST_CAPTURE_TOKEN + 1,
+                MediatedInputStatus::Ready,
+                vec![0; 17],
+            ),
+        ] {
+            assert!(state.complete(token, status, bytes).is_err());
+        }
+        state
+            .complete(request.handle, MediatedInputStatus::Ready, vec![3])
+            .unwrap();
+        assert_eq!(state.result(handle), Some([3].as_slice()));
+        state
+            .complete(FIRST_CAPTURE_TOKEN, MediatedInputStatus::Cancelled, vec![])
+            .unwrap();
+        assert_eq!(state.result(handle), Some([3].as_slice()));
+    }
+
+    #[test]
+    fn capture_tokens_are_distinct_from_guest_registration_handles() {
+        let mut state = MediatedInputState::default();
+        state.set_supported_kinds(&["camera-ur".into()]).unwrap();
+        let first = state.register("camera-ur".into(), "first".into(), 16) as u32;
+        let second = state.register("camera-ur".into(), "second".into(), 16) as u32;
+        assert_eq!(state.trigger(second), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        let Some(MediatedInputCommand::Request(request)) = state.take_command() else {
+            panic!("expected request");
+        };
+        assert_eq!(request.handle, FIRST_CAPTURE_TOKEN);
+        assert_ne!(request.handle, second);
         assert!(state
-            .complete(handle, MediatedInputStatus::Ready, vec![1])
+            .complete(second, MediatedInputStatus::Ready, vec![1])
             .is_err());
+        assert_eq!(state.cancel(second), MEDIATED_INPUT_CANCEL_ACCEPTED);
+        assert_eq!(
+            state.take_command(),
+            Some(MediatedInputCommand::Cancel {
+                handle: request.handle
+            })
+        );
+        assert_eq!(state.trigger(first), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        state
+            .complete(request.handle, MediatedInputStatus::Ready, vec![1])
+            .unwrap();
+        assert_eq!(state.status(first), MediatedInputStatus::Active);
+        assert_eq!(state.status(second), MediatedInputStatus::Registered);
+        state
+            .complete(FIRST_CAPTURE_TOKEN + 1, MediatedInputStatus::Ready, vec![2])
+            .unwrap();
+        assert_eq!(state.result(first), Some([2].as_slice()));
+    }
+
+    #[test]
+    fn capture_tokens_never_wrap_or_reuse() {
+        let mut state = MediatedInputState::default();
+        state.set_supported_kinds(&["camera-ur".into()]).unwrap();
+        let handle = state.register("camera-ur".into(), "bytes".into(), 16) as u32;
+        state.next_request_handle = u32::MAX - 1;
+        assert_eq!(state.trigger(handle), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        let Some(MediatedInputCommand::Request(request)) = state.take_command() else {
+            panic!("expected last available request");
+        };
+        assert_eq!(request.handle, u32::MAX);
+        assert_eq!(state.cancel(handle), MEDIATED_INPUT_CANCEL_ACCEPTED);
+        assert_eq!(
+            state.take_command(),
+            Some(MediatedInputCommand::Cancel { handle: u32::MAX })
+        );
+        assert_eq!(state.trigger(handle), MEDIATED_INPUT_TRIGGER_BUSY);
+        assert_eq!(state.status(handle), MediatedInputStatus::Registered);
+        assert_eq!(state.take_command(), None);
+    }
+
+    #[test]
+    fn retired_device_token_cannot_complete_a_file_interaction() {
+        let mut state = MediatedInputState::default();
+        state.set_supported_kinds(&["camera-ur".into()]).unwrap();
+        state
+            .set_file_support(FileInputSupport {
+                inline: true,
+                entrypoint: "app.polkavm".into(),
+                ..FileInputSupport::default()
+            })
+            .unwrap();
+        let file = state.register_file(
+            br#"{"id":"doc","label":"Doc","extensions":[".txt"],"delivery":"inline","maxBytes":4}"#,
+        ) as u32;
+        let camera = state.register("camera-ur".into(), "bytes".into(), 4) as u32;
+        assert_eq!(state.trigger(camera), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        state.take_command();
+        assert_eq!(state.cancel(camera), MEDIATED_INPUT_CANCEL_ACCEPTED);
+        assert_eq!(
+            state.take_command(),
+            Some(MediatedInputCommand::Cancel {
+                handle: FIRST_CAPTURE_TOKEN
+            })
+        );
+        assert_eq!(state.trigger(file), MEDIATED_INPUT_TRIGGER_ACCEPTED);
+        assert!(matches!(
+            state.take_command(),
+            Some(MediatedInputCommand::FileRequest(request)) if request.handle == file
+        ));
+        state
+            .complete(FIRST_CAPTURE_TOKEN, MediatedInputStatus::Ready, vec![1])
+            .unwrap();
+        assert_eq!(state.status(file), MediatedInputStatus::Active);
+        assert_eq!(state.result(file), None);
+        assert!(state
+            .complete(camera, MediatedInputStatus::Cancelled, vec![])
+            .is_err());
+        state
+            .complete(file, MediatedInputStatus::Cancelled, vec![])
+            .unwrap();
+        assert_eq!(state.status(file), MediatedInputStatus::Cancelled);
     }
 
     #[test]
@@ -814,7 +995,7 @@ mod tests {
         state.trigger(handle);
         state.take_command();
         state
-            .complete(handle, MediatedInputStatus::Ready, vec![1])
+            .complete(FIRST_CAPTURE_TOKEN, MediatedInputStatus::Ready, vec![1])
             .unwrap();
         assert_eq!(state.cancel(handle), MEDIATED_INPUT_CANCEL_ACCEPTED);
         assert_eq!(state.take_command(), None);

@@ -18,6 +18,7 @@ const context = vm.createContext({
   Uint8Array,
   onmessage: null,
   postMessage() {},
+  performance: { now: () => 0 },
   setTimeout(callback) {
     queueMicrotask(callback);
   },
@@ -433,6 +434,9 @@ function backgroundEngine() {
       };
     },
     queue: {
+      writeBuffer(buffer, offset, data) {
+        buffer.bytes.set(data, offset);
+      },
       submit(batches) {
         for (const operations of batches) {
           for (const operation of operations) operation();
@@ -678,7 +682,7 @@ test("rejects missing, wrong-type and deleted color attachments before any GPU m
         setup.push([11, u32s([handle(2)])]);
       }
 
-      await engine.execute(commands([...setup, ...renderPass(colorView)]));
+      await engine.execute(commands([...setup, ...renderPass(colorView, 2, 2)]));
 
       assert.equal(rejected.length, 1);
       assert.equal(rejected[0][0], setup.length);
@@ -691,16 +695,85 @@ test("rejects missing, wrong-type and deleted color attachments before any GPU m
   }
 });
 
-test("requires the current surface generation for both texture and surface attachments", () => {
-  for (const colorView of [0, handle(2)]) {
-    const engine = validationEngine();
-    assert.throws(
-      () => engine.validate(parseCommands(commands([
-        ...offscreenTextureCommands(),
-        ...renderPass(colorView, 2, 2),
-      ]))),
-      error => error.commandIndex === 2 && error.errorCode === 4,
+test("resize retains offscreen updates and rejects only stale default-surface passes", async () => {
+  const { engine, textures, visibleFrames } = backgroundEngine();
+  const capture = captureMessages();
+  try {
+    engine.submit(commands([
+      ...offscreenTextureCommands(),
+      [1, u32s([handle(3), 0x08, 4, 0])],
+      ...renderPass(handle(2)),
+    ]));
+    await engine.queue;
+    const texture = textures[0];
+    const buffer = engine.resources.get(handle(3)).value;
+    const generation = engine.surfaceGeneration;
+    const greenOffscreen = renderPass(handle(2), 2, generation);
+    new DataView(greenOffscreen[0][1].buffer).setFloat32(20, 1, true);
+    const pendingOffscreen = commands([
+      [2, u32s([handle(3), 0, 0, 0, 4, 0, 0x44332211])],
+      ...greenOffscreen,
+    ], 2n);
+    const pendingPresentation = commands(renderPass(0, 2, generation), 3n);
+
+    engine.scheduleResize({
+      physicalWidth: 128, physicalHeight: 96, logicalWidth: 128, logicalHeight: 96, scale: 1,
+    });
+    engine.submit(pendingOffscreen);
+    engine.submit(pendingPresentation);
+    await engine.queue;
+
+    assert.equal(engine.surfaceGeneration, generation + 1);
+    assert.equal(texture.destroyed, false, "resize must not invalidate explicit attachments");
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255], "old-generation offscreen work still executes");
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44]);
+    assert.equal(visibleFrames.length, 0, "stale presentation never acquires a surface");
+    assert.equal(engine.lastSequence, 2);
+
+    // A stale surface following an explicit pass must report that surface's
+    // exact index, not reject the earlier offscreen pass for its generation.
+    engine.submit(commands([
+      ...renderPass(handle(2), 2, generation),
+      ...renderPass(0, 2, generation),
+    ], 4n));
+    await engine.queue;
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255], "browser validation rejects before GPU mutation");
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44], "completed uploads survive rejection");
+    assert.equal(visibleFrames.length, 0);
+
+    const currentPresentation = renderPass(0, 2, engine.surfaceGeneration);
+    new DataView(currentPresentation[0][1].buffer).setFloat32(20, 1, true);
+    engine.submit(commands([
+      ...renderPass(handle(2), 3, generation),
+      ...currentPresentation,
+    ], 5n));
+    await engine.queue;
+
+    assert.equal(engine.lastSequence, 5);
+    assert.equal(engine.resources.get(handle(1)).value, texture);
+    assert.equal(engine.resources.get(handle(3)).value, buffer);
+    assert.deepEqual(texture.pixel, [0, 255, 0, 255]);
+    assert.deepEqual(Array.from(buffer.bytes), [0x11, 0x22, 0x33, 0x44]);
+    assert.equal(visibleFrames.length, 1);
+    assert.deepEqual(visibleFrames[0].descriptor.size, [128, 96, 1]);
+    assert.deepEqual(visibleFrames[0].pixel, [0, 255, 0, 255]);
+    const events = capture.messages.filter(message => message.type === "event");
+    assert.deepEqual(events.map(message => [
+      eventType(message.bytes),
+      new DataView(message.bytes.buffer).getBigUint64(16, true),
+    ]), [[5, 1n], [6, 0n], [5, 2n], [1, 3n], [1, 4n], [5, 5n]]);
+    assert.deepEqual(events.filter(message => eventType(message.bytes) === 1).map(message => {
+      const view = new DataView(message.bytes.buffer);
+      return [view.getUint32(24, true), view.getUint32(28, true)];
+    }), [[0, 4], [2, 4]], "stale rejections retain error code and exact command index");
+    assert.deepEqual(
+      capture.messages.filter(message => message.type === "presented").map(message => message.sequence),
+      [5],
+      "resource/offscreen batches and obsolete blits must not inflate presented-frame metrics",
     );
+  } finally {
+    capture.restore();
+    engine.stop();
   }
 });
 
@@ -736,6 +809,15 @@ function lostEngine(overrides = {}) {
     testDeviceLossPending: false,
     stopped: true,
     disposed: false,
+    restoreAttempts: 0,
+    restoreInProgress: false,
+    restoreFailed: false,
+    deviceRestoredAt: null,
+    backgroundRequested: false,
+    backgrounded: false,
+    occlusionEpoch: 0,
+    occlusionReadbacks: new Set(),
+    occlusionDelivery: Promise.resolve(),
     device: { destroy() {} },
     context: { configure() {} },
     ...overrides,
@@ -1172,16 +1254,18 @@ function occlusionPass(count, token = 0) {
 }
 
 function occlusionEngine() {
-  const engine = validationEngine();
   const gates = [];
   const passCalls = [];
   const buffers = [];
   const bytes = buffer => new Uint8Array(buffer.storage);
-  Object.assign(engine, {
-    occlusionDelivery: Promise.resolve(),
-    occlusionEpoch: 0,
-    context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+  const backend = {
+    context: {
+      configure() {},
+      getCurrentTexture: () => ({ createView: () => ({}) }),
+    },
     device: {
+      addEventListener() {},
+      lost: new Promise(() => {}),
       pushErrorScope() {},
       popErrorScope: async () => null,
       createQuerySet: ({ count }) => ({ samples: new Array(count).fill(0n), destroy() {} }),
@@ -1224,7 +1308,21 @@ function occlusionEngine() {
     emitBatchRejected(...args) {
       assert.fail(`valid occlusion batch was rejected: ${args[3]}`);
     },
-  });
+  };
+  // Exercise lifecycle methods with constructor-initialized recovery state;
+  // validationEngine deliberately only models batch validation.
+  const engine = new GpuEngine(
+    {},
+    backend.device,
+    backend.context,
+    "rgba8unorm",
+    validationEngine().limits,
+    { physicalWidth: 64, physicalHeight: 64, logicalWidth: 64, logicalHeight: 64, scale: 1 },
+    false,
+    false,
+    {},
+  );
+  engine.emitBatchRejected = backend.emitBatchRejected;
   return { engine, gates, passCalls, buffers };
 }
 
@@ -1340,6 +1438,7 @@ test("reset destroys pending query buffers and fresh results bypass an abandoned
 
 test("backend rejection releases all query resources without emitting results", async () => {
   const { engine, buffers } = occlusionEngine();
+  const initialSequence = engine.lastSequence;
   let scopes = 0;
   engine.device.popErrorScope = async () => ++scopes === 2 ? { message: "invalid pass" } : null;
   const rejected = [];
@@ -1350,7 +1449,7 @@ test("backend rejection releases all query resources without emitting results", 
   assert.match(rejected[0][3], /invalid pass/);
   assert.equal(engine.occlusionReadbacks.size, 0);
   assert.ok(buffers.every(buffer => buffer.destroyed));
-  assert.equal(engine.lastSequence, 0n);
+  assert.equal(engine.lastSequence, initialSequence, "rejected batches do not advance sequencing");
   engine.stop();
 });
 
@@ -1383,6 +1482,7 @@ test("device restoration fences old batches waiting for backend validation", asy
     engine.stopped = true;
     engine.abandonOcclusionResults();
     await engine.restore();
+    assert.equal(engine.device, replacement.device, "recovery installs the acquired device");
     await engine.execute(commands([[1, u32s([handle(10), 8, 4, 0])]]));
     scopes.forEach(resolveScope => resolveScope(null));
     await oldQueue;
@@ -1516,3 +1616,387 @@ test("pipeline stencil and depth bias follow WebGPU's format and topology rules"
     ));
   }
 });
+
+function replacementDevice(lost = new Promise(() => {})) {
+  return {
+    device: { addEventListener() {}, lost, destroy() {} },
+    context: { configure() {} },
+    format: "bgra8unorm",
+    limits: Array.from({ length: 21 }, () => 2048),
+  };
+}
+
+test("success followed by immediate device loss shares the retry ceiling and backoff", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  const delays = [];
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    // Stop the unfixed implementation eventually rather than hanging the test.
+    return replacementDevice(
+      attempts < 12
+        ? Promise.resolve({ message: "replacement immediately lost" })
+        : new Promise(() => {}),
+    );
+  };
+  context.setTimeout = (callback, delay) => {
+    delays.push(delay);
+    queueMicrotask(callback);
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [250, 500]);
+    assert.equal(engine.stopped, true);
+    assert.equal(capture.messages.filter(message => message.type === "capabilities").length, 3);
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+    await engine.restore();
+    assert.equal(attempts, 3, "a failed episode cannot restart itself");
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+test("healthy intervals reset the recovery budget instead of imposing a lifetime ceiling", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  let now = 0;
+  const delays = [];
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  const clock = context.performance.now;
+  context.performance.now = () => now;
+  context.setTimeout = (callback, delay) => {
+    delays.push(delay);
+    queueMicrotask(callback);
+  };
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    return replacementDevice();
+  };
+  const capture = captureMessages();
+  try {
+    for (let episode = 0; episode < 6; episode++) {
+      engine.stopped = true;
+      await engine.restore();
+      assert.equal(engine.stopped, false);
+      assert.equal(engine.restoreAttempts, 1);
+      now += 30_000;
+    }
+    assert.equal(attempts, 6);
+    assert.deepEqual(delays, []);
+    assert.equal(capture.messages.some(message => message.type === "error"), false);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    context.performance.now = clock;
+    capture.restore();
+  }
+});
+
+test("acquisition failures and short-lived replacements share one recovery budget", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    if (attempts === 1 || attempts > 3) {
+      throw new Error("adapter unavailable");
+    }
+    return replacementDevice(Promise.resolve({ message: "lost again" }));
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 3);
+    assert.equal(capture.messages.filter(message => message.type === "capabilities").length, 2);
+    assert.equal(capture.messages.filter(message => message.type === "error").length, 1);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+});
+
+test("disposal during backoff cancels further acquisition and publication", async () => {
+  const engine = lostEngine();
+  let attempts = 0;
+  let resume;
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    throw new Error("adapter unavailable");
+  };
+  context.setTimeout = callback => { resume = callback; };
+  const capture = captureMessages();
+  try {
+    const restoring = engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof resume, "function");
+    engine.stop();
+    resume();
+    await restoring;
+    assert.equal(attempts, 1);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+for (const supersede of [false, true]) {
+  test(`an acquisition completed after ${supersede ? "device replacement" : "disposal"} is destroyed without publication`, async () => {
+    const engine = lostEngine();
+    let resolveAcquisition;
+    let destroyed = 0;
+    let attempts = 0;
+    const replacement = replacementDevice();
+    replacement.device.destroy = () => { destroyed++; };
+    const acquire = GpuEngine.acquireDevice;
+    GpuEngine.acquireDevice = () => {
+      attempts++;
+      return new Promise(resolve => { resolveAcquisition = resolve; });
+    };
+    const capture = captureMessages();
+    try {
+      const restoring = engine.restore();
+      await engine.restore();
+      assert.equal(attempts, 1, "recovery is single-flight");
+      if (supersede) {
+        engine.device = replacementDevice().device;
+      } else {
+        engine.stop();
+      }
+      resolveAcquisition(replacement);
+      await restoring;
+      assert.equal(destroyed, 1);
+      assert.equal(engine.deviceGeneration, 1);
+      assert.deepEqual(capture.messages, []);
+    } finally {
+      engine.stop();
+      GpuEngine.acquireDevice = acquire;
+      capture.restore();
+    }
+  });
+}
+
+test("loss from a superseded device cannot start another recovery", async () => {
+  let loseOldDevice;
+  const old = replacementDevice(new Promise(resolve => { loseOldDevice = resolve; }));
+  const engine = lostEngine({ device: old.device });
+  engine.observeDevice(old.device);
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    return replacementDevice();
+  };
+  const capture = captureMessages();
+  try {
+    await engine.restore();
+    capture.messages.length = 0;
+    loseOldDevice({ message: "stale device loss" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1);
+    assert.equal(engine.stopped, false);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+});
+
+for (const blockedQueue of [false, true]) {
+  test(`recovery coalesces resizes while the old queue is ${blockedQueue ? "blocked" : "drained"}`, async () => {
+    let releaseOldQueue;
+    let loseDevice;
+    let retry;
+    const old = replacementDevice(new Promise(resolve => { loseDevice = resolve; }));
+    const engine = lostEngine({
+      device: old.device,
+      stopped: false,
+      queue: blockedQueue
+        ? new Promise(resolve => { releaseOldQueue = resolve; })
+        : Promise.resolve(),
+    });
+    engine.observeDevice(old.device);
+    const replacement = replacementDevice();
+    let attempts = 0;
+    const acquire = GpuEngine.acquireDevice;
+    const setTimeout = context.setTimeout;
+    GpuEngine.acquireDevice = async () => {
+      if (++attempts === 1) throw new Error("adapter unavailable");
+      return replacement;
+    };
+    context.setTimeout = callback => { retry = callback; };
+    const capture = captureMessages();
+    try {
+      engine.scheduleResize({
+        physicalWidth: 640, physicalHeight: 480,
+        logicalWidth: 640, logicalHeight: 480, scale: 1,
+      });
+      const oldQueue = engine.queue;
+      loseDevice({ message: "lost while resizing" });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(engine.stopped, true);
+      assert.equal(typeof retry, "function");
+      const generationAtLoss = engine.surfaceGeneration;
+      engine.scheduleResize({
+        physicalWidth: 0, physicalHeight: 0,
+        logicalWidth: 0, logicalHeight: 0, scale: 1,
+      });
+      const latest = {
+        physicalWidth: 5000, physicalHeight: 1200,
+        logicalWidth: 1000, logicalHeight: 600, scale: 2,
+      };
+      engine.scheduleResize(latest);
+      assert.equal(engine.pendingResize, latest);
+      retry();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(attempts, 2);
+      assert.equal(engine.stopped, false);
+      assert.equal(engine.device, replacement.device);
+      assert.equal(engine.pendingResize, null);
+      assert.equal(engine.resizeScheduled, false);
+      assert.deepEqual(engine.canvas, { width: 2048, height: 1200 });
+      assert.equal(engine.surfaceGeneration, generationAtLoss + 1);
+      const capabilities = capture.messages.findLast(message => message.type === "capabilities");
+      const view = new DataView(capabilities.bytes.buffer);
+      assert.deepEqual(
+        [16, 20, 24, 28].map(offset => view.getUint32(offset, true)),
+        [2048, 1200, 1000, 600],
+      );
+      assert.equal(view.getFloat32(32, true), 2);
+      assert.equal(view.getUint32(40, true), 2);
+      assert.deepEqual(
+        capture.messages.filter(message => message.type === "event")
+          .slice(-2).map(message => eventType(message.bytes)),
+        [6, 8],
+      );
+      const published = capture.messages.length;
+      releaseOldQueue?.();
+      await oldQueue;
+      assert.equal(capture.messages.length, published, "the old resize cannot overwrite recovery");
+      assert.deepEqual(engine.canvas, { width: 2048, height: 1200 });
+    } finally {
+      engine.stop();
+      releaseOldQueue?.();
+      retry?.();
+      GpuEngine.acquireDevice = acquire;
+      context.setTimeout = setTimeout;
+      capture.restore();
+    }
+  });
+}
+
+test("a zero-sized surface pending recovery uses the ordinary one-pixel clamp", async () => {
+  const engine = lostEngine({ queue: Promise.resolve() });
+  const acquire = GpuEngine.acquireDevice;
+  GpuEngine.acquireDevice = async () => replacementDevice();
+  const capture = captureMessages();
+  try {
+    engine.scheduleResize({
+      physicalWidth: 0, physicalHeight: 0,
+      logicalWidth: 0, logicalHeight: 0, scale: 1,
+    });
+    await engine.restore();
+    assert.deepEqual(engine.canvas, { width: 1, height: 1 });
+    assert.equal(engine.logicalWidth, 1);
+    assert.equal(engine.logicalHeight, 1);
+    assert.equal(engine.stopped, false);
+    assert.equal(capture.messages.some(message => message.type === "error"), false);
+  } finally {
+    engine.stop();
+    GpuEngine.acquireDevice = acquire;
+    capture.restore();
+  }
+});
+
+test("disposal discards pending recovery resizes and ignores later resize messages", async () => {
+  const engine = lostEngine({ queue: Promise.resolve() });
+  let retry;
+  let attempts = 0;
+  const acquire = GpuEngine.acquireDevice;
+  const setTimeout = context.setTimeout;
+  GpuEngine.acquireDevice = async () => {
+    attempts++;
+    throw new Error("adapter unavailable");
+  };
+  context.setTimeout = callback => { retry = callback; };
+  const capture = captureMessages();
+  try {
+    const restoring = engine.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    const dimensions = {
+      physicalWidth: 800, physicalHeight: 600,
+      logicalWidth: 800, logicalHeight: 600, scale: 1,
+    };
+    engine.scheduleResize(dimensions);
+    assert.equal(engine.pendingResize, dimensions);
+    engine.stop();
+    engine.scheduleResize(dimensions);
+    assert.equal(engine.pendingResize, null);
+    retry();
+    await restoring;
+    assert.equal(attempts, 1);
+    assert.deepEqual(engine.canvas, { width: 320, height: 240 });
+    assert.equal(engine.stopped, true);
+    assert.deepEqual(capture.messages, []);
+  } finally {
+    engine.stop();
+    retry?.();
+    GpuEngine.acquireDevice = acquire;
+    context.setTimeout = setTimeout;
+    capture.restore();
+  }
+});
+
+for (const invalidScale of [false, true]) {
+  test(`recovery reports ${invalidScale ? "invalid resize scale" : "canvas configuration rejection"} without publishing restoration`, async () => {
+    const engine = lostEngine({ queue: Promise.resolve() });
+    const replacement = replacementDevice();
+    let destroyed = 0;
+    let attempts = 0;
+    replacement.device.destroy = () => { destroyed++; };
+    if (!invalidScale) {
+      replacement.context.configure = () => { throw new Error("canvas rejected configuration"); };
+    }
+    const acquire = GpuEngine.acquireDevice;
+    GpuEngine.acquireDevice = async () => {
+      attempts++;
+      return replacement;
+    };
+    const capture = captureMessages();
+    try {
+      engine.scheduleResize({
+        physicalWidth: 800, physicalHeight: 600,
+        logicalWidth: 800, logicalHeight: 600, scale: invalidScale ? 0 : 1,
+      });
+      await engine.restore();
+      assert.equal(engine.stopped, true);
+      assert.equal(engine.restoreFailed, true);
+      assert.equal(destroyed, 1);
+      assert.deepEqual(capture.messages.map(message => message.type), ["error"]);
+      assert.match(capture.messages[0].message, invalidScale ? /surface scale/ : /canvas rejected/);
+      await engine.restore();
+      assert.equal(attempts, 1, "a rejected surface cannot silently restart recovery");
+    } finally {
+      engine.stop();
+      GpuEngine.acquireDevice = acquire;
+      capture.restore();
+    }
+  });
+}

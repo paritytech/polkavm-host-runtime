@@ -546,10 +546,13 @@ fn host_ui_activates_only_idle_registrations_and_rejects_over_bound_files() {
         Some(support(true, true)),
         None,
     );
-    assert!(matches!(
-        runtime.take_mediated_input_command(),
-        Some(MediatedInputCommand::Request(_))
-    ));
+    let Some(MediatedInputCommand::Request(request)) = runtime.take_mediated_input_command() else {
+        panic!("expected camera request");
+    };
+    assert!(
+        request.handle >= 0x8000_0000,
+        "camera tokens cannot alias file handles"
+    );
     assert_eq!(
         runtime
             .send_file_input(1, selection("a.txt", "", b"a"))
@@ -560,7 +563,7 @@ fn host_ui_activates_only_idle_registrations_and_rejects_over_bound_files() {
         .send_file_input(2, selection("a.txt", "", b"a"))
         .is_err());
     runtime
-        .send_mediated_input_result(2, MediatedInputStatus::Cancelled, Vec::new())
+        .send_mediated_input_result(request.handle, MediatedInputStatus::Cancelled, Vec::new())
         .unwrap();
 
     assert_eq!(

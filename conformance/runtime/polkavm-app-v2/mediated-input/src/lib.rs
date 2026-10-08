@@ -6,6 +6,8 @@
 //! bytes delivered by the Host. The first save contains the positive handle,
 //! trigger result, and active status as little-endian `i32` values. The second
 //! contains the successful read length followed by the decoded bytes.
+//! It idles between Host events. Pointer deltas control the capture lifecycle:
+//! x=0 cancels, x=1 cancels and re-arms, and x=2 triggers the idle registration.
 
 #![no_std]
 #![allow(static_mut_refs)]
@@ -29,12 +31,16 @@ extern "C" {
     fn host_input_trigger(handle: u32) -> u32;
     fn host_input_status(handle: u32) -> u32;
     fn host_input_read(handle: u32, pointer: u32, capacity: u32) -> i32;
+    fn host_input_cancel(handle: u32) -> u32;
+    fn host_poll_input(pointer: u32, capacity: u32) -> u32;
+    fn host_update_after(delay_ms: u32);
     fn host_save_submit(pointer: u32, length: u32) -> u32;
 }
 
 #[polkavm_derive::polkavm_export]
 extern "C" fn init() {
     unsafe {
+        host_update_after(u32::MAX);
         let handle = host_input_register(
             KIND.as_ptr() as u32,
             KIND.len() as u32,
@@ -56,6 +62,19 @@ extern "C" fn init() {
 #[polkavm_derive::polkavm_export]
 extern "C" fn update() {
     unsafe {
+        host_update_after(u32::MAX);
+        let mut input = [0u8; 8];
+        if host_poll_input(input.as_mut_ptr() as u32, input.len() as u32) == 8
+            && input[0] == 6
+        {
+            if input[2] != 2 {
+                host_input_cancel(HANDLE);
+            }
+            if input[2] != 0 {
+                host_input_trigger(HANDLE);
+            }
+            return;
+        }
         if host_input_status(HANDLE) != 3 {
             return;
         }

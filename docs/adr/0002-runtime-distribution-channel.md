@@ -40,6 +40,10 @@ allowlist entry for this repository to `paritytech/npm_publish_automation`.
   and attaches all three to the tagged GitHub release. That tarball is the
   artifact downstream Hosts vendor, recorded by upstream revision in their own
   lockfiles.
+- Repeated tag events are serialized. Retrying publication accepts an existing
+  non-draft release only when its prerelease flag, complete asset inventory and
+  every artifact byte (including the provenance manifest) match the rebuilt
+  release. Missing or differing assets fail; the workflow never replaces them.
 - A Host that wants the package from a registry gets it through the
   useragent-kit distribution, which owns that publication and its versioning.
 - Changing the distribution channel is an organisational decision, not a
