@@ -235,7 +235,7 @@ Version numbers describe different boundaries; they are not interchangeable:
 | Presentation records | Graphics ABI 1, with the selected profile and required limits |
 | Browser bootstrap exports | Browser runtime ABI 2; ship Wasm and JS from the same build |
 | Engine and blob encoding | Exact revision `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` |
-| Conformance guest toolchain | `polkatool 0.31.0`, `nightly-2025-10-09` |
+| Conformance guest toolchain | `nightly-2025-10-09`; `polkatool 0.31.0` for 32-bit fixtures and the exact engine revision above for 64-bit fixtures |
 
 The pinned engine passed [Linux and Apple M1 qualification](https://github.com/paritytech/polkavm-host-runtime/actions/runs/37094525375),
 including forced native JIT execution and an ad-hoc signed hardened macOS host

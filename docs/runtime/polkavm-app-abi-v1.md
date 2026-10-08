@@ -1132,8 +1132,11 @@ polkadot_host_0_1_core_random(destination: u32, length: u32) -> i32
 ```
 
 The clock operations write a little-endian `u64` nanosecond value and return
-zero. The monotonic clock is scoped to the execution; the wall clock is Unix
-time. `core_random` fills exactly the requested bytes, at most 4 KiB, from the
+zero. The monotonic clock measures elapsed time from execution creation, with
+one epoch across initialization, updates, and resumptions. Browser translation
+uses `performance.now()` independently of the legacy frame clock. Nanosecond
+units do not guarantee nanosecond resolution. The wall clock is Unix time.
+`core_random` fills exactly the requested bytes, at most 4 KiB, from the
 Host CSPRNG. It returns `-3` for an empty request, `-5` when secure entropy is
 unavailable, and `-6` above the per-call limit. A failed entropy request does
 not write the guest destination. Invalid writable guest ranges fail the

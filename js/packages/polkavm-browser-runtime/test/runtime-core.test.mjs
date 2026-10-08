@@ -1495,7 +1495,6 @@ test("stop remains terminal when pending instantiation resolves or rejects", asy
     });
   }
 });
-
 test("both browser backends expose application core clocks and entropy", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
@@ -1545,6 +1544,98 @@ test("both browser backends expose application core clocks and entropy", async (
     await waitForMessage(messages, "terminated");
   }
 });
+
+for (const bitness of [32, 64]) {
+  test(`translated ${bitness}-bit core clock keeps its epoch across init and updates`, async (t) => {
+    const runtime = await readFile(
+      resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+    );
+    const fixture =
+      bitness === 32
+        ? "application-core-services"
+        : "application-core-services-64";
+    const program = await readFile(
+      resolve(
+        repositoryRoot,
+        `rust/crates/polkavm-host-runtime/tests/fixtures/${fixture}.polkavm`,
+      ),
+    );
+    const { messages, receiver } = endpoint();
+    let compiled;
+    try {
+      receiver.onmessage({
+        data: {
+          type: "start",
+          runtime: bytesBuffer(runtime),
+          program: bytesBuffer(program),
+          assets: [],
+          graphicsProfile: "framebuffer",
+          audioEnabled: false,
+          cacheKey: `core-clock-epoch-${bitness}`,
+        },
+      });
+      compiled = await waitForMessage(messages, "compiled");
+    } finally {
+      // Startup errors already terminate the endpoint and clear its handler.
+      if (receiver.onmessage) {
+        receiver.onmessage({ data: { type: "stop" } });
+        await waitForMessage(messages, "terminated");
+      }
+    }
+
+    // Model expensive initialization without a timing-sensitive busy wait.
+    // Each read also advances within a guest call, independently of frame time.
+    let now = 100;
+    t.mock.method(performance, "now", () => now++);
+    const samples = [];
+    const translated = new globalThis.TranslatedPolkaVmRuntime(
+      compiled.program,
+      [],
+      (output) => {
+        if (output.type === "save") {
+          samples.push(
+            new DataView(
+              output.bytes.buffer,
+              output.bytes.byteOffset,
+              output.bytes.byteLength,
+            ),
+          );
+        }
+      },
+      1_000_000,
+      false,
+      "framebuffer",
+    );
+    try {
+      now = 141;
+      translated.initialize();
+      assert.equal(samples.length, 1);
+      assert.equal(samples[0].getBigUint64(0, true), 41_000_000n);
+      assert.equal(samples[0].getBigUint64(8, true), 42_000_000n);
+
+      // The scheduler starts its epoch after init: 29 ms must not replace 41 ms.
+      now = 170;
+      translated.update(29);
+      assert.equal(samples.length, 2);
+      assert.equal(samples[1].getBigUint64(0, true), 70_000_000n);
+      assert.equal(samples[1].getBigUint64(8, true), 71_000_000n);
+
+      // An idle interval and even a reset frame clock must not reset core time.
+      // This value also exercises both halves of the pointer-based u64 record.
+      now = 5_200;
+      translated.update(0);
+      assert.equal(samples.length, 3);
+      assert.equal(samples[2].getBigUint64(0, true), 5_100_000_000n);
+      assert.equal(samples[2].getBigUint64(8, true), 5_101_000_000n);
+      for (const sample of samples) {
+        assert.equal(sample.getInt32(24, true), 0);
+        assert.equal(sample.getInt32(28, true), 0);
+      }
+    } finally {
+      translated.stop();
+    }
+  });
+}
 
 test("both browser backends deny unavailable or failing entropy without modifying the destination", async () => {
   const runtime = await readFile(

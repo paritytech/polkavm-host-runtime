@@ -2614,8 +2614,9 @@
         }
         case "polkadot_host_0_1_core_clock_monotonic": {
           this.#chargeBytes(8);
-          const timeMs =
-            this.timeMs ?? performance.now() - this.clockStartedAt;
+          // Keep one elapsed-time epoch through init, updates, and resumptions.
+          // timeMs belongs to the legacy frame clock, whose epoch starts after init.
+          const timeMs = performance.now() - this.clockStartedAt;
           this.#writeU64(
             this.#u32(a0),
             BigInt(Math.max(0, Math.trunc(timeMs * 1_000_000))),

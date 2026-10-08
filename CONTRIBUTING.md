@@ -28,6 +28,17 @@ When locked dependencies or toolchains change, regenerate attribution with
 checks deterministic output. The pinned Rust toolchain includes the source and
 documentation components needed to preserve standard-library license texts.
 
+### Conformance guests
+
+`scripts/check-conformance-guests.sh` rebuilds both 32-bit and 64-bit fixtures.
+Install `nightly-2025-10-09` with `rust-src` and keep `polkatool 0.31.0` on
+`PATH` for the existing 32-bit fixtures. The 64-bit linker must instead match
+the exact PolkaVM Git revision in `Cargo.lock`; version `0.37.0` alone does not
+identify its bytecode encoding. Install that linker under a separate prefix
+and set `POLKAVM_64_POLKATOOL` to its absolute executable path before running
+the script. The **Install guest toolchain** step in
+`.github/workflows/ci.yml` contains the pinned installation commands.
+
 ## Commit messages
 
 Use concise conventional subjects such as `fix(runtime): reject stale GPU sequences` or `build(browser): reproduce release assets`.

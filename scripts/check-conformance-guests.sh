@@ -9,6 +9,7 @@ GUESTS=(
   "polkavm-app-v2/ui-output polkavm_ui_output ui-output.polkavm"
   "polkavm-app-v2/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
   "polkavm-app-v2/core-services polkavm_app_core_services application-core-services.polkavm"
+  "polkavm-app-v2/core-services polkavm_app_core_services application-core-services-64.polkavm 64"
   "polkavm-app-v2/mediated-input polkavm_mediated_input mediated-input.polkavm"
   "polkadot-host-computer-0.1/core-context polkavm_computer_core_context computer-core-context.polkavm"
   "polkadot-host-computer-0.1/core-services polkavm_computer_core_services computer-core-services.polkavm"
@@ -30,13 +31,19 @@ done
 
 rustup component add rust-src --toolchain "$TOOLCHAIN" >/dev/null
 RUSTC="$(rustup which --toolchain "$TOOLCHAIN" rustc)"
-TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness 32)"
-TARGET_NAME="$(basename "$TARGET_JSON" .json)"
 TARGET_DIR="$(mktemp -d)"
 trap 'rm -rf "$TARGET_DIR"' EXIT
 
 for guest in "${GUESTS[@]}"; do
-  read -r directory artifact fixture <<<"$guest"
+  read -r directory artifact fixture bitness <<<"$guest"
+  # Latest64 changed its code encoding after polkatool 0.31. Keep the existing
+  # 32-bit fixture linker, but use the runtime's exact PolkaVM pin for 64-bit.
+  LINKER=polkatool
+  if [[ "${bitness:-32}" == 64 ]]; then
+    LINKER="${POLKAVM_64_POLKATOOL:?set to polkatool built from the PolkaVM revision in Cargo.lock}"
+  fi
+  TARGET_JSON="$(RUSTC="$RUSTC" polkatool get-target-json-path --bitness "${bitness:-32}")"
+  TARGET_NAME="$(basename "$TARGET_JSON" .json)"
   cargo +"$TOOLCHAIN" build \
     -Z build-std=core \
     --locked \
@@ -45,7 +52,7 @@ for guest in "${GUESTS[@]}"; do
     --target "$TARGET_JSON" \
     --release
 
-  polkatool link \
+  "$LINKER" link \
     "$TARGET_DIR/$TARGET_NAME/release/$artifact.elf" \
     -o "$TARGET_DIR/$fixture"
 
