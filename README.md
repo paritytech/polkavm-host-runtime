@@ -337,9 +337,17 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.8`.
-This candidate adds block-local register caching, forward dispatch, and inline gas
-checks described above. It retains rc.7's exact binary32 add/multiply intrinsics, accepting and returning
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.9`.
+This candidate combines the released rc.8 optimizations with foreground event
+wakes and the initial demand-driven update, monotonic clocks for 32-bit and
+64-bit guests, and WebGPU device-recovery retries. Recovery retains pending
+surface resizes, validates against the replacement device's current limits,
+and does not announce success after a failed surface configuration.
+Translated hostcall yields retain the remaining complete-call gas budget,
+scheduling requests, and per-call service bounds.
+
+It preserves rc.8's block-local register caching, forward dispatch, and inline gas
+checks described above, and rc.7's exact binary32 add/multiply intrinsics, accepting and returning
 raw IEEE-754 bits. Native execution, browser fallback and translated Wasm preserve
 round-to-nearest-even, subnormals, signed zero, and the documented NaN payload/sign
 rules. The bounded intrinsics consume guest gas without consuming Host I/O quotas.
@@ -362,6 +370,18 @@ It remains a prerelease, not a stable compatibility promise. The release generat
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
+
+Local rc.9 integration qualification passed 344 browser tests, 34 release-integrity
+tests, the all-feature Rust workspace suite, and all seven opt-in native GPU
+regressions. The rebuilt 32-bit and 64-bit clock fixtures matched their checked-in
+bytes; both browser backends produced monotonic samples over real MessageChannels.
+Chromium on a non-fallback NVIDIA Ampere adapter recovered from device loss and
+an injected acquisition failure, applied a pending resize using replacement limits,
+and completed a real GPU submission. An injected surface-configuration failure
+remained terminal without announcing restoration. Actual compiler and interpreter
+Workers also preserved hard-pause, background-idle, foreground-resume, and terminal
+stop behavior. These local results do not replace the candidate's required CI or
+qualify every graphics driver.
 
 ## Security
 

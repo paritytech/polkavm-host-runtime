@@ -1,6 +1,6 @@
 PolkaVM App v2 browser runtime
 Source repository: https://github.com/paritytech/polkavm-host-runtime
-Release tag: v0.3.2-rc.8
+Release tag: v0.3.2-rc.9
 Rust crate: rust/crates/polkavm-host-runtime
 GPU wire crate: rust/crates/polkavm-gpu-wire
 PolkaVM native revision: 642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5
