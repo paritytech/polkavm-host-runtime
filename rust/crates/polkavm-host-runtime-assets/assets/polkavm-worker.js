@@ -915,6 +915,7 @@
       motionAvailability = MOTION_STATUS_UNAVAILABLE,
       mediatedInputKinds = [],
       fileInput = null,
+      maxGasSlices = 1,
     ) {
       if (!TranslatedPolkaVmRuntime.isCompiledProgram(program)) {
         throw new TypeError("invalid translated PolkaVM compiled program");
@@ -1006,6 +1007,11 @@
       this.uiSemanticsSubmitted = false;
       this.uiOutputSubmitted = false;
       this.maxGas = BigInt(maxGas);
+      if (!Number.isSafeInteger(maxGasSlices) || maxGasSlices < 1) {
+        throw new Error("translated PolkaVM runtime has invalid gas slice count");
+      }
+      this.maxGasSlices = maxGasSlices;
+      this.remainingGasSlices = 0;
       this.input = [];
       this.coreInput = [];
       this.epocaInput = [];
@@ -1026,6 +1032,7 @@
       this.hostcalls = 0;
       this.hostcallBytes = 0;
       this.resumePending = false;
+      this.continuationPending = false;
       this.stopped = false;
       this.coreVm = this.metadata.exports.has("_pvm_start");
       if (this.coreVm && graphicsProfile !== "framebuffer") {
@@ -1080,7 +1087,7 @@
     }
 
     hasPendingContinuation() {
-      return !this.coreVm && this.resumePending;
+      return this.continuationPending;
     }
 
     pendingHostFrameResponses() {
@@ -1141,17 +1148,16 @@
         return;
       }
       this.timeMs = Math.max(this.timeMs ?? 0, timeMs);
-      this.updateAfterMs = null;
-      this.gpuSubmits = 0;
-      this.hostFrameRequests = 0;
-      this.uiSemanticsSubmitted = false;
-      this.uiOutputSubmitted = false;
-      this.hostFrameRequestBytes = 0;
-      this.#resetBudget(
-        this.coreVm && !this.coreVmStarted
-          ? MAX_HOSTCALLS_PER_INIT
-          : MAX_HOSTCALLS_PER_UPDATE,
-      );
+      const hostcalls = this.coreVm && !this.coreVmStarted
+        ? MAX_HOSTCALLS_PER_INIT
+        : MAX_HOSTCALLS_PER_UPDATE;
+      if (this.continuationPending) {
+        // A worker tick is not a new guest call. Only the hostcall scheduling
+        // quantum restarts; gas, scheduling requests and call bounds survive.
+        this.hostcalls = hostcalls;
+      } else {
+        this.#resetBudget(hostcalls);
+      }
       if (this.coreVm) {
         this.#run(this.exports.get("_pvm_start"), true);
         this.coreVmStarted = true;
@@ -2022,6 +2028,12 @@
 
     #resetBudget(hostcalls, gas = this.maxGas) {
       this.hostcalls = hostcalls;
+      this.updateAfterMs = null;
+      this.gpuSubmits = 0;
+      this.hostFrameRequests = 0;
+      this.uiSemanticsSubmitted = false;
+      this.uiOutputSubmitted = false;
+      this.hostFrameRequestBytes = 0;
       this.hostcallBytes = MAX_HOSTCALL_BYTES;
       this.tri2dSubmitted = false;
       this.mediatedInputCommands = 0;
@@ -2032,11 +2044,17 @@
       let status;
       if (this.resumePending) {
         this.resumePending = false;
+        if (!this.continuationPending) {
+          this.remainingGasSlices = this.maxGasSlices - 1;
+        }
+        this.continuationPending = false;
         status = this.pvm.pvm_resume();
       } else {
         if (entry === undefined) {
           throw new Error("translated PolkaVM entrypoint is missing");
         }
+        this.remainingGasSlices =
+          gas === this.maxGas ? this.maxGasSlices - 1 : 0;
         status = this.pvm.pvm_begin(entry, gas);
       }
       for (;;) {
@@ -2052,7 +2070,16 @@
           );
         }
         if (status === STATUS_OUT_OF_GAS) {
-          throw new Error("translated PolkaVM guest ran out of gas");
+          if (this.remainingGasSlices === 0) {
+            throw new Error("translated PolkaVM guest ran out of gas");
+          }
+          this.remainingGasSlices--;
+          // Hostcall yields retain the gas already in the VM. Only an exhausted
+          // gas quantum gets a refill, charged against the complete call budget.
+          this.pvm.pvm_set_gas(this.maxGas);
+          this.resumePending = true;
+          this.continuationPending = true;
+          return;
         }
         if (status !== STATUS_ECALL) {
           throw new Error(
@@ -2072,6 +2099,7 @@
           : this.#handleCooperativeCall(name);
         if (yielded && yieldOnFrame) {
           this.resumePending = true;
+          this.continuationPending = false;
           return;
         }
         if (this.hostcalls === 0) {
@@ -2079,6 +2107,7 @@
           // assets can require more than one bounded hostcall slice, while
           // returning here keeps each slice capped and the worker responsive.
           this.resumePending = true;
+          this.continuationPending = true;
           return;
         }
         status = this.pvm.pvm_resume();
@@ -3286,6 +3315,8 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   const LEGACY_FRAME_INTERVAL_MS = 1000 / 60;
   const MAX_GAS_PER_UPDATE = 10_000_000_000;
   const MAX_TRANSLATED_LOOPS_PER_UPDATE = 50_000_000;
+  const MAX_TRANSLATED_GAS_SLICES_PER_UPDATE =
+    MAX_GAS_PER_UPDATE / MAX_TRANSLATED_LOOPS_PER_UPDATE;
   const MAX_PROGRAM_BYTES = 64 * 1024 * 1024;
   const MAX_ASSET_FILES = 2048;
   const MAX_ASSET_NAME_BYTES = 1024;
@@ -3344,6 +3375,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   let pendingFrame = null;
   let demandDriven = false;
   let tickPending = false;
+  let updateRequested = false;
   let motionAvailability = 0;
   let pendingMotionSample = null;
   let pointerCaptureSupported = false;
@@ -3917,8 +3949,8 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   }
 
   function hasBackgroundWork() {
-    // Only cooperative hostcall-budget yields are continuations. CoreVM's
-    // frame yield is an update boundary, never a reason for an idle spin.
+    // Gas and hostcall scheduling yields are continuations. CoreVM's frame
+    // yield is an update boundary, never a reason for an idle spin.
     if (translated?.hasPendingContinuation()) {
       return backgroundContinuationTicks > 0;
     }
@@ -3953,6 +3985,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
 
   function wake() {
     if (demandDriven && !backgrounded) {
+      updateRequested = true;
       scheduleTick(0);
     }
   }
@@ -3965,8 +3998,10 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       ? Math.min(backgroundServiceTicks + 1, MAX_BACKGROUND_SERVICE_TICKS)
       : MAX_BACKGROUND_SERVICE_TICKS;
     backgroundContinuationTicks = MAX_BACKGROUND_CONTINUATION_TICKS;
-    if (backgrounded || demandDriven) {
+    if (backgrounded) {
       scheduleTick(0);
+    } else {
+      wake();
     }
   }
 
@@ -4028,6 +4063,9 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         backgroundServiceTicks = pendingHostFrameResponses();
         backgroundContinuationTicks = MAX_BACKGROUND_CONTINUATION_TICKS;
       }
+      if (!backgrounded) {
+        updateRequested = true;
+      }
       if (!backgrounded && pendingFrame !== null) {
         const { output, transfers } = pendingFrame;
         pendingFrame = null;
@@ -4054,6 +4092,11 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
   function tick() {
     if (!running || paused || (backgrounded && !hasBackgroundWork())) {
       return;
+    }
+    if (!translated?.hasPendingContinuation()) {
+      // An external wake belongs to the next logical call, not a continuation
+      // of a call that may already have polled before that event arrived.
+      updateRequested = false;
     }
     const firstUpdate = updateCount === 0;
     if (firstUpdate) {
@@ -4116,6 +4159,10 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
       if (hasBackgroundWork()) {
         scheduleTick(0);
       }
+      return;
+    }
+    if (translated?.hasPendingContinuation() || updateRequested) {
+      scheduleTick(0);
       return;
     }
     const requestedDelay = requestedUpdateDelay(completedAt);
@@ -4568,6 +4615,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         motionAvailability,
         message.mediatedInputKinds ?? [],
         message.fileInput ?? null,
+        MAX_TRANSLATED_GAS_SLICES_PER_UPDATE,
       );
       const relaunch = relaunchFile(message);
       if (relaunch !== null) {
@@ -4768,6 +4816,9 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
     for (const { output, transfers } of pendingOutputs) {
       postRuntimeOutput(output, transfers);
     }
+    // Initialization may still be suspended. Its completion cannot consume
+    // the automatic first update or make that update wait on an init deadline.
+    updateRequested = true;
     scheduleTick(0);
   }
 
