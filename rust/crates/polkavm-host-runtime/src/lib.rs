@@ -280,6 +280,38 @@ pub(crate) fn validate_blob(blob: &ProgramBlob) -> Result<()> {
     Ok(())
 }
 
+// Raw-bit arithmetic avoids the platform-dependent NaN propagation of native
+// floating-point instructions. These policies match the guest soft-float ABI.
+fn host_f32_add(a: u32, b: u32) -> u32 {
+    let a_abs = a & 0x7fff_ffff;
+    let b_abs = b & 0x7fff_ffff;
+    if a_abs > 0x7f80_0000 {
+        return a_abs | 0x0040_0000;
+    }
+    if b_abs > 0x7f80_0000 {
+        return b_abs | 0x0040_0000;
+    }
+    if a_abs == 0x7f80_0000 && b_abs == 0x7f80_0000 && a != b {
+        return 0x7fc0_0000;
+    }
+    (f32::from_bits(a) + f32::from_bits(b)).to_bits()
+}
+
+fn host_f32_mul(a: u32, b: u32) -> u32 {
+    let a_abs = a & 0x7fff_ffff;
+    let b_abs = b & 0x7fff_ffff;
+    if a_abs > 0x7f80_0000 {
+        return a | 0x0040_0000;
+    }
+    if b_abs > 0x7f80_0000 {
+        return b | 0x0040_0000;
+    }
+    if (a_abs == 0x7f80_0000 && b_abs == 0) || (b_abs == 0x7f80_0000 && a_abs == 0) {
+        return 0x7fc0_0000;
+    }
+    (f32::from_bits(a) * f32::from_bits(b)).to_bits()
+}
+
 /// Fixed input record discriminants in the guest ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -1111,6 +1143,25 @@ impl Runtime {
         let module =
             Module::from_blob(&engine, &module_config, blob).context("compile PolkaVM module")?;
         let mut linker: Linker<HostState, anyhow::Error> = Linker::new();
+
+        // Pure, fixed-cost arithmetic is bounded by guest gas, not host IO
+        // quotas. Do not charge host-call counts or bytes for these imports.
+        linker
+            .define_typed(
+                "host_f32_add",
+                |_: polkavm::Caller<'_, HostState>, a: u32, b: u32| -> Result<u32> {
+                    Ok(host_f32_add(a, b))
+                },
+            )
+            .context("define host_f32_add")?;
+        linker
+            .define_typed(
+                "host_f32_mul",
+                |_: polkavm::Caller<'_, HostState>, a: u32, b: u32| -> Result<u32> {
+                    Ok(host_f32_mul(a, b))
+                },
+            )
+            .context("define host_f32_mul")?;
 
         linker
             .define_typed(
@@ -2832,6 +2883,175 @@ mod tests {
     use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::{asm, InstructionSetKind};
     use polkavm_common::writer::ProgramBlobBuilder;
+
+    fn f32_backends() -> impl Iterator<Item = BackendKind> {
+        [
+            BackendKind::Interpreter,
+            #[cfg(not(target_arch = "wasm32"))]
+            BackendKind::Compiler,
+        ]
+        .into_iter()
+    }
+
+    #[test]
+    fn f32_imports_preserve_soft_float_bits_without_io_budget() {
+        // Import index, left bits, right bits, expected result bits. Expected
+        // values are explicit so platform NaN propagation cannot be the oracle.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            (0, 0x3f80_0000, 0x4000_0000, 0x4040_0000),
+            (0, 0x0000_0000, 0x8000_0000, 0x0000_0000),
+            (0, 0x8000_0000, 0x0000_0000, 0x0000_0000),
+            (0, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+            (0, 0x3f80_0000, 0xbf80_0000, 0x0000_0000),
+            // Half an ULP: even rounds down; odd rounds up.
+            (0, 0x3f80_0000, 0x3380_0000, 0x3f80_0000),
+            (0, 0x3f80_0001, 0x3380_0000, 0x3f80_0002),
+            (0, 0x0000_0001, 0x0000_0001, 0x0000_0002),
+            (0, 0x007f_ffff, 0x0000_0001, 0x0080_0000),
+            (0, 0x0080_0000, 0x8000_0001, 0x007f_ffff),
+            (0, 0x8000_0001, 0x8000_0001, 0x8000_0002),
+            (0, 0x7f7f_ffff, 0x7f7f_ffff, 0x7f80_0000),
+            (0, 0xff7f_ffff, 0xff7f_ffff, 0xff80_0000),
+            (0, 0x7f80_0000, 0x7f80_0000, 0x7f80_0000),
+            (0, 0xff80_0000, 0xff80_0000, 0xff80_0000),
+            (0, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000),
+            (0, 0xff80_0000, 0x7f80_0000, 0x7fc0_0000),
+            (0, 0x3f80_0000, 0xff80_0000, 0xff80_0000),
+            // Add selects the first NaN and clears its sign.
+            (0, 0xff81_2345, 0x7fc5_4321, 0x7fc1_2345),
+            (0, 0x7fc5_4321, 0xff81_2345, 0x7fc5_4321),
+            (0, 0x3f80_0000, 0xff81_2345, 0x7fc1_2345),
+            (0, 0xffc5_4321, 0x7f81_2345, 0x7fc5_4321),
+            (0, 0x7f80_0000, 0xffc5_4321, 0x7fc5_4321),
+            // Subtraction is add with the right operand's sign flipped.
+            (0, 0x4000_0000, 0x3f80_0000 ^ 0x8000_0000, 0x3f80_0000),
+            (0, 0x3f80_0000, 0x7f81_2345 ^ 0x8000_0000, 0x7fc1_2345),
+            (1, 0x3fc0_0000, 0x4000_0000, 0x4040_0000),
+            (1, 0x0000_0000, 0xbf80_0000, 0x8000_0000),
+            (1, 0x8000_0000, 0xbf80_0000, 0x0000_0000),
+            (1, 0x8000_0000, 0x3f80_0000, 0x8000_0000),
+            (1, 0x0080_0000, 0x3f00_0000, 0x0040_0000),
+            (1, 0x0000_0001, 0x3f00_0000, 0x0000_0000),
+            (1, 0x8000_0001, 0x3f00_0000, 0x8000_0000),
+            (1, 0x0000_0003, 0x3f00_0000, 0x0000_0002),
+            (1, 0x0000_0005, 0x3f00_0000, 0x0000_0002),
+            (1, 0x0080_0000, 0x3f7f_ffff, 0x0080_0000),
+            (1, 0x7f7f_ffff, 0x4000_0000, 0x7f80_0000),
+            (1, 0xff7f_ffff, 0x4000_0000, 0xff80_0000),
+            (1, 0x7f80_0000, 0xbf80_0000, 0xff80_0000),
+            (1, 0xff80_0000, 0xbf80_0000, 0x7f80_0000),
+            (1, 0x7f80_0000, 0xff80_0000, 0xff80_0000),
+            (1, 0x7f80_0000, 0x0000_0000, 0x7fc0_0000),
+            (1, 0xff80_0000, 0x8000_0000, 0x7fc0_0000),
+            (1, 0x0000_0000, 0xff80_0000, 0x7fc0_0000),
+            (1, 0x8000_0000, 0x7f80_0000, 0x7fc0_0000),
+            // Multiply selects the first NaN but preserves its sign.
+            (1, 0xff81_2345, 0x7fc5_4321, 0xffc1_2345),
+            (1, 0x7fc5_4321, 0xff81_2345, 0x7fc5_4321),
+            (1, 0x3f80_0000, 0xff81_2345, 0xffc1_2345),
+            (1, 0xffc5_4321, 0x7f81_2345, 0xffc5_4321),
+            (1, 0x0000_0000, 0xffc5_4321, 0xffc5_4321),
+        ];
+        let output_bytes = (cases.len() * 4) as u32;
+        let output = MemoryMapBuilder::new(64 * 1024)
+            .rw_data_size(output_bytes)
+            .build()
+            .unwrap()
+            .rw_data_address();
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.set_rw_data_size(output_bytes);
+        builder.add_import(b"host_f32_add");
+        builder.add_import(b"host_f32_mul");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        let mut code = Vec::new();
+        for (index, &(import, a, b, _)) in cases.iter().enumerate() {
+            code.extend([
+                asm::load_imm(Reg::A0, a as i32),
+                asm::load_imm(Reg::A1, b as i32),
+                asm::ecalli(import as i32),
+                asm::store_u32(Reg::A0, (output + index as u32 * 4) as i32),
+            ]);
+        }
+        code.push(asm::ret());
+        builder.set_code(&code, &[]);
+        let program = builder.into_vec().unwrap();
+        for backend in f32_backends() {
+            let mut runtime = Runtime::new_with_backend(
+                &program,
+                HashMap::new(),
+                PresentationProfile::Framebuffer,
+                false,
+                100_000,
+                backend,
+            )
+            .unwrap();
+            // Fresh HostState has no IO allowance at all. Exercise the real
+            // registered imports rather than the arithmetic helpers directly.
+            runtime.instance.set_gas(100_000);
+            runtime
+                .instance
+                .call_typed_and_get_result::<(), ()>(&mut runtime.state, "init", ())
+                .unwrap();
+            let results = runtime.instance.read_memory(output, output_bytes).unwrap();
+            for (index, &(_, a, b, expected)) in cases.iter().enumerate() {
+                let actual =
+                    u32::from_le_bytes(results[index * 4..index * 4 + 4].try_into().unwrap());
+                assert_eq!(
+                    actual, expected,
+                    "{backend:?}, case {index}: {a:08x}, {b:08x}"
+                );
+            }
+            assert_eq!(runtime.state.hostcalls_remaining, 0);
+            assert_eq!(runtime.state.hostcall_bytes_remaining, 0);
+            assert!(runtime.instance.gas() < 100_000);
+            assert!(runtime.state.charge_hostcall(0).is_err());
+            assert!(runtime.state.charge_hostcall_bytes(1).is_err());
+        }
+    }
+
+    #[test]
+    fn f32_imports_remain_gas_bounded_without_io_budget() {
+        let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);
+        builder.add_import(b"host_f32_add");
+        builder.add_import(b"host_f32_mul");
+        builder.add_export_by_basic_block(0, b"init");
+        builder.add_export_by_basic_block(0, b"update");
+        builder.set_code(
+            &[
+                asm::load_imm(Reg::A0, 0),
+                asm::load_imm(Reg::A1, 0),
+                asm::ecalli(0),
+                asm::ecalli(1),
+                asm::jump(0),
+            ],
+            &[],
+        );
+        let program = builder.into_vec().unwrap();
+        for backend in f32_backends() {
+            let mut runtime = Runtime::new_with_backend(
+                &program,
+                HashMap::new(),
+                PresentationProfile::Framebuffer,
+                false,
+                100,
+                backend,
+            )
+            .unwrap();
+            runtime.instance.set_gas(100);
+            let result = runtime.instance.call_typed_and_get_result::<(), ()>(
+                &mut runtime.state,
+                "init",
+                (),
+            );
+            assert!(
+                matches!(result, Err(CallError::NotEnoughGas)),
+                "{backend:?}: {result:?}"
+            );
+            assert_eq!(runtime.state.hostcalls_remaining, 0);
+            assert_eq!(runtime.state.hostcall_bytes_remaining, 0);
+        }
+    }
 
     fn resident_stack_program(stack_bytes: u32, touch_guard: bool) -> Vec<u8> {
         let mut builder = ProgramBlobBuilder::new(InstructionSetKind::Latest32);

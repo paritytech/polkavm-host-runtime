@@ -1127,6 +1127,56 @@ only while the execution is in the foreground and MUST stop physical sensor
 acquisition when the execution loses the foreground, closes, or loses
 authorization. The application MUST handle `-1` and `-2`.
 
+### Exact binary32 arithmetic
+
+```text
+host_f32_add(a: u32, b: u32) -> u32
+host_f32_mul(a: u32, b: u32) -> u32
+```
+
+These optional imports interpret both arguments and the result as raw IEEE-754
+binary32 bits, not integer values or pointers. Addition and multiplication MUST
+round to nearest, ties to even, with gradual underflow (no flushing subnormals
+to zero), signed zeros, and signed infinities. Each operation rounds once to
+binary32; it MUST NOT be fused with another operation.
+
+NaN propagation is explicit and matches the guest soft-float implementation,
+independently of the Host's native floating-point NaN conventions:
+
+- If either argument is a NaN, select the first NaN in argument order `a`, `b`.
+- Addition returns `(selected & 0x7fffffff) | 0x00400000`: preserve the payload,
+  quiet signaling NaNs, and clear the sign.
+- Multiplication returns `selected | 0x00400000`: preserve the payload and
+  sign, and quiet signaling NaNs.
+- With no NaN operand, opposite-signed infinities added together or zero
+  multiplied by infinity return the positive canonical NaN `0x7fc00000`,
+  regardless of operand order or signs.
+
+Subtraction uses `host_f32_add(a, b ^ 0x80000000)`; there is no separate
+subtraction import.
+
+These are pure, fixed-cost arithmetic operations: they access no guest memory,
+allocate no per-operation storage, and perform no IO. Their guest instructions
+remain gas-metered, including import calls. Hosts MUST NOT charge them against
+Host IO call-count or byte budgets; this exemption does not apply to any other
+Host import.
+
+Existing guests that do not import these symbols are unchanged. Guests that
+import them require an updated runtime providing this exact contract; an
+unsupported Host MUST reject the import rather than silently substitute an
+approximation or a fallback implementation.
+
+The browser Wasm translator lowers these imports directly to binary32
+arithmetic without a JavaScript hostcall. It checks the result for NaN and
+repairs exceptional results from the original integer operand bits; non-NaN
+results need no operand checks. This lowering preserves the register and gas
+contract above, including when execution resumes after gas exhaustion.
+When the arithmetic continuation is the adjacent block in the same generated
+function, execution falls through without re-entering the group dispatcher.
+The translator still records the continuation PC and retains its gas checks.
+Continuations across function/module boundaries retain tail-call dispatch,
+and ordinary Host imports still yield to the Host.
+
 ### Time
 
 ```text
@@ -1252,9 +1302,9 @@ asset files                           2,048
 one asset                             128 MiB
 all assets                            256 MiB
 one asset read                        16 MiB
-Host-call bytes per init/update       32 MiB
-Host calls during init                131,072
-Host calls during update              65,536
+Host IO call bytes per init/update    32 MiB
+Host IO calls during init             131,072
+Host IO calls during update           65,536
 sleep during init                     100 ms
 sleep during update                   50 ms
 audio samples per submission          96,000

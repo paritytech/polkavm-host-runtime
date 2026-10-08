@@ -224,6 +224,43 @@ runtime handles this ordering and caches the complete set. Browser Wasm tail
 calls are required by the compiled backend; unsupported compilation falls back
 to the interpreter. Compiler tests use the pinned native engine only as an oracle.
 
+The load-helper optimization emits address mapping directly inside
+each shared load helper, avoiding a second Wasm call on every dynamic load.
+It retains the general guest-address mapping, including heap-backed fiber
+stacks; SP is not assumed to point into the reserved stack segment. In a local
+hardware-WebGPU OpenHV menu comparison, this change alone moved 8.85 to
+9.37 FPS while adding 294 bytes to the 204,709,713-byte translated module.
+
+The compiler caches the 13 guest registers in block-local Wasm locals.
+Dirty registers are published at control transfers,
+hostcalls, explicit traps, and before potentially trapping memory operations.
+RV32 writes remain zero-normalized; host register mutations are observed on
+resumption. Direct forward transfers within a 128-block group branch to the
+existing Wasm labels instead of re-entering the dispatcher; backward and
+cross-group transfers still tail-call. Block-entry gas checks are emitted inline
+to avoid a shared call obscuring register globals from the Wasm optimizer.
+Gas accounting, the exported register ABI, memory layout, heap limits, and
+partitioned-module contract are unchanged. All 24 compiler regressions pass,
+including interpreter comparisons at hostcalls, traps, float intrinsics, and gas resumption.
+
+With the same integer-audio/input-before-render OpenHV guest, matched local
+60-second menu captures improved **13.15 → 22.40 FPS** (70%). The preserved
+published guest/runtime measured 10.15 FPS in the same comparison. Chromium 153
+used a non-fallback NVIDIA Ampere WebGPU adapter at 1304×1088 with music enabled.
+The final core compiled the guest normally in-browser, without supplied
+precompiled guest Wasm: translation took 3,998 ms and the backend was `compiler`.
+A fresh Cold Rage/Rogue AI match exercised construction, placement, and return
+to the menu. An earlier long session hit a guest `OutOfMemoryException` during
+map loading. Guest-side diagnostics showed contiguous GC reservation pressure;
+OpenHV now uses 4 MiB rather than 16 MiB small-object segments within the same
+128 MiB heap ceiling. The uninstrumented guest on rc.8 measured 22.13 FPS,
+or 21.52 FPS with browser audio playback active, and passed 21,854 frames including
+a 12,800-frame menu soak, construction, world teardown, and a second map with
+three AI opponents. The intermittent original terminal failure was not
+deterministically reproduced; the guest change mitigates the observed pressure,
+not every possible OOM. These are local qualification results, not a general
+frame-rate or unlimited-session stability guarantee.
+
 ## Compatibility and installation
 
 Version numbers describe different boundaries; they are not interchangeable:
@@ -300,13 +337,27 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.5`.
-This candidate is `0.3.2-rc.4` plus the surface-resize fix: offscreen passes
-retain their resources across resize, stale default-surface passes report error
-`4` with the offending command index, and offscreen/resource-only work does not
-count as a presented frame. It retains PolkaVM engine
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.8`.
+This candidate adds block-local register caching, forward dispatch, and inline gas
+checks described above. It retains rc.7's exact binary32 add/multiply intrinsics, accepting and returning
+raw IEEE-754 bits. Native execution, browser fallback and translated Wasm preserve
+round-to-nearest-even, subnormals, signed zero, and the documented NaN payload/sign
+rules. The bounded intrinsics consume guest gas without consuming Host I/O quotas.
+Translated float calls continue directly into the next block when it belongs to
+the same generated function; gas checks and real Host-call suspension are retained.
+The application measurements above are local observations, not a general FPS guarantee.
+
+The candidate retains `0.3.2-rc.6`'s correction for heap-backed fiber stacks:
+SP-relative loads and stores use the same guest-address mapping as other dynamic
+accesses, rather than assuming SP always points into the reserved stack segment.
+The 32-bit and 64-bit regression compares heap-backed and reserved-stack accesses
+with the interpreter.
+The candidate retains the surface-resize fix: offscreen passes retain their
+resources across resize, stale default-surface passes report error `4` with
+the offending command index, and offscreen/resource-only work does not count
+as a presented frame. It retains PolkaVM engine
 `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` and the prior translated-dispatch
-optimization, without adding the unfinished binary32 or checkpoint changes.
+optimization, without adding the unfinished checkpoint changes.
 It remains a prerelease, not a stable compatibility promise. The release generator
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.
