@@ -304,6 +304,60 @@ The host-frame transport is part of the base application ABI and does not
 require a manifest capability. Product identity, execution kind, permissions,
 and service availability remain Host policy.
 
+#### Optional browser workspace service
+
+An application may request `capabilities.workspace: { "abiVersion": 1 }`.
+This is an opt-in Host service over the existing opaque transport, not a new
+application runtime ABI or a grant of desktop filesystem access. The browser
+Host chooses a project before starting the guest and supplies
+`workspace: { name, files, metadata }` in the worker start message. An absent
+workspace disables the service. Older runtime distributions without
+`polkavm-workspace.js` do not support this capability.
+
+Workspace frames begin with the eight ASCII bytes `PVMFS001`, followed by a
+little-endian `u32` JSON-header byte length, a UTF-8 JSON header, and an optional
+raw byte payload. Requests contain a positive `u32` `id`, an `op`, and the
+operation's arguments. Responses contain the same `id`, a computer-filesystem
+`status`, and an optional descriptive `error`; operation results may also use
+the raw payload. The existing 1 MiB frame bound still applies. File transfers
+use chunks no larger than 256 KiB.
+
+The service reuses the computer filesystem's metadata, inode identities, path
+validation, and namespace operations. Its only root is `/home`: at most 64 files,
+256 non-root directories, 1 MiB per file, and 200 UTF-8 bytes per canonical path.
+Project identifiers are not part of the guest protocol. Git, symlinks, OS trash,
+and access outside that root are not provided.
+
+Mutations are serialized. The worker requests persistence with
+`{ type: "workspace-commit", id, modified, removed, metadata }`; the Host replies
+with `{ type: "workspace-commit-result", id, ok, error? }`. The Host MUST NOT
+reply with `ok: true` before durable transaction completion. On failure, the
+service restores file bytes and metadata before processing another request and
+returns an error to the guest. Hosts must drain pending persistence before
+releasing a project's writer ownership or switching projects. There is no
+commit timeout that pretends a possibly committed transaction was rolled back.
+The underlying computer ABI's `fs_sync` remains visibility-only.
+
+Hosts MAY additionally enable saved readable copies with `workspaceFormat: true`
+in the start message. A guest request `{ id, op: "readable_copy", path }` has no
+payload and operates on saved bytes, never guest editor buffers. The worker sends
+`{ type: "workspace-format", id, path, bytes: Uint8Array }` to the Host, transferring
+an owned input buffer. The Host replies with
+`{ type: "workspace-format-result", id, ok: true, bytes: Uint8Array }`, or
+`{ type: "workspace-format-result", id, ok: false, error: string }`.
+Format IDs are independent of persistence IDs. Without the start flag, the
+operation fails explicitly rather than waiting for an unsupported exchange.
+
+The formatter MUST parse without executing supplied code or loading project
+configuration. Formatting alone does not mutate the namespace. The service
+creates an unused sibling (`app.readable.js`, then `app.readable-2.js`, etc.),
+enforces the existing file, path, and byte limits, and uses the normal durable
+commit exchange. Only after commit success does the guest receive `{ id, status: 0 }`
+with the canonical UTF-8 sibling path as its payload. Formatting or persistence
+failure leaves saved source bytes and metadata unchanged; output is never
+truncated to fit. A Host may bound formatter computation independently of
+persistence, but MUST NOT treat that compute deadline as a commit timeout.
+
 ### Input
 
 ```text

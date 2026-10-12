@@ -7,6 +7,19 @@
 /**
  * Creates the bounded PolkaVM endpoint in a Worker or on a host thread.
  *
+ * Load polkavm-computer.js and polkavm-workspace.js before this source. A Host
+ * grants an origin-private namespace through start.workspace:
+ * {name, files: [{path, bytes: Uint8Array}], metadata: FilesystemMetadata}.
+ * The endpoint receives workspace-commit {id, modified, removed, metadata}
+ * and must send workspace-commit-result {id, ok, error?} only after its durable
+ * transaction completes. IDs and storage selection are Host-owned; they never
+ * appear in guest filesystem requests. Missing workspace grants return DENIED.
+ * This acknowledgement is independent of Computer fs_sync (visibility only).
+ * Hosts that set start.workspaceFormat=true also receive workspace-format
+ * {id, path, bytes: Uint8Array} and return workspace-format-result
+ * {id, ok:true, bytes: Uint8Array} or {id, ok:false, error:string}. Format IDs
+ * are independent of commit IDs; formatting alone never persists a file.
+ *
  * @param {DedicatedWorkerGlobalScope} endpoint - Message endpoint owned by the runtime.
  */
 globalThis.createPolkaVmRuntime = (endpoint) => {
@@ -63,6 +76,13 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let running = false;
   let disposed = false;
   let starting = false;
+  let workspace = null;
+  let workspaceCommit = null;
+  let nextWorkspaceCommitId = 1;
+  let workspaceFormat = null;
+  let nextWorkspaceFormatId = 1;
+  const workspaceResponses = [];
+  let workspaceResponseBytes = 0;
   let paused = false;
   let pausedAt = 0;
   let demandDriven = false;
@@ -93,6 +113,16 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
     activeMediatedInputHandles.clear();
     running = false;
+    workspace?.stop();
+    workspaceCommit?.reject(new Error("PolkaVM workspace stopped"));
+    workspaceCommit = null;
+    workspaceFormat?.reject(new Error("PolkaVM workspace stopped"));
+    workspaceFormat = null;
+    for (const response of workspaceResponses) {
+      response.reject(new Error("PolkaVM workspace stopped"));
+    }
+    workspaceResponses.length = 0;
+    workspaceResponseBytes = 0;
     heldInputs.clear();
     clearTimeout(timer);
     translated?.stop();
@@ -103,6 +133,12 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   }
 
   function postRuntimeOutput(output, transfers = []) {
+    if (
+      output?.type === "host-frame-request" &&
+      routeWorkspaceFrame(output.bytes)
+    ) {
+      return;
+    }
     // The Host also clears already delivered audio when it requests a pause.
     if (paused && output?.type === "audio") {
       return;
@@ -237,13 +273,154 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         pvm.polkavm_browser_host_frame_request_pointer(),
         length,
       ).slice();
-      postMessage({ type: "host-frame-request", bytes }, [bytes.buffer]);
+      if (!routeWorkspaceFrame(bytes)) {
+        postMessage({ type: "host-frame-request", bytes }, [bytes.buffer]);
+      }
     }
+  }
+
+  function routeWorkspaceFrame(bytes) {
+    if (!globalThis.PolkaVmWorkspace?.isWorkspaceFrame(bytes)) return false;
+    if (!workspace) {
+      throw new Error("PolkaVM workspace service is unavailable");
+    }
+    workspace.receive(bytes);
+    return true;
+  }
+
+  function commitWorkspace(delta) {
+    return new Promise((resolve, reject) => {
+      if (
+        disposed ||
+        workspaceCommit !== null ||
+        !Number.isSafeInteger(nextWorkspaceCommitId)
+      ) {
+        reject(new Error("PolkaVM workspace commit is unavailable"));
+        return;
+      }
+      const id = nextWorkspaceCommitId++;
+      workspaceCommit = { id, resolve, reject };
+      try {
+        // Service deltas contain copies, never live Computer filesystem buffers.
+        postMessage(
+          { type: "workspace-commit", id, ...delta },
+          delta.modified.map((file) => file.bytes.buffer),
+        );
+      } catch (error) {
+        workspaceCommit = null;
+        reject(error);
+      }
+    });
+  }
+
+  function receiveWorkspaceCommit(message) {
+    // Only the Host endpoint reaches this function. Guest host frames cannot
+    // acknowledge persistence. Unknown/stale IDs never settle another commit.
+    const pending = workspaceCommit;
+    if (!pending || message.id !== pending.id) return;
+    workspaceCommit = null;
+    if (
+      typeof message.ok !== "boolean" ||
+      (message.error !== undefined && typeof message.error !== "string")
+    ) {
+      pending.reject(
+        new Error("invalid workspace persistence acknowledgement"),
+      );
+    } else if (message.ok) {
+      pending.resolve();
+    } else {
+      pending.reject(
+        new Error(message.error || "workspace persistence failed"),
+      );
+    }
+  }
+
+  function formatWorkspace(path, bytes) {
+    return new Promise((resolve, reject) => {
+      if (
+        disposed ||
+        workspaceFormat !== null ||
+        !Number.isSafeInteger(nextWorkspaceFormatId)
+      ) {
+        reject(new Error("PolkaVM workspace formatter is unavailable"));
+        return;
+      }
+      const id = nextWorkspaceFormatId++;
+      workspaceFormat = { id, resolve, reject };
+      try {
+        // WorkspaceService supplies an owned copy, not its saved file buffer.
+        postMessage({ type: "workspace-format", id, path, bytes }, [
+          bytes.buffer,
+        ]);
+      } catch (error) {
+        workspaceFormat = null;
+        reject(error);
+      }
+    });
+  }
+
+  function receiveWorkspaceFormat(message) {
+    const pending = workspaceFormat;
+    if (!pending || message.id !== pending.id) return;
+    workspaceFormat = null;
+    if (
+      typeof message.ok !== "boolean" ||
+      (message.error !== undefined && typeof message.error !== "string") ||
+      (message.ok && !(message.bytes instanceof Uint8Array))
+    ) {
+      pending.reject(new Error("invalid workspace formatter response"));
+    } else if (message.ok) {
+      pending.resolve(message.bytes);
+    } else {
+      pending.reject(new Error(message.error || "workspace formatting failed"));
+    }
+  }
+
+  function queueWorkspaceResponse(bytes) {
+    return new Promise((resolve, reject) => {
+      if (
+        disposed ||
+        workspaceResponses.length >= 32 ||
+        workspaceResponseBytes + bytes.length > 4 * 1024 * 1024
+      ) {
+        reject(new Error("PolkaVM workspace response queue is unavailable"));
+        return;
+      }
+      workspaceResponses.push({ bytes, resolve, reject });
+      workspaceResponseBytes += bytes.length;
+      try {
+        flushWorkspaceResponses();
+        wake();
+      } catch (error) {
+        workspaceResponses.pop();
+        workspaceResponseBytes -= bytes.length;
+        reject(error);
+      }
+    });
+  }
+
+  function flushWorkspaceResponses() {
+    if (!running || disposed) return;
+    while (workspaceResponses.length) {
+      const response = workspaceResponses[0];
+      if (!sendHostFrameResponse(response.bytes)) return;
+      workspaceResponses.shift();
+      workspaceResponseBytes -= response.bytes.length;
+      response.resolve();
+    }
+  }
+
+  function failWorkspace(error) {
+    if (disposed) return;
+    stopRuntime();
+    postMessage({ type: "error", message: error.message });
+    postMessage({ type: "terminated" });
   }
 
   function drainMediatedInputCommands() {
     while (true) {
-      const operation = pvm.polkavm_browser_take_mediated_input_command?.() ?? 0;
+      const operation =
+        pvm.polkavm_browser_take_mediated_input_command?.() ?? 0;
       if (operation === 0) {
         return;
       }
@@ -253,7 +430,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         continue;
       }
       if (operation !== 1) {
-        throw new Error("interpreter emitted an invalid mediated-input command");
+        throw new Error(
+          "interpreter emitted an invalid mediated-input command",
+        );
       }
       const kind = decoder.decode(
         new Uint8Array(
@@ -375,7 +554,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     if (translated) {
       translated.pauseInput();
     } else {
-      check(pvm.polkavm_browser_pause_input(), "discard paused PolkaVM browser input");
+      check(
+        pvm.polkavm_browser_pause_input(),
+        "discard paused PolkaVM browser input",
+      );
     }
     // Releases survive the pause boundary; presses and movement never do.
     // A conforming Host has already sent these, but also release controls if
@@ -434,6 +616,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     }
     const before = performance.now();
     try {
+      flushWorkspaceResponses();
       if (translated) {
         translated.update(before - startedAt);
       } else {
@@ -453,6 +636,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         drainLogs();
       }
       drainPointerCapture();
+      flushWorkspaceResponses();
     } catch (error) {
       stopRuntime();
       postMessage({ type: "error", message: error.message });
@@ -480,7 +664,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         updateMaxMs: sorted[sorted.length - 1],
       });
     }
-    const requestedDelay = requestedUpdateDelay();
+    const requestedDelay = workspaceResponses.length
+      ? 0
+      : requestedUpdateDelay();
     if (requestedDelay !== null) {
       scheduleTick(
         demandDriven ? requestedDelay : Math.max(0, requestedDelay - elapsed),
@@ -619,6 +805,21 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       throw new Error("PolkaVM browser worker is already started");
     }
     const program = validateStartMessage(message);
+    if (message.workspace != null && !globalThis.PolkaVmWorkspace) {
+      throw new Error("PolkaVM workspace service is not installed");
+    }
+    if (globalThis.PolkaVmWorkspace) {
+      workspace = new globalThis.PolkaVmWorkspace.WorkspaceService(
+        message.workspace,
+        {
+          commit: commitWorkspace,
+          format:
+            message.workspaceFormat === true ? formatWorkspace : undefined,
+          respond: queueWorkspaceResponse,
+          fatal: failWorkspace,
+        },
+      );
+    }
     starting = true;
     motionAvailability = message.motionAvailability ?? 0;
     pointerCaptureSupported = message.pointerCaptureSupported === true;
@@ -649,11 +850,9 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             }
             const bytes = new Uint8Array(length >>> 0);
             browserCrypto.getRandomValues(bytes);
-            new Uint8Array(
-              pvm.memory.buffer,
-              pointer >>> 0,
-              length >>> 0,
-            ).set(bytes);
+            new Uint8Array(pvm.memory.buffer, pointer >>> 0, length >>> 0).set(
+              bytes,
+            );
             return 0;
           } catch {
             return CORE_STATUS_DENIED;
@@ -661,9 +860,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         },
       },
     };
-    pvm = (
-      await WebAssembly.instantiate(message.runtime, runtimeImports)
-    ).instance.exports;
+    pvm = (await WebAssembly.instantiate(message.runtime, runtimeImports))
+      .instance.exports;
     if (disposed) {
       pvm.polkavm_browser_reset?.();
       return;
@@ -727,9 +925,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
             `PolkaVM single-module compilation failed; compiling bounded code parts: ${error instanceof Error ? error.message : String(error)}`,
           );
           compilerStage = "compiler-translating-parts";
-          pvm = (
-            await WebAssembly.instantiate(message.runtime, runtimeImports)
-          ).instance.exports;
+          pvm = (await WebAssembly.instantiate(message.runtime, runtimeImports))
+            .instance.exports;
           if (disposed) {
             pvm.polkavm_browser_reset?.();
             return;
@@ -764,7 +961,11 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         if (generatedTranslation) {
           const persistent = bytes.slice();
           postMessage(
-            { type: "translated", cacheKey: message.cacheKey, bytes: persistent },
+            {
+              type: "translated",
+              cacheKey: message.cacheKey,
+              bytes: persistent,
+            },
             [persistent.buffer],
           );
         }
@@ -819,9 +1020,8 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         );
       }
       if (pvm === null) {
-        pvm = (
-          await WebAssembly.instantiate(message.runtime, runtimeImports)
-        ).instance.exports;
+        pvm = (await WebAssembly.instantiate(message.runtime, runtimeImports))
+          .instance.exports;
         if (disposed) {
           pvm.polkavm_browser_reset?.();
           return;
@@ -959,6 +1159,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
     for (const { output, transfers } of pendingOutputs) {
       postRuntimeOutput(output, transfers);
     }
+    flushWorkspaceResponses();
     scheduleTick(0);
   }
 
@@ -978,8 +1179,18 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       return;
     }
     const type = bytes[0];
-    if (paused && !(type === 2 || type === 4 || type === 7 || type === 12 ||
-        type === 20 || type === 21 || ((type === 13 || type === 15) && bytes[1] === 0))) {
+    if (
+      paused &&
+      !(
+        type === 2 ||
+        type === 4 ||
+        type === 7 ||
+        type === 12 ||
+        type === 20 ||
+        type === 21 ||
+        ((type === 13 || type === 15) && bytes[1] === 0)
+      )
+    ) {
       return;
     }
     if (type === 1 || type === 3 || type === 18) {
@@ -1334,6 +1545,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         postMessage({ type: "error", message: error.message });
         postMessage({ type: "terminated" });
       }
+    } else if (message?.type === "workspace-commit-result") {
+      receiveWorkspaceCommit(message);
+    } else if (message?.type === "workspace-format-result") {
+      receiveWorkspaceFormat(message);
     } else if (message?.type === "mediated-input-result") {
       try {
         sendMediatedInputResult(

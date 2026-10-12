@@ -60,6 +60,21 @@ color attachments; zero still selects the surface. Offscreen passes preserve
 the surface and retain generation and resource-handle validation. These changes
 remain within application runtime ABI 1, as required by ADR 0001.
 
+Browser Hosts may opt into the workspace service by supplying a `workspace`
+snapshot in the worker's start message. `polkavm-workspace.js` reuses the
+computer filesystem at `/home` and handles its bounded host-frame protocol.
+The Host selects the project; the guest cannot select a storage identifier.
+Mutations emit `workspace-commit` deltas and succeed only after the Host confirms
+durable persistence with `workspace-commit-result`. Failed commits restore the
+live filesystem before subsequent requests run. This does not change the
+computer ABI's visibility-only `fs_sync` semantics. See the
+[optional workspace service contract](docs/runtime/polkavm-app-abi-v1.md#optional-browser-workspace-service).
+
+Hosts can additionally set `workspaceFormat: true` to enable `readable_copy`.
+The separate `workspace-format` / `workspace-format-result` exchange delegates
+formatting to the Host; the service preserves the saved source and creates a
+non-overwriting sibling through the same durable commit path. Hosts without this
+optional formatter reject the operation explicitly.
 
 ## Build and test
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 await import("../src/polkavm-computer.js");
+await import("../src/polkavm-workspace.js");
 const {
   ComputerDevices,
   FS_OPEN_READ: READ,
@@ -347,4 +348,550 @@ test("exhausted metadata clocks roundtrip and reject mutations atomically", () =
   assert.deepEqual(devices.takeModifiedFiles(), []);
   assert.deepEqual(devices.takeRemovedFiles(), []);
   assert.equal(devices.takeFilesystemMetadata(), null);
+});
+
+const { WorkspaceService, encodeFrame, decodeFrame } =
+  globalThis.PolkaVmWorkspace;
+
+function workspaceSnapshot(
+  files = [{ path: "/home/dir/file", bytes: encode("before") }],
+) {
+  const devices = new ComputerDevices();
+  for (const file of files) devices.mountFile(file.path, file.bytes);
+  const snapshot = {
+    name: "test",
+    files,
+    metadata: devices.exportFilesystemMetadata(),
+  };
+  devices.dispose();
+  return snapshot;
+}
+
+function workspaceClient(t, commit, snapshot = workspaceSnapshot(), format) {
+  let id = 0;
+  const pending = new Map();
+  const service = new WorkspaceService(snapshot, {
+    commit,
+    format,
+    respond(bytes) {
+      const response = decodeFrame(bytes);
+      const resolve = pending.get(response.header.id);
+      pending.delete(response.header.id);
+      resolve(response);
+    },
+    fatal(error) {
+      assert.fail(error.message);
+    },
+  });
+  t.after(() => service.stop());
+  return {
+    service,
+    request(op, args = {}, payload) {
+      const current = ++id;
+      return new Promise((resolve) => {
+        pending.set(current, resolve);
+        service.receive(encodeFrame({ id: current, op, ...args }, payload));
+      });
+    },
+  };
+}
+
+async function stageWorkspaceWrite(client, bytes) {
+  const begin = await client.request("begin_write", {
+    path: "/home/dir/file",
+    length: bytes.length,
+    overwrite: true,
+    ignoreIfExists: false,
+  });
+  assert.equal(begin.header.status, 0);
+  if (bytes.length) {
+    const chunk = await client.request("write_chunk", { offset: 0 }, bytes);
+    assert.ok(chunk.header.status >= 0, chunk.header.error);
+  }
+}
+
+test("workspace failed durability restores bytes and metadata before queued reads", async (t) => {
+  let rejectCommit;
+  let started;
+  let failCommit = true;
+  const committing = new Promise((resolve) => {
+    started = resolve;
+  });
+  const client = workspaceClient(t, (delta) => {
+    // The Host may transfer the payload onward. Neither rollback references nor
+    // live Computer buffers may be detached by this transfer.
+    structuredClone(delta, {
+      transfer: delta.modified.map((file) => file.bytes.buffer),
+    });
+    if (!failCommit) return;
+    started();
+    return new Promise((_, reject) => {
+      rejectCommit = reject;
+    });
+  });
+  const before = await client.request("metadata", { path: "/home/dir/file" });
+  await stageWorkspaceWrite(client, encode("after!"));
+  const stagedRead = await client.request("read", {
+    path: "/home/dir/file",
+    offset: 0,
+    capacity: 100,
+  });
+  assert.equal(decode(stagedRead.payload), "before");
+  const saving = client.request("commit_write");
+  await committing;
+  let readCompleted = false;
+  const reading = client
+    .request("read", { path: "/home/dir/file", offset: 0, capacity: 100 })
+    .then((result) => {
+      readCompleted = true;
+      return result;
+    });
+  await Promise.resolve();
+  assert.equal(
+    readCompleted,
+    false,
+    "pending persistence must not expose its namespace",
+  );
+  rejectCommit(new Error("storage quota exceeded"));
+  assert.equal((await saving).header.status, -1);
+  assert.equal(decode((await reading).payload), "before");
+  assert.deepEqual(
+    (await client.request("metadata", { path: "/home/dir/file" })).payload,
+    before.payload,
+  );
+
+  failCommit = false;
+  await stageWorkspaceWrite(client, encode("short"));
+  assert.equal((await client.request("commit_write")).header.status, 0);
+  assert.equal(
+    decode(
+      (
+        await client.request("read", {
+          path: "/home/dir/file",
+          offset: 0,
+          capacity: 100,
+        })
+      ).payload,
+    ),
+    "short",
+  );
+  const old = new DataView(
+    before.payload.buffer,
+    before.payload.byteOffset,
+    before.payload.byteLength,
+  );
+  assert.equal(
+    (
+      await client.request("read", {
+        path: "/home/dir/file",
+        offset: 0,
+        capacity: 100,
+        inode: old.getBigUint64(16, true).toString(),
+        mtimeNs: old.getBigUint64(8, true).toString(),
+      })
+    ).header.status,
+    DENIED,
+  );
+});
+
+test("workspace failed rename and recursive removal restore the complete namespace", async (t) => {
+  const client = workspaceClient(t, () => {
+    throw new Error("transaction aborted");
+  });
+  const root = await client.request("metadata", { path: "/home" });
+  const directoryBefore = await client.request("metadata", {
+    path: "/home/dir",
+  });
+  const renamed = await client.request("rename", {
+    path: "/home/dir",
+    to: "/home/new/parent/moved",
+    overwrite: false,
+    ignoreIfExists: false,
+    createParents: true,
+  });
+  assert.equal(renamed.header.status, -1);
+  assert.equal(
+    (await client.request("metadata", { path: "/home/new" })).header.status,
+    NOT_FOUND,
+  );
+  assert.deepEqual(
+    (await client.request("metadata", { path: "/home" })).payload,
+    root.payload,
+  );
+  const removed = await client.request("remove", {
+    path: "/home/dir",
+    kind: 2,
+    recursive: true,
+    ignoreIfNotExists: false,
+  });
+  assert.equal(removed.header.status, -1);
+  assert.deepEqual(
+    (await client.request("metadata", { path: "/home/dir" })).payload,
+    directoryBefore.payload,
+  );
+  assert.equal(
+    decode(
+      (
+        await client.request("read", {
+          path: "/home/dir/file",
+          offset: 0,
+          capacity: 100,
+        })
+      ).payload,
+    ),
+    "before",
+  );
+});
+
+test("workspace invalid staged chunks cannot publish partial files or cross namespaces", async (t) => {
+  const first = workspaceClient(t, () => {});
+  const second = workspaceClient(t, () => {});
+  await first.request("begin_write", {
+    path: "/home/dir/file",
+    length: 5,
+    overwrite: true,
+    ignoreIfExists: false,
+  });
+  assert.equal(
+    (await first.request("write_chunk", { offset: 1 }, encode("x"))).header
+      .status,
+    INVALID,
+  );
+  assert.equal((await first.request("commit_write")).header.status, INVALID);
+  await stageWorkspaceWrite(first, encode("changed"));
+  assert.equal((await first.request("commit_write")).header.status, 0);
+  assert.equal(
+    decode(
+      (
+        await second.request("read", {
+          path: "/home/dir/file",
+          offset: 0,
+          capacity: 100,
+        })
+      ).payload,
+    ),
+    "before",
+  );
+});
+
+test("workspace framing rejects uncorrelatable requests and disabled grants fail explicitly", async (t) => {
+  const denied = workspaceClient(
+    t,
+    () => assert.fail("disabled workspace committed"),
+    null,
+  );
+  assert.equal((await denied.request("workspace")).header.status, DENIED);
+  assert.equal(
+    (await denied.request("workspace", { projectId: "guest-selected" })).header
+      .status,
+    INVALID,
+  );
+  assert.throws(() =>
+    denied.service.receive(encodeFrame({ id: 0, op: "workspace" })),
+  );
+  const truncated = encodeFrame({ id: 1, op: "workspace" });
+  new DataView(truncated.buffer).setUint32(8, truncated.length, true);
+  assert.throws(() => denied.service.receive(truncated));
+
+  const snapshot = workspaceSnapshot();
+  snapshot.metadata.entries = snapshot.metadata.entries.filter(
+    (entry) => entry.kind !== 1,
+  );
+  assert.throws(
+    () =>
+      new WorkspaceService(snapshot, {
+        commit() {},
+        respond() {},
+        fatal() {},
+      }),
+    /metadata/,
+  );
+});
+
+test("workspace readable copies preserve saved source and collisions until durable success", async (t) => {
+  const path = "/home/dir/foo.js";
+  const snapshot = workspaceSnapshot([
+    { path, bytes: encode("const x={a:1};") },
+    { path: "/home/dir/foo.readable.js", bytes: encode("existing") },
+    { path: "/home/dir/foo.readable-2.js/child", bytes: encode("child") },
+  ]);
+  let finishCommit;
+  let started;
+  const committing = new Promise((resolve) => {
+    started = resolve;
+  });
+  const client = workspaceClient(
+    t,
+    (delta) => {
+      assert.deepEqual(
+        delta.modified.map((file) => file.path),
+        ["/home/dir/foo.readable-3.js"],
+      );
+      assert.equal(decode(delta.modified[0].bytes), "const x = { a: 1 };\n");
+      assert.deepEqual(delta.removed, []);
+      structuredClone(delta, {
+        transfer: delta.modified.map((file) => file.bytes.buffer),
+      });
+      started();
+      return new Promise((resolve) => {
+        finishCommit = resolve;
+      });
+    },
+    snapshot,
+    (sourcePath, bytes) => {
+      assert.equal(sourcePath, path);
+      assert.equal(decode(bytes), "const x={a:1};");
+      structuredClone(bytes, { transfer: [bytes.buffer] });
+      return encode("const x = { a: 1 };\n");
+    },
+  );
+  const before = await client.request("metadata", { path });
+  let completed = false;
+  const copying = client.request("readable_copy", { path }).then((result) => {
+    completed = true;
+    return result;
+  });
+  await committing;
+  assert.equal(
+    completed,
+    false,
+    "copy must not be acknowledged before persistence",
+  );
+  finishCommit();
+  const response = await copying;
+  assert.equal(response.header.status, 0);
+  assert.equal(decode(response.payload), "/home/dir/foo.readable-3.js");
+  assert.equal(
+    decode(
+      (await client.request("read", { path, offset: 0, capacity: 100 }))
+        .payload,
+    ),
+    "const x={a:1};",
+  );
+  assert.deepEqual(
+    (await client.request("metadata", { path })).payload,
+    before.payload,
+  );
+  const copy = await client.request("metadata", {
+    path: decode(response.payload),
+  });
+  const inode = (record) =>
+    new DataView(
+      record.buffer,
+      record.byteOffset,
+      record.byteLength,
+    ).getBigUint64(16, true);
+  assert.notEqual(inode(copy.payload), inode(before.payload));
+  for (const [existing, content] of [
+    ["/home/dir/foo.readable.js", "existing"],
+    ["/home/dir/foo.readable-2.js/child", "child"],
+    [decode(response.payload), "const x = { a: 1 };\n"],
+  ]) {
+    assert.equal(
+      decode(
+        (
+          await client.request("read", {
+            path: existing,
+            offset: 0,
+            capacity: 100,
+          })
+        ).payload,
+      ),
+      content,
+    );
+  }
+});
+
+test("workspace readable copy formats saved bytes rather than a staged upload", async (t) => {
+  const client = workspaceClient(
+    t,
+    () => {},
+    undefined,
+    (_, bytes) => {
+      assert.equal(decode(bytes), "before");
+      return encode("readable");
+    },
+  );
+  await stageWorkspaceWrite(client, encode("unsaved"));
+  const first = await client.request("readable_copy", {
+    path: "/home/dir/file",
+  });
+  const second = await client.request("readable_copy", {
+    path: "/home/dir/file",
+  });
+  assert.equal(first.header.status, 0);
+  assert.equal(second.header.status, 0);
+  assert.equal(decode(first.payload), "/home/dir/file.readable");
+  assert.equal(decode(second.payload), "/home/dir/file.readable-2");
+  assert.equal((await client.request("commit_write")).header.status, 0);
+  assert.equal(
+    decode(
+      (
+        await client.request("read", {
+          path: "/home/dir/file",
+          offset: 0,
+          capacity: 100,
+        })
+      ).payload,
+    ),
+    "unsaved",
+  );
+});
+
+test("workspace readable formatting errors leave the namespace and source unchanged", async (t) => {
+  for (const [format, status] of [
+    [undefined, DENIED],
+    [
+      () => {
+        throw new Error("invalid syntax");
+      },
+      -1,
+    ],
+    [() => new ArrayBuffer(5), INVALID],
+    [() => new Uint8Array(1048577), LIMIT],
+  ]) {
+    const client = workspaceClient(
+      t,
+      () => assert.fail("failed formatting must not persist"),
+      undefined,
+      format,
+    );
+    const before = await client.request("metadata", { path: "/home/dir/file" });
+    const listing = await client.request("list", { path: "/home/dir" });
+    const result = await client.request("readable_copy", {
+      path: "/home/dir/file",
+    });
+    assert.equal(result.header.status, status);
+    assert.equal(result.payload.length, 0);
+    assert.deepEqual(
+      (await client.request("list", { path: "/home/dir" })).payload,
+      listing.payload,
+    );
+    assert.deepEqual(
+      (await client.request("metadata", { path: "/home/dir/file" })).payload,
+      before.payload,
+    );
+    assert.equal(
+      decode(
+        (
+          await client.request("read", {
+            path: "/home/dir/file",
+            offset: 0,
+            capacity: 100,
+          })
+        ).payload,
+      ),
+      "before",
+    );
+  }
+});
+
+test("workspace readable copy rejects path and file limits without truncation", async (t) => {
+  for (const files of [
+    [{ path: `/home/${"é".repeat(95)}.js`, bytes: encode("x") }],
+    Array.from({ length: 64 }, (_, i) => ({
+      path: `/home/file${i}.js`,
+      bytes: encode("x"),
+    })),
+  ]) {
+    const client = workspaceClient(
+      t,
+      () => assert.fail("limit failure must not persist"),
+      workspaceSnapshot(files),
+      (_, bytes) => bytes,
+    );
+    const before = await client.request("list", { path: "/home" });
+    const result = await client.request("readable_copy", {
+      path: files[0].path,
+    });
+    assert.equal(result.header.status, LIMIT);
+    assert.equal(result.payload.length, 0);
+    assert.deepEqual(
+      (await client.request("list", { path: "/home" })).payload,
+      before.payload,
+    );
+  }
+});
+
+test("workspace readable copy rolls back failed durability and reuses the available name", async (t) => {
+  let rejectCommit;
+  let started;
+  let failCommit = true;
+  const committing = new Promise((resolve) => {
+    started = resolve;
+  });
+  const client = workspaceClient(
+    t,
+    (delta) => {
+      structuredClone(delta, {
+        transfer: delta.modified.map((file) => file.bytes.buffer),
+      });
+      if (!failCommit) return;
+      started();
+      return new Promise((_, reject) => {
+        rejectCommit = reject;
+      });
+    },
+    undefined,
+    () => encode("readable"),
+  );
+  const before = await client.request("metadata", { path: "/home/dir/file" });
+  const directory = await client.request("metadata", { path: "/home/dir" });
+  const copying = client.request("readable_copy", { path: "/home/dir/file" });
+  await committing;
+  const queued = client.request("metadata", {
+    path: "/home/dir/file.readable",
+  });
+  rejectCommit(new Error("quota exceeded"));
+  const result = await copying;
+  assert.equal(result.header.status, -1);
+  assert.equal(result.payload.length, 0);
+  assert.equal((await queued).header.status, NOT_FOUND);
+  assert.deepEqual(
+    (await client.request("metadata", { path: "/home/dir/file" })).payload,
+    before.payload,
+  );
+  assert.deepEqual(
+    (await client.request("metadata", { path: "/home/dir" })).payload,
+    directory.payload,
+  );
+  assert.equal(
+    decode(
+      (
+        await client.request("read", {
+          path: "/home/dir/file",
+          offset: 0,
+          capacity: 100,
+        })
+      ).payload,
+    ),
+    "before",
+  );
+  failCommit = false;
+  const retry = await client.request("readable_copy", {
+    path: "/home/dir/file",
+  });
+  assert.equal(retry.header.status, 0);
+  assert.equal(decode(retry.payload), "/home/dir/file.readable");
+});
+
+test("workspace stopping during readable formatting prevents late persistence or success", async (t) => {
+  let finishFormat;
+  const client = workspaceClient(
+    t,
+    () => assert.fail("stopped formatting must not persist"),
+    undefined,
+    () =>
+      new Promise((resolve) => {
+        finishFormat = resolve;
+      }),
+  );
+  let responded = false;
+  void client.request("readable_copy", { path: "/home/dir/file" }).then(() => {
+    responded = true;
+  });
+  client.service.stop();
+  finishFormat(encode("readable"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(responded, false);
 });

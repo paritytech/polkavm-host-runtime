@@ -76,9 +76,15 @@ if (process.env.POLKAVM_HOST_RUNTIME_WASM === undefined) {
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
-const translated = await readFile(resolve(source, "polkavm-wasm-translated.js"));
+const translated = await readFile(
+  resolve(source, "polkavm-wasm-translated.js"),
+);
+const computer = await readFile(resolve(source, "polkavm-computer.js"));
+const workspace = await readFile(resolve(source, "polkavm-workspace.js"));
 const runtimeCore = await readFile(resolve(source, "polkavm-runtime-core.js"));
-const workerEntry = await readFile(resolve(source, "polkavm-wasm-worker-entry.js"));
+const workerEntry = await readFile(
+  resolve(source, "polkavm-wasm-worker-entry.js"),
+);
 await copyFile(wasm, resolve(dist, "polkavm-browser-runtime.wasm"));
 await copyFile(
   resolve(source, "polkavm-gpu-worker.js"),
@@ -100,10 +106,18 @@ await copyFile(
   resolve(source, "polkavm-computer.js"),
   resolve(dist, "polkavm-computer.js"),
 );
+await copyFile(
+  resolve(source, "polkavm-workspace.js"),
+  resolve(dist, "polkavm-workspace.js"),
+);
 await writeFile(
   resolve(dist, "polkavm-worker.js"),
   Buffer.concat([
     translated,
+    Buffer.from("\n"),
+    embeddedSource(computer, "polkavm-computer.js"),
+    Buffer.from("\n"),
+    embeddedSource(workspace, "polkavm-workspace.js"),
     Buffer.from("\n"),
     embeddedSource(runtimeCore, "polkavm-runtime-core.js"),
     Buffer.from("\n"),
@@ -119,6 +133,7 @@ const files = [
   "polkavm-runtime-core.js",
   "polkavm-wasm-worker-entry.js",
   "polkavm-computer.js",
+  "polkavm-workspace.js",
 ];
 const sums = [];
 for (const file of files) {
