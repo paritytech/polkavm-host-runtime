@@ -473,6 +473,40 @@ impl HostClock {
     }
 }
 
+// Raw-bit arithmetic avoids the platform-dependent NaN propagation of native
+// floating-point instructions. These policies match the guest soft-float ABI:
+// the first NaN operand (in argument order) is quieted; add clears its sign,
+// mul keeps it; invalid infinity arithmetic yields the positive canonical NaN.
+fn host_f32_add(a: u32, b: u32) -> u32 {
+    let a_abs = a & 0x7fff_ffff;
+    let b_abs = b & 0x7fff_ffff;
+    if a_abs > 0x7f80_0000 {
+        return a_abs | 0x0040_0000;
+    }
+    if b_abs > 0x7f80_0000 {
+        return b_abs | 0x0040_0000;
+    }
+    if a_abs == 0x7f80_0000 && b_abs == 0x7f80_0000 && a != b {
+        return 0x7fc0_0000;
+    }
+    (f32::from_bits(a) + f32::from_bits(b)).to_bits()
+}
+
+fn host_f32_mul(a: u32, b: u32) -> u32 {
+    let a_abs = a & 0x7fff_ffff;
+    let b_abs = b & 0x7fff_ffff;
+    if a_abs > 0x7f80_0000 {
+        return a | 0x0040_0000;
+    }
+    if b_abs > 0x7f80_0000 {
+        return b | 0x0040_0000;
+    }
+    if (a_abs == 0x7f80_0000 && b_abs == 0) || (b_abs == 0x7f80_0000 && a_abs == 0) {
+        return 0x7fc0_0000;
+    }
+    (f32::from_bits(a) * f32::from_bits(b)).to_bits()
+}
+
 fn wall_clock_ns() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1545,6 +1579,25 @@ impl Runtime {
                 },
             )
             .context("define host_time_ms")?;
+
+        // Pure, fixed-cost arithmetic is bounded by guest gas, not host IO
+        // quotas. Do not charge host-call counts or bytes for these imports.
+        linker
+            .define_typed(
+                "host_f32_add",
+                |_: polkavm::Caller<'_, HostState>, a: u32, b: u32| -> Result<u32> {
+                    Ok(host_f32_add(a, b))
+                },
+            )
+            .context("define host_f32_add")?;
+        linker
+            .define_typed(
+                "host_f32_mul",
+                |_: polkavm::Caller<'_, HostState>, a: u32, b: u32| -> Result<u32> {
+                    Ok(host_f32_mul(a, b))
+                },
+            )
+            .context("define host_f32_mul")?;
 
         linker
             .define_typed(
@@ -3029,6 +3082,72 @@ mod tests {
                 validate_gpu_event(&event).is_err(),
                 "invalid scale {scale:?} must fail closed"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod f32_intrinsic_tests {
+    use super::{host_f32_add, host_f32_mul};
+
+    #[test]
+    fn f32_helpers_follow_the_soft_float_nan_policy() {
+        // Import index, left bits, right bits, expected result bits. Expected
+        // values are explicit so platform NaN propagation cannot be the oracle.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            (0, 0x3f80_0000, 0x4000_0000, 0x4040_0000),
+            (0, 0x0000_0000, 0x8000_0000, 0x0000_0000),
+            (0, 0x8000_0000, 0x0000_0000, 0x0000_0000),
+            (0, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+            (0, 0x3f80_0000, 0xbf80_0000, 0x0000_0000),
+            (0, 0x3f80_0000, 0x3380_0000, 0x3f80_0000),
+            (0, 0x3f80_0001, 0x3380_0000, 0x3f80_0002),
+            (0, 0x0000_0001, 0x0000_0001, 0x0000_0002),
+            (0, 0x007f_ffff, 0x0000_0001, 0x0080_0000),
+            (0, 0x0080_0000, 0x8000_0001, 0x007f_ffff),
+            (0, 0x8000_0001, 0x8000_0001, 0x8000_0002),
+            (0, 0x7f7f_ffff, 0x7f7f_ffff, 0x7f80_0000),
+            (0, 0xff7f_ffff, 0xff7f_ffff, 0xff80_0000),
+            (0, 0x7f80_0000, 0x7f80_0000, 0x7f80_0000),
+            (0, 0xff80_0000, 0xff80_0000, 0xff80_0000),
+            (0, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000),
+            (0, 0xff80_0000, 0x7f80_0000, 0x7fc0_0000),
+            (0, 0x3f80_0000, 0xff80_0000, 0xff80_0000),
+            (0, 0xff81_2345, 0x7fc5_4321, 0x7fc1_2345),
+            (0, 0x7fc5_4321, 0xff81_2345, 0x7fc5_4321),
+            (0, 0x3f80_0000, 0xff81_2345, 0x7fc1_2345),
+            (0, 0xffc5_4321, 0x7f81_2345, 0x7fc5_4321),
+            (0, 0x7f80_0000, 0xffc5_4321, 0x7fc5_4321),
+            (0, 0x4000_0000, 0x3f80_0000 ^ 0x8000_0000, 0x3f80_0000),
+            (0, 0x3f80_0000, 0x7f81_2345 ^ 0x8000_0000, 0x7fc1_2345),
+            (1, 0x3fc0_0000, 0x4000_0000, 0x4040_0000),
+            (1, 0x0000_0000, 0xbf80_0000, 0x8000_0000),
+            (1, 0x8000_0000, 0xbf80_0000, 0x0000_0000),
+            (1, 0x8000_0000, 0x3f80_0000, 0x8000_0000),
+            (1, 0x0080_0000, 0x3f00_0000, 0x0040_0000),
+            (1, 0x0000_0001, 0x3f00_0000, 0x0000_0000),
+            (1, 0x8000_0001, 0x3f00_0000, 0x8000_0000),
+            (1, 0x0000_0003, 0x3f00_0000, 0x0000_0002),
+            (1, 0x0000_0005, 0x3f00_0000, 0x0000_0002),
+            (1, 0x0080_0000, 0x3f7f_ffff, 0x0080_0000),
+            (1, 0x7f7f_ffff, 0x4000_0000, 0x7f80_0000),
+            (1, 0xff7f_ffff, 0x4000_0000, 0xff80_0000),
+            (1, 0x7f80_0000, 0xbf80_0000, 0xff80_0000),
+            (1, 0xff80_0000, 0xbf80_0000, 0x7f80_0000),
+            (1, 0x7f80_0000, 0xff80_0000, 0xff80_0000),
+            (1, 0x7f80_0000, 0x0000_0000, 0x7fc0_0000),
+            (1, 0xff80_0000, 0x8000_0000, 0x7fc0_0000),
+            (1, 0x0000_0000, 0xff80_0000, 0x7fc0_0000),
+            (1, 0x8000_0000, 0x7f80_0000, 0x7fc0_0000),
+            (1, 0xff81_2345, 0x7fc5_4321, 0xffc1_2345),
+            (1, 0x7fc5_4321, 0xff81_2345, 0x7fc5_4321),
+            (1, 0x3f80_0000, 0xff81_2345, 0xffc1_2345),
+            (1, 0xffc5_4321, 0x7f81_2345, 0xffc5_4321),
+            (1, 0x0000_0000, 0xffc5_4321, 0xffc5_4321),
+        ];
+        for &(operation, a, b, expected) in cases {
+            let result = if operation == 0 { host_f32_add(a, b) } else { host_f32_mul(a, b) };
+            assert_eq!(result, expected, "op {operation} {a:#x} {b:#x}");
         }
     }
 }

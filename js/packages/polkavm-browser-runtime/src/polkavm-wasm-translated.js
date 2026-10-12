@@ -120,6 +120,28 @@
   const IOV_MAX = 1024n;
   const AT_FDCWD = BigInt.asUintN(64, -100n);
   const ENOSYS = 38;
+
+  // Exact binary32 add/mul with the guest soft-float NaN policy: first NaN
+  // operand quieted (add clears its sign, mul keeps it); invalid infinity
+  // arithmetic yields the positive canonical NaN. Views are reused; the
+  // synchronous pure operation cannot overlap another instance's call.
+  const floatBits = new Uint32Array(2);
+  const floatValues = new Float32Array(floatBits.buffer);
+
+  function float32Arithmetic(name, a, b) {
+    const multiply = name === "host_f32_mul";
+    if ((a & 0x7fffffff) > 0x7f800000 || (b & 0x7fffffff) > 0x7f800000) {
+      const bits = (a & 0x7fffffff) > 0x7f800000 ? a : b;
+      return ((multiply ? bits : bits & 0x7fffffff) | 0x00400000) >>> 0;
+    }
+    floatBits[0] = a;
+    floatBits[1] = b;
+    floatValues[0] = multiply
+      ? floatValues[0] * floatValues[1]
+      : floatValues[0] + floatValues[1];
+    const result = floatBits[0];
+    return (result & 0x7fffffff) > 0x7f800000 ? 0x7fc00000 : result;
+  }
   const EFAULT = 14;
   const ENOENT = 2;
   const EBADF = 9;
@@ -1214,6 +1236,17 @@
           throw new Error(
             `translated PolkaVM called unknown import ${importIndex}`,
           );
+        }
+        if (name === "host_f32_add" || name === "host_f32_mul") {
+          // Modules compiled by this runtime lower these imports; serve them
+          // for modules compiled without lowering. Pure arithmetic is bounded
+          // by guest gas and does not consume the hostcall budget.
+          this.#setReg(
+            7,
+            float32Arithmetic(name, this.#u32(this.#reg(7)), this.#u32(this.#reg(8))),
+          );
+          status = this.pvm.pvm_resume();
+          continue;
         }
         this.hostcalls--;
         const yielded = this.coreVm
