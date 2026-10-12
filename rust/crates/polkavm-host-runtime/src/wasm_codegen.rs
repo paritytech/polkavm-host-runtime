@@ -306,7 +306,7 @@ fn translate_with_part_limit(program: &[u8], part_limit: Option<usize>) -> Resul
     helper_code.function(&emit_physical_address_helper(layout));
     helper_code.function(&emit_gas_helper());
     for kind in LoadKind::ALL {
-        helper_code.function(&emit_load_helper(kind, context.physical_address_function));
+        helper_code.function(&emit_load_helper(kind, layout));
     }
     let mut code = if partitioned {
         CodeSection::new()
@@ -1027,34 +1027,39 @@ fn emit_physical_address(f: &mut Function, virtual_base: u32, physical_base: u32
     }
 }
 
-fn emit_physical_address_helper(layout: Layout) -> Function {
-    let mut f = Function::new([]);
+fn emit_physical_address_selection(f: &mut Function, layout: Layout) {
     f.instruction(&W::LocalGet(0));
     f.instruction(&W::I32Const(layout.stack_low as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.stack_low, layout.stack_phys);
+    emit_physical_address(f, layout.stack_low, layout.stack_phys);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(0));
     f.instruction(&W::I32Const(layout.rw_address as i32));
     f.instruction(&W::I32GeU);
     f.instruction(&W::If(BlockType::Result(ValType::I32)));
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.rw_address, layout.rw_phys);
+    emit_physical_address(f, layout.rw_address, layout.rw_phys);
     f.instruction(&W::Else);
     f.instruction(&W::LocalGet(0));
-    emit_physical_address(&mut f, layout.ro_address, layout.ro_phys);
+    emit_physical_address(f, layout.ro_address, layout.ro_phys);
     f.instruction(&W::End);
     f.instruction(&W::End);
+}
+
+fn emit_physical_address_helper(layout: Layout) -> Function {
+    let mut f = Function::new([]);
+    emit_physical_address_selection(&mut f, layout);
     f.instruction(&W::End);
     f
 }
 
-fn emit_load_helper(kind: LoadKind, physical_address_function: u32) -> Function {
+fn emit_load_helper(kind: LoadKind, layout: Layout) -> Function {
     let mut f = Function::new([]);
-    f.instruction(&W::LocalGet(0));
-    f.instruction(&W::Call(physical_address_function));
+    // Fuse the same address selection into each load helper rather than making
+    // a second Wasm call. Stores continue to use the shared address helper.
+    emit_physical_address_selection(&mut f, layout);
     emit_load_at(&mut f, kind);
     f.instruction(&W::End);
     f
@@ -2652,6 +2657,96 @@ mod tests {
                     .i64(),
                 Some(7),
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_loads_select_read_only_writable_and_stack_edges() {
+        let map = polkavm::MemoryMapBuilder::new(super::PAGE_SIZE)
+            .ro_data_size(65536)
+            .rw_data_size(65536)
+            .stack_size(65536)
+            .build()
+            .unwrap();
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            let mut ro_data = vec![0; 65536];
+            ro_data[..4].copy_from_slice(&0x8000_0001_u32.to_le_bytes());
+            ro_data[65532..].copy_from_slice(&0x8000_0002_u32.to_le_bytes());
+            let mut rw_data = vec![0; 65536];
+            rw_data[..4].copy_from_slice(&0x8000_0003_u32.to_le_bytes());
+            rw_data[65532..].copy_from_slice(&0x8000_0004_u32.to_le_bytes());
+            let mut builder = ProgramBlobBuilder::new(isa);
+            builder.set_ro_data_size(65536);
+            builder.set_ro_data(ro_data);
+            builder.set_rw_data_size(65536);
+            builder.set_rw_data(rw_data);
+            builder.set_stack_size(65536);
+            builder.add_export_by_basic_block(0, b"main");
+            let mut code = vec![
+                asm::load_imm(Reg::A0, 0x8000_0005_u32 as i32),
+                asm::load_imm(Reg::S0, map.stack_address_low() as i32),
+                asm::store_indirect_u32(Reg::A0, Reg::S0, 0),
+                asm::load_imm(Reg::A0, 0x8000_0006_u32 as i32),
+                asm::load_imm(Reg::S0, (map.stack_address_high() - 4) as i32),
+                asm::store_indirect_u32(Reg::A0, Reg::S0, 0),
+            ];
+            for (dst, address) in [
+                (Reg::A0, map.ro_data_address()),
+                (Reg::A1, map.ro_data_address() + map.ro_data_size() - 4),
+                (Reg::A2, map.rw_data_address()),
+                (Reg::A3, map.rw_data_address() + map.rw_data_size() - 4),
+                (Reg::A4, map.stack_address_low()),
+                (Reg::A5, map.stack_address_high() - 4),
+            ] {
+                code.push(asm::load_imm(Reg::S0, address as i32));
+                code.push(asm::load_indirect_i32(dst, Reg::S0, 0));
+            }
+            code.push(asm::ret());
+            builder.set_code(&code, &[]);
+            let program = builder.into_vec().unwrap();
+            let expected = interpreter_registers(&program);
+            for compile in [translate, translate_partitioned] {
+                let wasm = compile(&program).unwrap();
+                let (mut store, instance) = instance_from_wasm(&wasm);
+                let begin = instance
+                    .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                    .unwrap();
+                assert_eq!(
+                    begin.call(&mut store, (0, i64::MAX)).unwrap(),
+                    STATUS_FINISHED,
+                );
+                assert_eq!(register_values(&store, instance), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_load_traps_preserve_the_destination() {
+        for isa in [InstructionSetKind::Latest32, InstructionSetKind::Latest64] {
+            for (width, address) in [("u8", 0), ("i32", 65535), ("u16", -2)] {
+                let source = format!(
+                    "%rw_data_size = 65536\n%stack_size = 4096\npub @main:\n\
+                     a0 = 7\na1 = {address}\na0 = {width} [a1]\na0 = 99\nret\n",
+                );
+                let program = assemble(Some(isa), &source).unwrap();
+                for compile in [translate, translate_partitioned] {
+                    let wasm = compile(&program).unwrap();
+                    let (mut store, instance) = instance_from_wasm(&wasm);
+                    let begin = instance
+                        .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
+                        .unwrap();
+                    // Unmapped dynamic loads fault in Wasm memory, before the
+                    // destination register is written.
+                    assert_eq!(
+                        begin
+                            .call(&mut store, (0, i64::MAX))
+                            .unwrap_err()
+                            .as_trap_code(),
+                        Some(wasmi::core::TrapCode::MemoryOutOfBounds),
+                    );
+                    assert_eq!(register_values(&store, instance)[Reg::A0 as usize], 7);
+                }
+            }
         }
     }
 
