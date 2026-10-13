@@ -15,6 +15,9 @@
  * transaction completes. IDs and storage selection are Host-owned; they never
  * appear in guest filesystem requests. Missing workspace grants return DENIED.
  * This acknowledgement is independent of Computer fs_sync (visibility only).
+ * Hosts that render the guest's text viewport set start.textViewport=true;
+ * ui-output commands of type "text-viewport" are rejected otherwise.
+ *
  * Hosts that set start.workspaceFormat=true also receive workspace-format
  * {id, path, bytes: Uint8Array} and return workspace-format-result
  * {id, ok:true, bytes: Uint8Array} or {id, ok:false, error:string}. Format IDs
@@ -77,6 +80,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
   let disposed = false;
   let starting = false;
   let workspace = null;
+  let textViewportEnabled = false;
   let workspaceCommit = null;
   let nextWorkspaceCommitId = 1;
   let workspaceFormat = null;
@@ -246,7 +250,10 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       pvm.polkavm_browser_ui_output_pointer(),
       length,
     ).slice();
-    const output = globalThis.decodePolkaVmUiOutput?.(bytes);
+    const output = globalThis.decodePolkaVmUiOutput?.(
+      bytes,
+      textViewportEnabled,
+    );
     if (output == null) {
       throw new Error("interpreter emitted invalid UI output");
     }
@@ -821,6 +828,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
       );
     }
     starting = true;
+    textViewportEnabled = message.textViewport === true;
     motionAvailability = message.motionAvailability ?? 0;
     pointerCaptureSupported = message.pointerCaptureSupported === true;
     pendingGpuCapabilities =
@@ -995,6 +1003,7 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         pendingGpuCapabilities,
         motionAvailability,
         message.mediatedInputKinds ?? [],
+        message.textViewport === true,
       );
       compilerStage = "compiler-initializing";
       if (pendingMotionSample !== null) {
@@ -1077,6 +1086,12 @@ globalThis.createPolkaVmRuntime = (endpoint) => {
         ),
         "set PolkaVM browser pointer capture support",
       );
+      if (message.textViewport === true) {
+        check(
+          pvm.polkavm_browser_set_text_viewport_enabled(1),
+          "enable PolkaVM browser text viewport",
+        );
+      }
       if ((message.mediatedInputKinds?.length ?? 0) > 0) {
         stage(encoder.encode(message.mediatedInputKinds.join("\0")));
         check(

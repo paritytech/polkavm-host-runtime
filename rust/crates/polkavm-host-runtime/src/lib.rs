@@ -630,6 +630,9 @@ struct HostState {
     ui_semantics_submitted: bool,
     ui_output: Option<UiOutputFrame>,
     ui_output_submitted: bool,
+    /// The Host renders guest text-viewport snapshots; off by default so a
+    /// guest without a renderer behind it learns from the rejected submit.
+    text_viewport_enabled: bool,
     audio: VecDeque<AudioChunk>,
     audio_samples: usize,
     input: VecDeque<[u8; INPUT_EVENT_BYTES]>,
@@ -680,6 +683,7 @@ impl HostState {
             ui_semantics_submitted: false,
             ui_output: None,
             ui_output_submitted: false,
+            text_viewport_enabled: false,
             audio: VecDeque::new(),
             audio_samples: 0,
             input: VecDeque::new(),
@@ -896,7 +900,11 @@ impl HostState {
         if self.ui_output_submitted {
             bail!("UI output was already submitted during this call");
         }
-        ui_wire::decode_ui_output(&bytes).map_err(|error| anyhow!("invalid UI output: {error}"))?;
+        let options = ui_wire::UiOutputDecodeOptions {
+            text_viewport: self.text_viewport_enabled,
+        };
+        ui_wire::decode_ui_output_with(&bytes, options)
+            .map_err(|error| anyhow!("invalid UI output: {error}"))?;
         self.ui_output = Some(UiOutputFrame { bytes });
         self.ui_output_submitted = true;
         Ok(())
@@ -2016,6 +2024,12 @@ impl Runtime {
     /// Declares whether this Host can capture the pointer at all. Revoking
     /// support drops any request the guest has not been served yet, so the Host
     /// never arms capture it has just said it cannot perform.
+    /// Declares whether this Host renders [`ui_wire::UiOutputCommand::TextViewport`]
+    /// snapshots. Submits carrying one are rejected while this is off.
+    pub fn set_text_viewport_enabled(&mut self, enabled: bool) {
+        self.state.text_viewport_enabled = enabled;
+    }
+
     pub fn set_pointer_capture_supported(&mut self, supported: bool) {
         self.state.pointer_capture.supported = supported;
         if !supported {
@@ -3146,7 +3160,11 @@ mod f32_intrinsic_tests {
             (1, 0x0000_0000, 0xffc5_4321, 0xffc5_4321),
         ];
         for &(operation, a, b, expected) in cases {
-            let result = if operation == 0 { host_f32_add(a, b) } else { host_f32_mul(a, b) };
+            let result = if operation == 0 {
+                host_f32_add(a, b)
+            } else {
+                host_f32_mul(a, b)
+            };
             assert_eq!(result, expected, "op {operation} {a:#x} {b:#x}");
         }
     }

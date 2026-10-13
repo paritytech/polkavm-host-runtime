@@ -221,6 +221,14 @@ impl ApplicationRuntime {
         }
     }
 
+    pub fn set_text_viewport_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Cooperative(runtime) => runtime.set_text_viewport_enabled(enabled),
+            // CoreVm guests have no UI platform-output channel.
+            Self::CoreVm(_) => {}
+        }
+    }
+
     pub fn set_pointer_capture_active(&mut self, active: bool) -> Result<()> {
         match self {
             Self::Cooperative(runtime) => runtime.set_pointer_capture_active(active),

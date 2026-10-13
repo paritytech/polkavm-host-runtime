@@ -58,6 +58,26 @@ pub const UI_OUTPUT_COMMAND_OPEN_URL: u8 = 2;
 pub const UI_OUTPUT_COMMAND_COPY_IMAGE: u8 = 3;
 /// Open the URL in a new platform surface rather than replacing the current one.
 pub const UI_OUTPUT_OPEN_URL_NEW_SURFACE: u8 = 1 << 0;
+/// Replace the Host-retained text viewport: changed rows as styled runs.
+/// Only accepted by Hosts that render the viewport; see [`UiOutputDecodeOptions`].
+pub const UI_OUTPUT_COMMAND_TEXT_VIEWPORT: u8 = 4;
+/// Encoded byte length of the text-viewport command header.
+pub const TEXT_VIEWPORT_HEADER_BYTES: usize = 52;
+/// Encoded byte length of every text-viewport row header.
+pub const TEXT_VIEWPORT_ROW_HEADER_BYTES: usize = 8;
+/// Encoded byte length of every text-viewport styled run.
+pub const TEXT_VIEWPORT_RUN_BYTES: usize = 8;
+/// Maximum rows in one viewport and maximum changed rows in one command.
+pub const MAX_TEXT_VIEWPORT_ROWS: usize = 512;
+/// Maximum UTF-8 bytes in one viewport row.
+pub const MAX_TEXT_VIEWPORT_ROW_BYTES: usize = 16 * 1024;
+/// The run is rendered with a bold weight.
+pub const TEXT_VIEWPORT_RUN_BOLD: u8 = 1 << 0;
+/// The run is rendered italic.
+pub const TEXT_VIEWPORT_RUN_ITALIC: u8 = 1 << 1;
+const TEXT_VIEWPORT_RUN_FLAGS: u8 = TEXT_VIEWPORT_RUN_BOLD | TEXT_VIEWPORT_RUN_ITALIC;
+/// Cursor row value meaning "no cursor in this viewport".
+pub const TEXT_VIEWPORT_NO_CURSOR: u32 = u32::MAX;
 
 /// A surface-relative rectangle in logical UI points.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -251,7 +271,163 @@ pub enum UiOutputCommand<'a> {
         /// Row-major unpremultiplied sRGBA pixels.
         rgba: &'a [u8],
     },
+    /// Replace the Host-retained text viewport with the rows that changed.
+    TextViewport(UiTextViewport<'a>),
 }
+
+/// Geometry and identity of one Host-retained text viewport snapshot.
+///
+/// Lengths are in logical UI points relative to the application surface. Row
+/// `r` of the document is drawn with its top edge at
+/// `origin_y + (r - first_row) * line_height - scroll_y_fraction`, where the
+/// fraction is already folded into `origin_y` by the sender.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiTextViewportDescriptor {
+    /// Monotonic per-guest snapshot number; the Host applies rows in order.
+    pub sequence: u32,
+    /// First visible document row.
+    pub first_row: u32,
+    /// Visible rows; rows outside `first_row..first_row + row_count` are dropped.
+    pub row_count: u32,
+    /// Cursor as `(row, column)` in document rows and UTF-8 byte columns.
+    pub cursor: Option<(u32, u32)>,
+    /// Text area origin and size.
+    pub bounds: UiRect,
+    /// Vertical pitch between rows.
+    pub line_height: f32,
+    /// Font size used by the sender's layout.
+    pub font_size: f32,
+    /// Horizontal scroll offset applied before drawing every row.
+    pub scroll_x: f32,
+}
+
+impl UiTextViewportDescriptor {
+    fn is_valid(&self) -> bool {
+        self.row_count as usize <= MAX_TEXT_VIEWPORT_ROWS
+            && self.first_row.checked_add(self.row_count).is_some()
+            && self.cursor.is_none_or(|(row, _)| {
+                row != TEXT_VIEWPORT_NO_CURSOR
+                    && row >= self.first_row
+                    && row < self.first_row + self.row_count
+            })
+            && self.bounds.is_valid()
+            && self.line_height.is_finite()
+            && self.line_height > 0.0
+            && self.font_size.is_finite()
+            && self.font_size > 0.0
+            && self.scroll_x.is_finite()
+            && self.scroll_x >= 0.0
+    }
+}
+
+/// One styled run within a text-viewport row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiTextRun {
+    /// UTF-8 byte length covered by this run; runs tile the row text exactly.
+    pub len: u16,
+    /// Text colour as `0xRRGGBBAA`.
+    pub rgba: u32,
+    /// [`TEXT_VIEWPORT_RUN_BOLD`] and [`TEXT_VIEWPORT_RUN_ITALIC`] bits.
+    pub flags: u8,
+}
+
+/// One validated changed row borrowed from the stream.
+#[derive(Clone, Copy, Debug)]
+pub struct UiTextRow<'a> {
+    /// Document row.
+    pub row: u32,
+    /// Row text without line terminators.
+    pub text: &'a str,
+    runs: &'a [u8],
+}
+
+impl<'a> UiTextRow<'a> {
+    /// Styled runs covering `text` in order.
+    pub fn runs(self) -> impl ExactSizeIterator<Item = UiTextRun> + 'a {
+        self.runs
+            .chunks_exact(TEXT_VIEWPORT_RUN_BYTES)
+            .map(|run| UiTextRun {
+                len: read_u16(run, 0),
+                flags: run[2],
+                rgba: read_u32(run, 4),
+            })
+    }
+}
+
+/// A validated text-viewport command borrowed from the stream.
+#[derive(Clone, Copy, Debug)]
+pub struct UiTextViewport<'a> {
+    descriptor: UiTextViewportDescriptor,
+    changed_count: u32,
+    rows: &'a [u8],
+}
+
+impl<'a> UiTextViewport<'a> {
+    /// Geometry and identity of this snapshot.
+    pub fn descriptor(self) -> UiTextViewportDescriptor {
+        self.descriptor
+    }
+
+    /// Number of changed rows carried by this snapshot.
+    pub fn changed_count(self) -> usize {
+        self.changed_count as usize
+    }
+
+    /// Changed rows in ascending document order.
+    pub fn rows(self) -> UiTextRows<'a> {
+        UiTextRows {
+            bytes: self.rows,
+            remaining: self.changed_count,
+        }
+    }
+}
+
+impl PartialEq for UiTextViewport<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor && self.rows == other.rows
+    }
+}
+
+impl Eq for UiTextViewport<'_> {}
+
+/// Iterator over changed rows of a validated text-viewport command.
+#[derive(Clone, Debug)]
+pub struct UiTextRows<'a> {
+    bytes: &'a [u8],
+    remaining: u32,
+}
+
+impl<'a> Iterator for UiTextRows<'a> {
+    type Item = UiTextRow<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let row = read_u32(self.bytes, 0);
+        let text_len = usize::from(read_u16(self.bytes, 4));
+        let run_count = usize::from(read_u16(self.bytes, 6));
+        let text_start = TEXT_VIEWPORT_ROW_HEADER_BYTES;
+        let runs_start = text_start + text_len;
+        let end = runs_start + run_count * TEXT_VIEWPORT_RUN_BYTES;
+        let item = UiTextRow {
+            row,
+            text: core::str::from_utf8(&self.bytes[text_start..runs_start])
+                .expect("validated UI viewport row text"),
+            runs: &self.bytes[runs_start..end],
+        };
+        self.bytes = &self.bytes[end..];
+        self.remaining -= 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for UiTextRows<'_> {}
 
 /// A validated borrowed UI output stream.
 #[derive(Clone, Copy, Debug)]
@@ -318,6 +494,9 @@ impl<'a> Iterator for UiOutputCommands<'a> {
                 height: read_u32(payload, 4),
                 rgba: &payload[8..],
             },
+            UI_OUTPUT_COMMAND_TEXT_VIEWPORT => {
+                UiOutputCommand::TextViewport(text_viewport_from_validated(payload))
+            }
             _ => unreachable!("validated UI command opcode"),
         })
     }
@@ -417,6 +596,48 @@ impl<'a> UiOutputEncoder<'a> {
         )
     }
 
+    /// Begin one text-viewport command. Rows are appended through the returned
+    /// encoder, which must be finished before any other command is appended.
+    pub fn text_viewport(
+        &mut self,
+        descriptor: UiTextViewportDescriptor,
+    ) -> Result<UiTextViewportEncoder<'_, 'a>, UiOutputEncodeError> {
+        if !descriptor.is_valid() {
+            return Err(UiOutputEncodeError::TextViewport);
+        }
+        let mut header = [0u8; TEXT_VIEWPORT_HEADER_BYTES];
+        let (cursor_row, cursor_column) = descriptor.cursor.unwrap_or((TEXT_VIEWPORT_NO_CURSOR, 0));
+        for (index, value) in [
+            descriptor.sequence,
+            descriptor.first_row,
+            descriptor.row_count,
+            0,
+            cursor_row,
+            cursor_column,
+            descriptor.bounds.min_x.to_bits(),
+            descriptor.bounds.min_y.to_bits(),
+            descriptor.bounds.max_x.to_bits(),
+            descriptor.bounds.max_y.to_bits(),
+            descriptor.line_height.to_bits(),
+            descriptor.font_size.to_bits(),
+            descriptor.scroll_x.to_bits(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            header[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let command_start = self.destination.len();
+        self.push_command(UI_OUTPUT_COMMAND_TEXT_VIEWPORT, 0, &header)?;
+        Ok(UiTextViewportEncoder {
+            encoder: self,
+            command_start,
+            descriptor,
+            changed_count: 0,
+            last_row: None,
+        })
+    }
+
     /// Finish the stream by writing its total length and command count.
     pub fn finish(self) {
         let length = self.destination.len() as u32;
@@ -472,6 +693,79 @@ impl<'a> UiOutputEncoder<'a> {
     }
 }
 
+/// Appends changed rows to one text-viewport command.
+pub struct UiTextViewportEncoder<'e, 'a> {
+    encoder: &'e mut UiOutputEncoder<'a>,
+    command_start: usize,
+    descriptor: UiTextViewportDescriptor,
+    changed_count: u32,
+    last_row: Option<u32>,
+}
+
+impl UiTextViewportEncoder<'_, '_> {
+    /// Append one changed row. Rows must be visible, ascending, free of line
+    /// terminators, and exactly tiled by `runs`.
+    pub fn row(
+        &mut self,
+        row: u32,
+        text: &str,
+        runs: &[UiTextRun],
+    ) -> Result<(), UiOutputEncodeError> {
+        let descriptor = self.descriptor;
+        if self.changed_count as usize == MAX_TEXT_VIEWPORT_ROWS
+            || row < descriptor.first_row
+            || row >= descriptor.first_row + descriptor.row_count
+            || self.last_row.is_some_and(|last| row <= last)
+            || text.len() > MAX_TEXT_VIEWPORT_ROW_BYTES
+            || text.bytes().any(|byte| byte == b'\n' || byte == b'\r')
+            || runs.len() > text.len().max(1)
+            || runs
+                .iter()
+                .any(|run| run.len == 0 || run.flags & !TEXT_VIEWPORT_RUN_FLAGS != 0)
+            || runs.iter().map(|run| usize::from(run.len)).sum::<usize>() != text.len()
+        {
+            return Err(UiOutputEncodeError::TextViewport);
+        }
+        let added =
+            TEXT_VIEWPORT_ROW_HEADER_BYTES + text.len() + runs.len() * TEXT_VIEWPORT_RUN_BYTES;
+        let destination = &mut *self.encoder.destination;
+        let next_length = destination
+            .len()
+            .checked_add(added)
+            .ok_or(UiOutputEncodeError::OutputLength)?;
+        if next_length > MAX_UI_OUTPUT_BYTES {
+            return Err(UiOutputEncodeError::OutputLength);
+        }
+        destination
+            .try_reserve(added)
+            .map_err(UiOutputEncodeError::Allocation)?;
+        push_u32(destination, row);
+        push_u16(destination, text.len() as u16);
+        push_u16(destination, runs.len() as u16);
+        destination.extend_from_slice(text.as_bytes());
+        for run in runs {
+            push_u16(destination, run.len);
+            destination.push(run.flags);
+            destination.push(0);
+            push_u32(destination, run.rgba);
+        }
+        self.changed_count += 1;
+        self.last_row = Some(row);
+        Ok(())
+    }
+
+    /// Finish the command by writing its payload length and changed-row count.
+    pub fn finish(self) {
+        let destination = &mut *self.encoder.destination;
+        let payload_length =
+            destination.len() - self.command_start - UI_OUTPUT_COMMAND_HEADER_BYTES;
+        destination[self.command_start + 4..self.command_start + 8]
+            .copy_from_slice(&(payload_length as u32).to_le_bytes());
+        let changed_at = self.command_start + UI_OUTPUT_COMMAND_HEADER_BYTES + 12;
+        destination[changed_at..changed_at + 4].copy_from_slice(&self.changed_count.to_le_bytes());
+    }
+}
+
 /// Encode failure before a stream is submitted to a Host.
 #[derive(Debug)]
 pub enum UiOutputEncodeError {
@@ -487,6 +781,8 @@ pub enum UiOutputEncodeError {
     OpenUrlLength,
     /// The complete stream exceeds [`MAX_UI_OUTPUT_BYTES`].
     OutputLength,
+    /// Text-viewport geometry or a row violates the wire contract.
+    TextViewport,
     /// The destination could not reserve enough memory.
     Allocation(TryReserveError),
 }
@@ -508,6 +804,7 @@ impl fmt::Display for UiOutputEncodeError {
             Self::CopyImage => "UI clipboard image exceeds the wire limits",
             Self::OpenUrlLength => "UI URL is empty or exceeds the wire limit",
             Self::OutputLength => "UI output exceeds the wire limit",
+            Self::TextViewport => "UI text viewport violates the wire contract",
             Self::Allocation(_) => "could not allocate the UI output stream",
         })
     }
@@ -550,6 +847,10 @@ pub enum UiOutputDecodeError {
     Utf8,
     /// Bytes remain after the declared command sequence.
     TrailingBytes,
+    /// A text-viewport command was sent to a Host that does not render one.
+    TextViewportUnsupported,
+    /// Text-viewport geometry or a row violates the wire contract.
+    TextViewport,
 }
 
 impl fmt::Display for UiOutputDecodeError {
@@ -571,14 +872,32 @@ impl fmt::Display for UiOutputDecodeError {
             Self::CopyImage => "UI clipboard image exceeds the wire limits",
             Self::Utf8 => "UI output command is not valid UTF-8",
             Self::TrailingBytes => "UI output has trailing bytes",
+            Self::TextViewportUnsupported => "this Host does not render a UI text viewport",
+            Self::TextViewport => "UI text viewport violates the wire contract",
         })
     }
 }
 
 impl core::error::Error for UiOutputDecodeError {}
 
-/// Decode and validate one complete UI output v1 stream.
+/// Host capabilities that widen the accepted command set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UiOutputDecodeOptions {
+    /// The Host renders [`UiOutputCommand::TextViewport`] snapshots.
+    pub text_viewport: bool,
+}
+
+/// Decode and validate one complete UI output v1 stream for a Host without
+/// optional capabilities.
 pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeError> {
+    decode_ui_output_with(bytes, UiOutputDecodeOptions::default())
+}
+
+/// Decode and validate one complete UI output v1 stream.
+pub fn decode_ui_output_with(
+    bytes: &[u8],
+    options: UiOutputDecodeOptions,
+) -> Result<UiOutput<'_>, UiOutputDecodeError> {
     if bytes.len() < UI_OUTPUT_HEADER_BYTES || bytes.len() > MAX_UI_OUTPUT_BYTES {
         return Err(UiOutputDecodeError::Length);
     }
@@ -679,6 +998,15 @@ pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeErro
                 validate_copy_image(width, height, rgba.len())
                     .map_err(|_| UiOutputDecodeError::CopyImage)?;
             }
+            UI_OUTPUT_COMMAND_TEXT_VIEWPORT => {
+                if command_flags != 0 {
+                    return Err(UiOutputDecodeError::CommandFlags);
+                }
+                if !options.text_viewport {
+                    return Err(UiOutputDecodeError::TextViewportUnsupported);
+                }
+                validate_text_viewport(payload)?;
+            }
             _ => return Err(UiOutputDecodeError::CommandOpcode),
         }
         offset = end;
@@ -696,6 +1024,94 @@ pub fn decode_ui_output(bytes: &[u8]) -> Result<UiOutput<'_>, UiOutputDecodeErro
         },
         command_count,
     })
+}
+
+fn read_text_viewport_descriptor(payload: &[u8]) -> (UiTextViewportDescriptor, u32) {
+    let cursor_row = read_u32(payload, 16);
+    let descriptor = UiTextViewportDescriptor {
+        sequence: read_u32(payload, 0),
+        first_row: read_u32(payload, 4),
+        row_count: read_u32(payload, 8),
+        cursor: (cursor_row != TEXT_VIEWPORT_NO_CURSOR)
+            .then(|| (cursor_row, read_u32(payload, 20))),
+        bounds: UiRect {
+            min_x: read_f32(payload, 24),
+            min_y: read_f32(payload, 28),
+            max_x: read_f32(payload, 32),
+            max_y: read_f32(payload, 36),
+        },
+        line_height: read_f32(payload, 40),
+        font_size: read_f32(payload, 44),
+        scroll_x: read_f32(payload, 48),
+    };
+    (descriptor, read_u32(payload, 12))
+}
+
+fn validate_text_viewport(payload: &[u8]) -> Result<(), UiOutputDecodeError> {
+    let invalid = UiOutputDecodeError::TextViewport;
+    if payload.len() < TEXT_VIEWPORT_HEADER_BYTES {
+        return Err(invalid);
+    }
+    let (descriptor, changed_count) = read_text_viewport_descriptor(payload);
+    if !descriptor.is_valid()
+        || changed_count > descriptor.row_count
+        || (descriptor.cursor.is_none() && read_u32(payload, 20) != 0)
+    {
+        return Err(invalid);
+    }
+    let mut rows = &payload[TEXT_VIEWPORT_HEADER_BYTES..];
+    let mut last_row = None;
+    for _ in 0..changed_count {
+        if rows.len() < TEXT_VIEWPORT_ROW_HEADER_BYTES {
+            return Err(invalid);
+        }
+        let row = read_u32(rows, 0);
+        let text_len = usize::from(read_u16(rows, 4));
+        let run_count = usize::from(read_u16(rows, 6));
+        if row < descriptor.first_row
+            || row >= descriptor.first_row + descriptor.row_count
+            || last_row.is_some_and(|last| row <= last)
+            || run_count > text_len.max(1)
+        {
+            return Err(invalid);
+        }
+        let runs_start = TEXT_VIEWPORT_ROW_HEADER_BYTES + text_len;
+        let end = runs_start + run_count * TEXT_VIEWPORT_RUN_BYTES;
+        let text = rows
+            .get(TEXT_VIEWPORT_ROW_HEADER_BYTES..runs_start)
+            .ok_or(invalid)?;
+        let runs = rows.get(runs_start..end).ok_or(invalid)?;
+        if text.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
+            return Err(invalid);
+        }
+        core::str::from_utf8(text).map_err(|_| UiOutputDecodeError::Utf8)?;
+        let mut covered = 0usize;
+        for run in runs.chunks_exact(TEXT_VIEWPORT_RUN_BYTES) {
+            let len = usize::from(read_u16(run, 0));
+            if len == 0 || run[2] & !TEXT_VIEWPORT_RUN_FLAGS != 0 || run[3] != 0 {
+                return Err(invalid);
+            }
+            covered += len;
+        }
+        if covered != text_len {
+            return Err(invalid);
+        }
+        last_row = Some(row);
+        rows = &rows[end..];
+    }
+    if !rows.is_empty() {
+        return Err(invalid);
+    }
+    Ok(())
+}
+
+fn text_viewport_from_validated(payload: &[u8]) -> UiTextViewport<'_> {
+    let (descriptor, changed_count) = read_text_viewport_descriptor(payload);
+    UiTextViewport {
+        descriptor,
+        changed_count,
+        rows: &payload[TEXT_VIEWPORT_HEADER_BYTES..],
+    }
 }
 
 fn validate_copy_image(width: usize, height: usize, rgba_bytes: usize) -> Result<(), ()> {
@@ -865,6 +1281,170 @@ mod tests {
         assert_eq!(
             encoder.copy_text("").unwrap_err(),
             UiOutputEncodeError::CommandCount
+        );
+    }
+
+    fn viewport() -> UiTextViewportDescriptor {
+        UiTextViewportDescriptor {
+            sequence: 7,
+            first_row: 40,
+            row_count: 3,
+            cursor: Some((41, 4)),
+            bounds: UiRect {
+                min_x: 60.0,
+                min_y: 30.0,
+                max_x: 800.0,
+                max_y: 600.0,
+            },
+            line_height: 20.0,
+            font_size: 14.0,
+            scroll_x: 0.0,
+        }
+    }
+
+    fn encoded_viewport() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder =
+            UiOutputEncoder::begin(&mut bytes, UiOutputDescriptor::default()).unwrap();
+        let mut rows = encoder.text_viewport(viewport()).unwrap();
+        rows.row(
+            40,
+            "fn main() {",
+            &[
+                UiTextRun {
+                    len: 2,
+                    rgba: 0xff0000ff,
+                    flags: TEXT_VIEWPORT_RUN_BOLD,
+                },
+                UiTextRun {
+                    len: 9,
+                    rgba: 0x00ff00ff,
+                    flags: 0,
+                },
+            ],
+        )
+        .unwrap();
+        rows.row(42, "", &[]).unwrap();
+        rows.finish();
+        encoder.copy_text("after").unwrap();
+        encoder.finish();
+        bytes
+    }
+
+    #[test]
+    fn text_viewport_round_trips_and_requires_host_support() {
+        let bytes = encoded_viewport();
+        assert_eq!(
+            decode_ui_output(&bytes).unwrap_err(),
+            UiOutputDecodeError::TextViewportUnsupported
+        );
+        let options = UiOutputDecodeOptions {
+            text_viewport: true,
+        };
+        let output = decode_ui_output_with(&bytes, options).unwrap();
+        let mut commands = output.commands();
+        let Some(UiOutputCommand::TextViewport(snapshot)) = commands.next() else {
+            panic!("expected a text viewport");
+        };
+        assert_eq!(snapshot.descriptor(), viewport());
+        assert_eq!(snapshot.changed_count(), 2);
+        let rows: Vec<_> = snapshot.rows().collect();
+        assert_eq!(rows[0].row, 40);
+        assert_eq!(rows[0].text, "fn main() {");
+        assert_eq!(
+            rows[0].runs().collect::<Vec<_>>(),
+            vec![
+                UiTextRun {
+                    len: 2,
+                    rgba: 0xff0000ff,
+                    flags: TEXT_VIEWPORT_RUN_BOLD,
+                },
+                UiTextRun {
+                    len: 9,
+                    rgba: 0x00ff00ff,
+                    flags: 0,
+                },
+            ]
+        );
+        assert_eq!(rows[1].row, 42);
+        assert_eq!(rows[1].text, "");
+        assert_eq!(rows[1].runs().len(), 0);
+        assert_eq!(commands.next(), Some(UiOutputCommand::CopyText("after")));
+    }
+
+    #[test]
+    fn text_viewport_rows_must_tile_text_and_stay_visible() {
+        let mut bytes = Vec::new();
+        let mut encoder =
+            UiOutputEncoder::begin(&mut bytes, UiOutputDescriptor::default()).unwrap();
+        let mut rows = encoder.text_viewport(viewport()).unwrap();
+        let run = |len| UiTextRun {
+            len,
+            rgba: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            rows.row(43, "x", &[run(1)]).unwrap_err(),
+            UiOutputEncodeError::TextViewport
+        );
+        assert_eq!(
+            rows.row(40, "ab", &[run(1)]).unwrap_err(),
+            UiOutputEncodeError::TextViewport
+        );
+        assert_eq!(
+            rows.row(40, "a\nb", &[run(3)]).unwrap_err(),
+            UiOutputEncodeError::TextViewport
+        );
+        rows.row(41, "ab", &[run(2)]).unwrap();
+        assert_eq!(
+            rows.row(40, "ab", &[run(2)]).unwrap_err(),
+            UiOutputEncodeError::TextViewport
+        );
+        let mut invalid = viewport();
+        invalid.cursor = Some((50, 0));
+        drop(rows);
+        assert!(matches!(
+            encoder.text_viewport(invalid).map(drop),
+            Err(UiOutputEncodeError::TextViewport)
+        ));
+    }
+
+    #[test]
+    fn corrupted_text_viewport_rows_are_rejected() {
+        let options = UiOutputDecodeOptions {
+            text_viewport: true,
+        };
+        let bytes = encoded_viewport();
+        let row_header =
+            UI_OUTPUT_HEADER_BYTES + UI_OUTPUT_COMMAND_HEADER_BYTES + TEXT_VIEWPORT_HEADER_BYTES;
+        // Row moved outside the viewport.
+        let mut moved = bytes.clone();
+        moved[row_header..row_header + 4].copy_from_slice(&39u32.to_le_bytes());
+        assert_eq!(
+            decode_ui_output_with(&moved, options).unwrap_err(),
+            UiOutputDecodeError::TextViewport
+        );
+        // Run no longer tiles the text.
+        let mut untiled = bytes.clone();
+        let first_run = row_header + TEXT_VIEWPORT_ROW_HEADER_BYTES + "fn main() {".len();
+        untiled[first_run..first_run + 2].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(
+            decode_ui_output_with(&untiled, options).unwrap_err(),
+            UiOutputDecodeError::TextViewport
+        );
+        // Reserved run byte set.
+        let mut reserved = bytes.clone();
+        reserved[first_run + 3] = 1;
+        assert_eq!(
+            decode_ui_output_with(&reserved, options).unwrap_err(),
+            UiOutputDecodeError::TextViewport
+        );
+        // Line terminator inside row text.
+        let mut terminated = bytes;
+        terminated[row_header + TEXT_VIEWPORT_ROW_HEADER_BYTES] = b'\n';
+        assert_eq!(
+            decode_ui_output_with(&terminated, options).unwrap_err(),
+            UiOutputDecodeError::TextViewport
         );
     }
 }

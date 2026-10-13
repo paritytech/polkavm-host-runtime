@@ -64,6 +64,11 @@
   const UI_OUTPUT_COMMAND_HEADER_BYTES = 8;
   const MAX_UI_COPY_IMAGE_BYTES = 4 * 1024 * 1024;
   const MAX_UI_OUTPUT_BYTES = MAX_UI_COPY_IMAGE_BYTES + 256 * 1024;
+  const TEXT_VIEWPORT_HEADER_BYTES = 52;
+  const TEXT_VIEWPORT_ROW_HEADER_BYTES = 8;
+  const TEXT_VIEWPORT_RUN_BYTES = 8;
+  const MAX_TEXT_VIEWPORT_ROWS = 512;
+  const TEXT_VIEWPORT_NO_CURSOR = 0xffffffff;
   const MAX_UI_OUTPUT_COMMANDS = 64;
   const MAX_UI_COPY_TEXT_BYTES = 64 * 1024;
   const MAX_UI_COPY_IMAGE_PIXELS = 1024 * 1024;
@@ -238,7 +243,110 @@
     );
   }
 
-  function decodeUiOutput(bytes) {
+  // Mirrors polkavm-ui-wire validate_text_viewport: every rejection there
+  // is a rejection here, so native and browser Hosts accept the same bytes.
+  function decodeTextViewport(bytes, view, payloadStart, payloadLength) {
+    if (payloadLength < TEXT_VIEWPORT_HEADER_BYTES) {
+      return null;
+    }
+    const u32 = (offset) => view.getUint32(payloadStart + offset, true);
+    const f32 = (offset) => view.getFloat32(payloadStart + offset, true);
+    const firstRow = u32(4);
+    const rowCount = u32(8);
+    const changedCount = u32(12);
+    const cursorRow = u32(16);
+    const cursorColumn = u32(20);
+    const bounds = [f32(24), f32(28), f32(32), f32(36)];
+    const lineHeight = f32(40);
+    const fontSize = f32(44);
+    const scrollX = f32(48);
+    const endRow = firstRow + rowCount;
+    if (
+      rowCount > MAX_TEXT_VIEWPORT_ROWS ||
+      endRow > 0xffffffff ||
+      changedCount > rowCount ||
+      (cursorRow === TEXT_VIEWPORT_NO_CURSOR
+        ? cursorColumn !== 0
+        : cursorRow < firstRow || cursorRow >= endRow) ||
+      !bounds.every(Number.isFinite) ||
+      bounds[2] < bounds[0] ||
+      bounds[3] < bounds[1] ||
+      !(lineHeight > 0 && Number.isFinite(lineHeight)) ||
+      !(fontSize > 0 && Number.isFinite(fontSize)) ||
+      !(scrollX >= 0 && Number.isFinite(scrollX))
+    ) {
+      return null;
+    }
+    const rows = [];
+    let offset = payloadStart + TEXT_VIEWPORT_HEADER_BYTES;
+    const payloadEnd = payloadStart + payloadLength;
+    let lastRow = -1;
+    for (let index = 0; index < changedCount; index++) {
+      if (offset + TEXT_VIEWPORT_ROW_HEADER_BYTES > payloadEnd) {
+        return null;
+      }
+      const row = view.getUint32(offset, true);
+      const textLength = view.getUint16(offset + 4, true);
+      const runCount = view.getUint16(offset + 6, true);
+      const textStart = offset + TEXT_VIEWPORT_ROW_HEADER_BYTES;
+      const runsStart = textStart + textLength;
+      const end = runsStart + runCount * TEXT_VIEWPORT_RUN_BYTES;
+      if (
+        row < firstRow ||
+        row >= endRow ||
+        row <= lastRow ||
+        runCount > Math.max(textLength, 1) ||
+        end > payloadEnd
+      ) {
+        return null;
+      }
+      const textBytes = bytes.subarray(textStart, runsStart);
+      if (textBytes.some((byte) => byte === 0x0a || byte === 0x0d)) {
+        return null;
+      }
+      const text = strictDecoder.decode(textBytes);
+      const runs = [];
+      let covered = 0;
+      for (let run = runsStart; run < end; run += TEXT_VIEWPORT_RUN_BYTES) {
+        const length = view.getUint16(run, true);
+        const flags = bytes[run + 2];
+        if (length === 0 || (flags & ~3) !== 0 || bytes[run + 3] !== 0) {
+          return null;
+        }
+        covered += length;
+        runs.push({
+          len: length,
+          rgba: view.getUint32(run + 4, true),
+          bold: (flags & 1) !== 0,
+          italic: (flags & 2) !== 0,
+        });
+      }
+      if (covered !== textLength) {
+        return null;
+      }
+      rows.push({ row, text, runs });
+      lastRow = row;
+      offset = end;
+    }
+    if (offset !== payloadEnd) {
+      return null;
+    }
+    return {
+      type: "text-viewport",
+      sequence: u32(0),
+      firstRow,
+      rowCount,
+      cursor:
+        cursorRow === TEXT_VIEWPORT_NO_CURSOR ? null : [cursorRow, cursorColumn],
+      bounds,
+      lineHeight,
+      fontSize,
+      scrollX,
+      rows,
+    };
+  }
+
+  function decodeUiOutput(bytes, textViewport = false) {
     if (
       !(bytes instanceof Uint8Array) ||
       bytes.byteLength < UI_OUTPUT_HEADER_BYTES ||
@@ -358,6 +466,20 @@
             height,
             rgba: payloadBytes.subarray(8),
           });
+        } else if (opcode === 4) {
+          if (commandFlags !== 0 || !textViewport) {
+            return null;
+          }
+          const viewport = decodeTextViewport(
+            bytes,
+            view,
+            payloadStart,
+            payloadLength,
+          );
+          if (viewport === null) {
+            return null;
+          }
+          commands.push(viewport);
         } else {
           return null;
         }
@@ -610,6 +732,7 @@
       gpuCapabilities = null,
       motionAvailability = MOTION_STATUS_UNAVAILABLE,
       mediatedInputKinds = [],
+      textViewport = false,
     ) {
       if (!TranslatedPolkaVmRuntime.isCompiledProgram(program)) {
         throw new TypeError("invalid translated PolkaVM compiled program");
@@ -633,6 +756,7 @@
       );
       this.emit = emit;
       this.audioEnabled = audioEnabled;
+      this.textViewport = textViewport === true;
       if (
         !["framebuffer", "tri2d", "webgpu-raster", "webgpu"].includes(
           graphicsProfile,
@@ -1476,7 +1600,7 @@
             this.#setReg(7, 1n);
             return false;
           }
-          const output = decodeUiOutput(bytes);
+          const output = decodeUiOutput(bytes, this.textViewport);
           if (output === null) {
             this.#setReg(7, 1n);
             return false;

@@ -3133,8 +3133,7 @@ mod tests {
                 builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
                 let program = builder.into_vec().unwrap();
                 for part_limit in [None, Some(1)] {
-                    let wasm =
-                        translate_with_part_limit(&program, part_limit).unwrap();
+                    let wasm = translate_with_part_limit(&program, part_limit).unwrap();
                     let (mut store, instance) = instance_from_wasm(&wasm);
                     let begin = instance
                         .get_typed_func::<(i32, i64), i32>(&store, "pvm_begin")
@@ -3225,8 +3224,7 @@ mod tests {
                 builder.set_code(&instructions, &[]);
                 let program = builder.into_vec().unwrap();
                 for part_limit in [None, Some(1)] {
-                    let wasm =
-                        translate_with_part_limit(&program, part_limit).unwrap();
+                    let wasm = translate_with_part_limit(&program, part_limit).unwrap();
                     let (mut store, instance) = instance_from_wasm(&wasm);
                     for (reg, bits) in [(Reg::A0, 0x3f800000), (Reg::A1, 0x40000000)] {
                         instance

@@ -1170,6 +1170,67 @@ test("native-Wasm and translated backends validate and emit UI output v1", async
   }
 });
 
+test("both backends gate the text viewport on start.textViewport", async () => {
+  const runtime = await readFile(
+    resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),
+  );
+  const program = await readFile(
+    resolve(
+      repositoryRoot,
+      "rust/crates/polkavm-host-runtime/tests/fixtures/text-viewport.polkavm",
+    ),
+  );
+  const viewport = {
+    type: "text-viewport",
+    sequence: 1,
+    firstRow: 10,
+    rowCount: 2,
+    cursor: [11, 3],
+    bounds: [48, 32, 640, 480],
+    lineHeight: 20,
+    fontSize: 14,
+    scrollX: 0,
+    rows: [
+      {
+        row: 10,
+        text: "let x = 1;",
+        runs: [
+          { len: 3, rgba: 0xff0000ff, bold: true, italic: false },
+          { len: 7, rgba: 0x00ff00ff, bold: false, italic: false },
+        ],
+      },
+      { row: 11, text: "", runs: [] },
+    ],
+  };
+
+  for (const forceInterpreter of [false, true]) {
+    for (const textViewport of [false, true]) {
+      const { messages, receiver } = endpoint();
+      receiver.onmessage({
+        data: {
+          type: "start",
+          runtime: bytesBuffer(runtime),
+          program: bytesBuffer(program),
+          assets: [],
+          graphicsProfile: "tri2d",
+          audioEnabled: false,
+          cacheKey: `text-viewport-${forceInterpreter}`,
+          forceInterpreter,
+          textViewport,
+        },
+      });
+
+      await waitForMessage(messages, "ready");
+      const output = await waitForMessage(messages, "ui-output");
+      assert.equal(output.output.cursorIcon, "text");
+      assert.deepEqual(output.output.commands, textViewport ? [viewport] : []);
+
+      receiver.onmessage({ data: { type: "stop" } });
+      await waitForMessage(messages, "terminated");
+    }
+  }
+});
+
 test("compiler backend implements MotionSample v1 status and reads", async () => {
   const runtime = await readFile(
     resolve(packageRoot, "dist/polkavm-browser-runtime.wasm"),

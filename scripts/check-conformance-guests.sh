@@ -7,6 +7,7 @@ TOOLCHAIN="${POLKAVM_GUEST_TOOLCHAIN:-nightly-2025-10-09}"
 GUESTS=(
   "polkavm-app-v2/host-frame-roundtrip polkavm_host_frame_roundtrip host-frame-roundtrip.polkavm"
   "polkavm-app-v2/ui-output polkavm_ui_output ui-output.polkavm"
+  "polkavm-app-v2/text-viewport polkavm_text_viewport text-viewport.polkavm"
   "polkavm-app-v2/pointer-capture polkavm_pointer_capture pointer-capture.polkavm"
   "polkavm-app-v2/core-services polkavm_app_core_services application-core-services.polkavm"
   "polkavm-app-v2/mediated-input polkavm_mediated_input mediated-input.polkavm"

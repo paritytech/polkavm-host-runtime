@@ -324,6 +324,14 @@ pub extern "C" fn polkavm_browser_set_pointer_capture_supported(supported: u32) 
 }
 
 #[no_mangle]
+pub extern "C" fn polkavm_browser_set_text_viewport_enabled(enabled: u32) -> u32 {
+    status(|host| {
+        host.running()?.set_text_viewport_enabled(enabled != 0);
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn polkavm_browser_set_pointer_capture_active(active: u32) -> u32 {
     status(|host| host.running()?.set_pointer_capture_active(active != 0))
 }
