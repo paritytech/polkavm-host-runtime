@@ -661,8 +661,51 @@ opcode  flags  payload
 1       0      clipboard text as UTF-8
 2       bit 0  non-empty URL as UTF-8; bit 0 requests a new surface
 3       0      width u32, height u32, then row-major unpremultiplied sRGBA bytes
+4       0      text viewport: a 52-byte header followed by changed rows
 ```
 
+Opcode 4 is only accepted by Hosts that render a text viewport for the guest.
+Every other Host rejects the whole stream with status 1, which is how a guest
+learns to keep painting its editor itself; a guest MUST resubmit without the
+command after that answer and MUST NOT send it again. Browser Hosts enable the
+command for apps whose manifest declares `capabilities.textViewport` and load
+the declared bundled font so rows are shaped with the face the guest laid them
+out with.
+
+The text viewport header is:
+
+```text
+offset  type  field
+0       u32   sequence (monotonic per guest)
+4       u32   first visible document row
+8       u32   visible row count (at most 512)
+12      u32   changed row count (at most the visible row count)
+16      u32   cursor row, or 0xffffffff for no cursor
+20      u32   cursor column as a UTF-8 byte offset (0 without a cursor)
+24      f32   text area x0, y0, x1, y1 (finite, ordered; y0 includes the
+              fractional scroll so row `first` is drawn at y0)
+40      f32   line height (> 0)
+44      f32   font size (> 0)
+48      f32   horizontal scroll offset (>= 0)
+```
+
+Each changed row immediately follows the previous one, in ascending row order,
+and lies inside the visible range:
+
+```text
+offset  type  field
+0       u32   document row
+4       u16   text bytes (at most 16 KiB; no CR or LF)
+6       u16   run count (at most max(text bytes, 1))
+8       [...] UTF-8 text, then runs of {len u16 (> 0), flags u8, zero u8, rgba u32}
+```
+
+Runs tile the text exactly. Run flag bit 0 is bold and bit 1 is italic; `rgba`
+is `0xRRGGBBAA`. The Host retains every visible row, forgets rows that leave
+the visible range, and repaints the viewport at row `r`'s top edge
+`y0 + (r - first) * line height` and left edge `x0 - scroll`, clipped to the
+text area. Rows are drawn with the glyph baseline at
+`(line height - ascent - descent) / 2 + ascent` from the row top.
 
 Commands are processed in stream order. URL bytes are untrusted input: the Host
 MUST apply its navigation scheme, origin, permission, and user-gesture policy,
