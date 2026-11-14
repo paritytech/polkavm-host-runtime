@@ -362,6 +362,27 @@ pub extern "C" fn polkavm_browser_translate_partitioned_staged() -> u32 {
     })
 }
 
+/// Translate a host_validation v2 child with its independent 64 MiB heap.
+#[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
+#[no_mangle]
+pub extern "C" fn polkavm_browser_translate_validation_staged() -> u32 {
+    status(|host| {
+        let blob = polkavm::ProgramBlob::parse(host.staging.as_slice().into())?;
+        anyhow::ensure!(
+            blob.isa() == polkavm::program::InstructionSetKind::Latest64,
+            "host_validation v2 requires RV64 latest64 bytecode"
+        );
+        host.translation = polkavm_wasm_compiler::translate_partitioned(
+            &host.staging,
+            polkavm_wasm_compiler::Limits {
+                max_heap_bytes: 64 * 1024 * 1024,
+                ..TRANSLATION_LIMITS
+            },
+        )?;
+        Ok(())
+    })
+}
+
 /// Return the translated root module's read-only memory offset.
 #[allow(unsafe_code)] // Unique Wasm ABI export; see module safety contract.
 #[no_mangle]

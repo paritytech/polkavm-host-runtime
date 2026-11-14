@@ -63,6 +63,58 @@ retries with bounded code modules sharing guest memory, registers, and dispatch
 state before falling back to the interpreter. Cached compiled programs include
 the root and every code module; instantiation creates fresh guest state.
 
+The translated browser backend also implements **`host_validation` v2**: an
+RV32 application can synchronously load one RV64 `latest64` computation,
+exporting `validate`, through `host_validation_load(ptr, len, 2)`. It uses a fresh
+instance of this package's Wasm translator, then synchronously compiles the
+partitioned child modules in the worker. Child memory, registers and work budget
+are independent of the application. Browser interpreter launches importing any
+`host_validation_*` symbol fail explicitly; there is no unsupported fallback.
+
+The outer calls are `host_validation_start(checkpoint_ptr, checkpoint_len)`,
+`step()`, `read(offset, destination, capacity)`, `ack()`, `cancel()`, `work()`,
+`peer_write(ptr, len)` and `peer_commit()` (all prefixed `host_validation_`).
+Mutations return zero; `step` returns an event, `read` returns bytes copied,
+`work` returns a u64 (RV32 a0/a1), and `cancel` returns void. Events are:
+0 = work slice exhausted, 1 = UTF-8 log, 2 = report, 3 = staged checkpoint,
+4 = finished (8-byte little-endian result), 5 = opaque peer request,
+6 = timed wait (4-byte little-endian milliseconds). A pending checkpoint blocks
+execution until the outer guest persists it and ACKs; a peer request blocks
+until a nonempty reply is written and committed. ACK publishes staged bytes
+as the next committed checkpoint. Cancel drops the invocation, not the loaded
+code; a second load or concurrent start is refused.
+
+Child imports are `validation_read`, `validation_log`, `validation_report`,
+`validation_checkpoint_read/write/commit`, and
+`validation_peer_request/read/wait/now_ms`. Reads accept only `state.bin`,
+`inputs.bin`, `peer.json`, `parameters.bin`, `genesis-header.bin` and
+`genesis-root.bin` from the application's assets. No transport, signer or
+checkpoint persistence is implemented here. The outer guest/host owns those
+effects. Peer time uses the worker's monotonic clock relative to child start;
+waits accept 1–250 ms and preserve the continuation.
+
+Limits: 64 MiB program and child heap, 4096-byte I/O chunks, 1,048,512-byte
+checkpoints and peer frames/replies, and separate 1 MiB log/report totals.
+Continuing peer computations reset output totals each outer logical update.
+Each outer initialization/update grants at most 4,194,304 translated-module
+gas units across all child steps; hostcall continuations, cancel and restart
+cannot refill that allowance. `work()` is monotonic within an invocation.
+These units are the translator's loop/dispatch scheduling gas, **not native
+compiler gas or JAM consensus gas**, and are not a wall-time guarantee.
+
+The finite-replay qualification uses a PolkaVM 0.37 `e06cce9`-linked child,
+accepted by the pinned `642fa95a` parser. Its report SHA-256 is
+`2fdf4c08d0dfb0011e6d7a89aed84e8b025124fa6e39279ba6014389f55b6def`.
+The package tests include real RV32→RV64 execution, checkpoint/peer bounds,
+clock waits, work-slice resumption and interpreter refusal. To additionally
+run the independent JAM replay (inputs are not bundled in this repository):
+
+```bash
+HOST_VALIDATION_PROBE=/path/to/computation-037.polkavm \
+HOST_VALIDATION_FIXTURES=/path/to/jam-validator/fixtures \
+npm test --workspace @parity/polkavm-browser-runtime
+```
+
 File handlers are runtime registrations on the mediated-input lifecycle
 (ABI v1 §File input). A Host declares the deliveries it serves with
 `set_file_input_support` (browser start option `fileInput`), reads the
