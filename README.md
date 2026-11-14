@@ -93,14 +93,21 @@ checkpoint persistence is implemented here. The outer guest/host owns those
 effects. Peer time uses the worker's monotonic clock relative to child start;
 waits accept 1–250 ms and preserve the continuation.
 
-Limits: 64 MiB program and child heap, 4096-byte I/O chunks, 1,048,512-byte
-checkpoints and peer frames/replies, and separate 1 MiB log/report totals.
-Continuing peer computations reset output totals each outer logical update.
-Each outer initialization/update grants at most 4,194,304 translated-module
-gas units across all child steps; hostcall continuations, cancel and restart
-cannot refill that allowance. `work()` is monotonic within an invocation.
-These units are the translator's loop/dispatch scheduling gas, **not native
-compiler gas or JAM consensus gas**, and are not a wall-time guarantee.
+The browser program limit is effectively 32 MiB through the enclosing
+application's hostcall byte budget (less if that update has already spent bytes).
+The child heap is 64 MiB, versus the native runtime's 128 MiB heap limit.
+Other limits are 4096-byte I/O chunks, 1,048,512-byte checkpoints and peer
+frames/replies, and separate 1 MiB log/report totals. Continuing peer computations
+reset output totals each outer logical update.
+Each outer initialization/update grants at most 4,194,304 work units, 65,536 child
+hostcalls and 32 MiB of child hostcall memory traffic across all steps. Every
+child hostcall charges at least one work unit; reads reserve their requested
+capacity, including the asset name when present. Exhaustion yields event 0
+without executing a partial hostcall; a deferred ECALL resumes exactly once
+after the next outer update. Hostcall continuations, cancel and restart cannot
+refill these allowances. `work()` is monotonic within an invocation.
+Work combines the translator's loop/dispatch gas with child-hostcall charges,
+**not native compiler gas or JAM consensus gas**, and is not a wall-time guarantee.
 
 The finite-replay qualification uses a PolkaVM 0.37 `e06cce9`-linked child,
 accepted by the pinned `642fa95a` parser. Its report SHA-256 is

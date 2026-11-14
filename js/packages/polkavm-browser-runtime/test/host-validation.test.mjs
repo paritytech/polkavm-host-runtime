@@ -21,6 +21,10 @@ const varint = (value) => {
   assert.ok(value < 16384, "small fixture integer");
   return value < 128 ? [value] : [0x80 | (value >>> 8), value & 255];
 };
+const word = (value) => [value & 255, (value >>> 8) & 255, (value >>> 16) & 255, value >>> 24];
+const incrementCounter = [128, 0x66, ...word(1)]; // add_imm_64 t2, t2, 1
+const counterLessThan = (count, relativeTarget) => [41, 0x46, ...word(count), ...word(relativeTarget)];
+const returnCounter = [227, 0x67]; // move a0, t2
 
 // Real Latest64 bytecode, using the same small-blob encoding as runtime-core tests.
 function program(names, instructions, data = [1, 2, 3, 4], bitness = 64, entry = "validate") {
@@ -108,7 +112,10 @@ test("checkpoint writes enforce total limit without publishing partial state", (
   child.run.pvm.r7.value = BigInt(RO);
   child.run.pvm.r8.value = 4n;
   for (let i = 0; i < LIMIT / 4; i++) {
-    child.dispatch("validation_checkpoint_write");
+    if (child.dispatch("validation_checkpoint_write") === null) {
+      child.beginUpdate();
+      assert.equal(child.dispatch("validation_checkpoint_write"), 0);
+    }
     child.run.pvm.r7.value = BigInt(RO);
   }
   assert.equal(child.run.stagedLength, LIMIT);
@@ -264,4 +271,80 @@ test("work slices are bounded and cannot be refilled by step, cancel or start", 
   assert.equal(child.step(), 0);
   assert.equal(child.work(), 0n);
   assert.equal(child.metadata.layout.heapLimit, 64 * 1024 * 1024);
+});
+
+test("child clock hostcall loops yield at the per-update count limit and finish without replay", () => {
+  const calls = 3 * 65536 + 1;
+  let clockReads = 0;
+  const child = loaded(program(["validation_peer_now_ms"], [
+    imm(6, 0), call(0), incrementCounter, counterLessThan(calls, -8), returnCounter, ret,
+  ]), undefined, () => { clockReads++; return 0; });
+  let previousWork = 0n;
+  for (let update = 0; update < 4; update++) {
+    const before = clockReads;
+    const event = child.step();
+    const expected = update < 3 ? 65536 : 1;
+    assert.equal(clockReads - before, expected);
+    assert.equal(event, update < 3 ? 0 : 4);
+    assert.ok(child.work() >= previousWork + BigInt(expected), "every hostcall costs work");
+    previousWork = child.work();
+    if (event === 0) {
+      assert.equal(child.hostcalls, 0);
+      assert.equal(child.step(), 0);
+      assert.equal(clockReads - before, expected, "step cannot refill the call budget");
+      assert.equal(child.work(), previousWork);
+      child.beginUpdate();
+    }
+  }
+  assert.equal(clockReads, calls + 1, "one start-clock sample plus exactly one per child call");
+  assert.equal(new DataView(child.read(0, 8).buffer).getBigUint64(0, true), BigInt(calls));
+});
+
+test("child asset reads defer an unexecuted ECALL at the byte limit and resume it exactly once", () => {
+  const calls = 20000;
+  let reads = 0;
+  const assets = new class extends Map {
+    get(name) { reads++; return super.get(name); }
+  }([["state.bin", new Uint8Array(4096).fill(7)]]);
+  const child = loaded(program(["validation_read"], [
+    imm(6, 0), imm(8, 9), imm(9, 0), imm(10, RW), imm(11, 4096),
+    imm(7, RO), call(0), incrementCounter, counterLessThan(calls, -14), returnCounter, ret,
+  ], text("state.bin")), assets);
+  const perUpdate = Math.floor(32 * 1024 * 1024 / (4096 + 9));
+  let previousWork = 0n;
+  for (let update = 0; update < 3; update++) {
+    const before = reads;
+    const event = child.step();
+    assert.equal(reads - before, update < 2 ? perUpdate : calls - 2 * perUpdate);
+    assert.ok(child.work() > previousWork);
+    previousWork = child.work();
+    if (update < 2) {
+      assert.equal(event, 0);
+      assert.equal(child.run.callPending, true, "ECALL awaits next byte allowance");
+      assert.equal(child.run.pvm.r7.value, BigInt(RO), "arguments remain intact");
+      assert.equal(child.step(), 0);
+      assert.equal(reads - before, perUpdate, "no partial copy or replay on repeated step");
+      assert.equal(child.work(), previousWork);
+      child.beginUpdate();
+    } else {
+      assert.equal(event, 4);
+    }
+  }
+  assert.equal(reads, calls);
+  assert.equal(new DataView(child.read(0, 8).buffer).getBigUint64(0, true), BigInt(calls));
+  assert.deepEqual(child.range(RW, 4096), new Uint8Array(4096).fill(7));
+});
+
+test("child hostcall budgets survive cancel and restart until the next outer update", () => {
+  const child = loaded(program(["validation_peer_now_ms"], [call(0), [217, 254]]));
+  assert.equal(child.step(), 0);
+  assert.equal(child.hostcalls, 0);
+  child.cancel();
+  child.start(new Uint8Array());
+  assert.equal(child.step(), 0);
+  assert.equal(child.work(), 0n);
+  child.beginUpdate();
+  assert.equal(child.step(), 0);
+  assert.equal(child.hostcalls, 0);
+  assert.ok(child.work() >= 65536n);
 });
