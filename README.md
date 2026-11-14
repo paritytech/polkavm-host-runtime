@@ -389,8 +389,11 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.9`.
-This candidate combines the released rc.8 optimizations with foreground event
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.10`.
+This candidate adds the translated browser `host_validation` v2 child engine,
+with isolated RV64 execution, checkpoint acknowledgement and peer-response
+gates, bounded work slices, and explicit interpreter refusal as described above.
+It retains rc.9's combination of the released rc.8 optimizations with foreground event
 wakes and the initial demand-driven update, monotonic clocks for 32-bit and
 64-bit guests, and WebGPU device-recovery retries. Recovery retains pending
 surface resizes, validates against the replacement device's current limits,
@@ -417,11 +420,19 @@ resources across resize, stale default-surface passes report error `4` with
 the offending command index, and offscreen/resource-only work does not count
 as a presented frame. It retains PolkaVM engine
 `642fa95a6f1df85612bdbd0a7e4353a2aa4dc9b5` and the prior translated-dispatch
-optimization, without adding the unfinished checkpoint changes.
+optimization. The new checkpoint contract is scoped to the translated validation
+child; application persistence remains the enclosing Host's responsibility.
 It remains a prerelease, not a stable compatibility promise. The release generator
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
+
+Local rc.10 release-source qualification passed 353 browser tests (including the
+independent RV64 validation replay), 34 release-integrity tests, and 229 tests in
+the all-feature Rust workspace suite. Ten existing opt-in GPU, fixture-export
+and selected-file tests remained ignored. Generated notices and all embedded
+browser asset digests matched. This does not qualify live follower operation or
+the separate Host transport/checkpoint integration.
 
 Local rc.9 integration qualification passed 344 browser tests, 34 release-integrity
 tests, the all-feature Rust workspace suite, and all seven opt-in native GPU
