@@ -396,10 +396,12 @@ A release is identified by one source commit and records:
 
 Release tags use `v<version>`. Moving branch references are not release inputs.
 
-The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.10`.
-This candidate adds the translated browser `host_validation` v2 child engine,
-with isolated RV64 execution, checkpoint acknowledgement and peer-response
-gates, bounded work slices, and explicit interpreter refusal as described above.
+The workspace, Rust crates, and browser package are aligned at `0.3.2-rc.11`.
+This candidate bounds the validation child's hostcalls by count, copied-byte
+allowance and work charges. Exhaustion yields without partially executing or
+replaying a child call. It retains rc.10's translated browser `host_validation`
+v2 engine, isolated RV64 execution, checkpoint acknowledgement and peer-response
+gates, and explicit interpreter refusal as described above.
 It retains rc.9's combination of the released rc.8 optimizations with foreground event
 wakes and the initial demand-driven update, monotonic clocks for 32-bit and
 64-bit guests, and WebGPU device-recovery retries. Recovery retains pending
@@ -433,6 +435,12 @@ It remains a prerelease, not a stable compatibility promise. The release generat
 deliberately refuses inconsistent versions, dirty or untagged source, stale embedded
 files, or mismatched compiler/engine provenance.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for preparation and integrity checks.
+
+Local rc.11 qualification passed 356 browser tests, 34 release-integrity tests
+and 229 all-feature Rust tests, with the same ten existing opt-in tests ignored.
+The new regressions complete 196,609 clock hostcalls over four updates and
+20,000 chunked asset reads over three updates without replaying a deferred
+ECALL. The independent RV64 replay retains the report digest documented above.
 
 Local rc.10 release-source qualification passed 353 browser tests (including the
 independent RV64 validation replay), 34 release-integrity tests, and 229 tests in

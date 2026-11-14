@@ -32,13 +32,13 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "SHA256SUMS",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/SHA256SUMS"),
-        sha256: "c9eb0abb7532622eba7dc98cefce44653fa3f0e5068ca8edad1c48863fb4ceea",
+        sha256: "7298895f40335bc0dff8a5db7dd139b9340a2b08c716e4e70f6947ca92c7f4db",
     },
     BrowserAsset {
         path: "THIRD_PARTY_LICENSES.txt",
         content_type: "text/plain",
         bytes: include_bytes!("../assets/THIRD_PARTY_LICENSES.txt"),
-        sha256: "73c8e3cd7b0eade7287c4c3171cbb2ebef6e165e99c35478befa48446609a2bf",
+        sha256: "bdb4aa5a991e03e4538dd1cd70d3f3614f0befd8a0d7d3737ad04bb72143df79",
     },
     BrowserAsset {
         path: "THIRD_PARTY_NOTICES.md",
@@ -62,7 +62,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "polkavm-browser-runtime.wasm",
         content_type: "application/wasm",
         bytes: include_bytes!("../assets/polkavm-browser-runtime.wasm"),
-        sha256: "9f08ee8503a1a2addbcbe2c505473b19d103cbdf71b8aebd75fb9c18e4efef98",
+        sha256: "8c71877ba14370c45e192ec35699a853f4fb57327d7e358f9453b70be8a0d673",
     },
     BrowserAsset {
         path: "polkavm-computer.js",
@@ -86,7 +86,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "polkavm-wasm-translated.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-wasm-translated.js"),
-        sha256: "3d532d3e986189f8419c4bcf36339b9f7e6e189640ee93abe59425896ad29b39",
+        sha256: "eff7feebdea88223e69cd946fef61a229fdf260db40e044fb5b3fa38faff91a0",
     },
     BrowserAsset {
         path: "polkavm-wasm-worker-entry.js",
@@ -98,7 +98,7 @@ const ASSETS: [BrowserAsset; 15] = [
         path: "polkavm-worker.js",
         content_type: "text/javascript",
         bytes: include_bytes!("../assets/polkavm-worker.js"),
-        sha256: "991c2cee0f6ebd878d2f9ae77d5dbaab9786597f5f5530456861b4a46678fd7c",
+        sha256: "831b837598630a5561aa50e499295092f9161ba4f855a79274368c8daa914f01",
     },
     BrowserAsset {
         path: "session.d.ts",

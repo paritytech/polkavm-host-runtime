@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "cargoLockSha256": "d96785de0d15151e638d36fcb58427c401882ed2a0bae34874918c3ade25da86",
+  "cargoLockSha256": "b01e867198cfb6b710d62ed4d29461015669ad8f7fe46809c3548095999b0082",
   "rustToolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
   "browser": {
     "root": "polkavm-host-runtime",
