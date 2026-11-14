@@ -271,6 +271,15 @@ pub(crate) fn validate_launch_inputs(
 }
 
 pub(crate) fn validate_blob(blob: &ProgramBlob) -> Result<()> {
+    #[cfg(target_arch = "wasm32")]
+    if blob
+        .imports()
+        .iter()
+        .flatten()
+        .any(|import| import.as_bytes().starts_with(b"host_validation_"))
+    {
+        bail!("host_validation v2 requires the translated browser backend; the interpreter is unsupported");
+    }
     if blob.rw_data_size() > MAX_GUEST_RW_DATA_BYTES {
         bail!("guest read-write data exceeds {MAX_GUEST_RW_DATA_BYTES} bytes");
     }

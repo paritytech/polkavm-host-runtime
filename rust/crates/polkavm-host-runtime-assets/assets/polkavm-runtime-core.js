@@ -1323,6 +1323,7 @@ globalThis.createPolkaVmRuntime = (endpoint, options = {}) => {
         message.mediatedInputKinds ?? [],
         message.fileInput ?? null,
         MAX_TRANSLATED_GAS_SLICES_PER_UPDATE,
+        { runtime: message.runtime, imports: runtimeImports },
       );
       const relaunch = relaunchFile(message);
       if (relaunch !== null) {
